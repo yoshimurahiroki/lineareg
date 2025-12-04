@@ -1,0 +1,97 @@
+# lineareg/pyproject.toml
+
+[build-system]
+# Specifies that this project uses setuptools for building.
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Core project metadata.
+name = "lineareg"
+version = "0.1.0"
+authors = [
+  { name="Your Name", email="your.email@example.com" },
+]
+description = "A Python library for rigorous, publication-quality econometric analysis."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+# Specifies all necessary third-party libraries. These are standard in the
+# scientific Python ecosystem and are required for numerical computation,
+# data manipulation, formula parsing, and plotting.
+dependencies = [
+    "numpy>=1.23.0",
+    "scipy>=1.9.0",
+    "pandas>=1.5.0",
+    "patsy>=0.5.3",
+    "matplotlib>=3.6.0",
+    "scikit-learn>=1.1.0", # Strictly for user-pluggable models in DR-DID.
+    "tabulate>=0.9.0",    # For creating summary tables.
+]
+
+[project.urls]
+"Homepage" = "https://github.com/your-username/lineareg"
+"Bug Tracker" = "https://github.com/your-username/lineareg/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+# -------------------------------------------------------------------
+# Ruff Configuration: Enforces strict code quality and style.
+# This is analogous to `R CMD check` or Stata's linter standards.
+# -------------------------------------------------------------------
+[tool.ruff]
+# Reserved for future global (non-lint) Ruff settings.
+
+[tool.ruff.format]
+# Use black-compatible formatting for consistency.
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint]
+# Enable all rules by default for maximum strictness.
+select = ["ALL"]
+
+# Ignore rules that are overly pedantic for scientific computing or conflict
+# with common styles. For example, requiring docstrings (D) or type
+# annotations (ANN) everywhere can be cumbersome in a research context.
+ignore = [
+    "D",      # Pydocstyle: Docstrings are good but not strictly enforced.
+    "ANN",    # flake8-annotations: Type hints are used but not required for every function.
+    "S101",   # flake8-bandit: Use of 'assert' is acceptable for internal checks.
+    "T201",   # flake8-print: `print` is used in summary/demo functions.
+    "TRY003", # tryceratops: Long exception messages are sometimes necessary.
+    "N803",   # pep8-naming: Argument names like 'X' and 'Y' are standard in econometrics.
+    "N806",   # pep8-naming: Variable names like 'X_t' are standard.
+    "N812",   # pep8-naming: Function names can be uppercase if they are estimators.
+    "FBT",    # flake8-boolean-trap: Avoids flagging boolean function arguments.
+    "E501",   # line-too-long: defer to formatter; scientific code with long expressions.
+    "ERA001", # eradicate: allow descriptive comments even if resembling code.
+    "EXE002", # shebang missing in library modules with executable bit; harmless in packaging.
+    "PGH003", # pygrep-hooks: type ignores may be broad in optional dependency guards.
+    "EM101",  # exception must not use a string literal, acceptable in research prototypes.
+    "EM102",  # exception must not use an f-string, acceptable for clarity in errors.
+    "C901",   # complexity: allow complex routines in numerics; we'll refactor gradually.
+    "PLR0912",# too many branches: common in parsing/absorbing logic.
+    "PLR0915",# too many statements: common in numerics; revisit later with helpers.
+    "PLR2004",# magic value used: acceptable in algorithmic thresholds/constants.
+    "PLC0415",# import outside toplevel: allow guarded/optional imports for optional deps.
+    "RUF003", # ambiguous-unicode-character: allow mathematical greek letters in docs/tests.
+    "SIM102", # nested ifs: acceptable in algorithmic code paths, revisit later.
+]
+
+# Allow unused variables if they are prefixed with an underscore.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+# Enable autofix for all safe rules.
+fixable = ["ALL"]
+unfixable = []

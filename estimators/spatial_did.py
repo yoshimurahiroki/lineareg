@@ -1,0 +1,1229 @@
+"""Spatial Difference-in-Differences (Spatial DiD) estimators.
+
+Scope and policy
+----------------
+- Implements Spatial DiD/event-study models with staggered adoption and
+    spillovers via user-provided spatial weight matrices.
+- Inference is bootstrap-only (wild/multiplier); default B=2000 draws with
+    B+1 quantiles. No analytical SEs, p-values, or critical values.
+- Uniform sup-t bands are exposed for event-study paths where applicable:
+    pre-only, post-only, and full-window bands, with staggered-robust handling.
+- All matrix operations route through :mod:`lineareg.core.linalg`; no explicit
+    matrix inverses are used in estimator code.
+- Formula, fixed effects absorption, and NA/weights alignment follow
+    :mod:`lineareg.utils.formula` conventions.
+
+Comments and docstrings are English-only by policy.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+
+from lineareg.core import bootstrap as bt
+from lineareg.core import linalg as la
+from lineareg.estimators.base import (
+    BootConfig,
+    EstimationResult,
+    attach_formula_metadata,
+    prepare_formula_environment,
+)
+from lineareg.utils.formula import FormulaParser
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+__all__ = ["SpatialDID", "SpatialDIDResult"]
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class SpatialDIDResult:
+    """Container for spatial DID estimates.
+
+    Fields
+    ------
+    direct_tau : τ-series for direct effects (β_D)
+    spill_tau  : τ-series for spillover effects (beta_S x mean exposure among exposed controls)
+    bands_direct / bands_spill : (pre/post) uniform bands
+    model_info : configuration and bootstrap details
+    """
+
+    direct_tau: pd.DataFrame
+    spill_tau: pd.DataFrame
+    beta_s_tau: pd.DataFrame  # raw beta_S (not multiplied by mean exposure) with bands
+    # Each bands_* now carries three pairs: (pre, post, full)
+    bands_direct: tuple[
+        tuple[pd.Series, pd.Series],
+        tuple[pd.Series, pd.Series],
+        tuple[pd.Series, pd.Series],
+    ]
+    bands_spill: tuple[
+        tuple[pd.Series, pd.Series],
+        tuple[pd.Series, pd.Series],
+        tuple[pd.Series, pd.Series],
+    ]
+    bands_beta_s: tuple[
+        tuple[pd.Series, pd.Series],
+        tuple[pd.Series, pd.Series],
+        tuple[pd.Series, pd.Series],
+    ]
+    model_info: dict[str, object]
+
+
+class SpatialDID:
+    """Spatial DID with exposure S = W * 1{treated_now} and ΔY regression on [1, D, S].
+
+    Notes
+    -----
+        - W can be dense or SciPy sparse; set `row_normalized=False` if W is **not**
+            row-normalized (this class will row-normalize once). If W is **already**
+            row-normalized, set `row_normalized=True` to skip normalization.
+    - Spill interpretation: reported as beta_S x mean(S | exposed controls), i.e., the
+      average effect among **exposed controls** (S>0). This is not the effect for
+      unexposed controls or the entire population. The estimand is documented explicitly.
+    - Bootstrap: wild residual with **restricted residuals (WCR)** by default and
+      multiway clustering via BootConfig; we share one W across all (g,t) cells.
+    - Extensions: Users can pass multiple exposure bands (e.g., rings) by providing
+      pre-constructed S_k columns and running separate calls; lagged S can also be
+      inserted to allow dynamic exposure responses.
+
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        id_name: str,
+        t_name: str,
+        cohort_name: str,
+        treat_name: str,
+        y_name: str,
+        event_time_name: str | None = None,
+        W: la.Matrix,
+        row_normalized: bool = True,
+        center_at: int = -1,
+        boot: BootConfig | None = None,
+        cluster_ids: Sequence | None = None,
+        space_ids: Sequence | None = None,
+        time_ids: Sequence | None = None,
+        residual_type: str = "restricted",
+        # ---- NEW: tau aggregation weight (R/Stata did/csdid convention: default 'group') ----
+        tau_weight: str = "group",
+        # ---- NEW: rank policy to match R or Stata QR thresholds ----
+        rank_policy: str = "stata",
+    ) -> None:
+        self.id_name = str(id_name)
+        self.t_name = str(t_name)
+        self.cohort_name = str(cohort_name)
+        self.treat_name = str(treat_name)
+        self.y_name = str(y_name)
+        self.event_time_name = None if event_time_name is None else str(event_time_name)
+        self.W = W
+        # row_normalized=True  -> assume W is already row-normalized (no action)
+        # row_normalized=False -> perform one row-normalization inside fit()
+        self.row_normalized = bool(row_normalized)
+        self.center_at = int(center_at)
+
+        self.boot = boot
+        self.cluster_ids = cluster_ids
+        self.space_ids = space_ids
+        self.time_ids = time_ids
+        if residual_type not in {"restricted", "unrestricted"}:
+            msg = 'residual_type must be "restricted" or "unrestricted".'
+            raise ValueError(msg)
+        self.residual_type = residual_type
+        # validate tau_weight
+        self.tau_weight = str(tau_weight).lower()
+        if self.tau_weight not in {"group", "equal", "treated_t"}:
+            msg = "tau_weight must be one of {'group','equal','treated_t'}."
+            raise ValueError(msg)
+        # validate rank policy
+        self._rank_policy = str(rank_policy).lower()
+        if self._rank_policy not in {"stata", "r"}:
+            raise ValueError("rank_policy must be one of {'stata','r'}.")
+
+    # ------------------------------------------------------------------
+    def _event_time(self, df: pd.DataFrame) -> pd.Series:
+        if self.event_time_name and self.event_time_name in df.columns:
+            return df[self.event_time_name].astype(int)
+        return (df[self.t_name].astype(int) - df[self.cohort_name].astype(int)).astype(
+            int,
+        )
+
+    def _first_difference(self, df: pd.DataFrame) -> pd.DataFrame:
+        dfx = df[[self.id_name, self.t_name, self.y_name]].copy()
+        dfx = dfx.sort_values([self.id_name, self.t_name])
+        dfx["_dY"] = dfx.groupby(self.id_name)[self.y_name].diff()
+        return df.merge(
+            dfx[[self.id_name, self.t_name, "_dY"]],
+            on=[self.id_name, self.t_name],
+            how="left",
+        )
+
+    # ------------------------------------------------------------------
+    def fit(self, df: pd.DataFrame | None = None) -> EstimationResult:
+        """Estimate spatial DID direct/spillover series with uniform bands (pre/post).
+
+        Correct cell construction: for each (g,t) the sample contains cohort g units at time t
+        AND control units defined as:
+            - not-yet treated (cohort > t) and never-treated (cohort==0)
+        This avoids D being constant within post cells. Exposure S is computed once over the
+        balanced (unit,time) grid and accessed by integer indices (vectorized).
+        """
+        if df is None:
+            df = getattr(self, "_formula_df", None)
+            if df is None:
+                raise ValueError(
+                    "Provide df explicitly or instantiate via from_formula().",
+                )
+        else:
+            self._formula_df = df
+
+        # keep original order to permit strict realignment of any external IDs
+        df0 = df.copy()
+        df0["_origpos"] = np.arange(df0.shape[0], dtype=np.int64)
+        df = df0.copy()
+        df["_tau"] = self._event_time(df)
+        df = df.sort_values([self.id_name, self.t_name]).reset_index(drop=True)
+
+        # strict integrity checks
+        if df.duplicated(subset=[self.id_name, self.t_name]).any():
+            raise ValueError("Duplicate (id,time) rows detected.")
+        # cohort must be unique per id (ignore missing/zero cohorts)
+        _c = df[[self.id_name, self.cohort_name]].dropna()
+        _c = _c[_c[self.cohort_name].astype(int) > 0]
+        if not _c.empty:
+            chk = _c.groupby(self.id_name)[self.cohort_name].nunique()
+            if int((chk > 1).sum()) > 0:
+                raise ValueError("Cohort must be unique per id.")
+
+        # canonical ids / times and maps to wide indices
+        ids = np.asarray(sorted(df[self.id_name].unique()))
+        times = np.asarray(sorted(df[self.t_name].unique()))
+        id_map = {v: i for i, v in enumerate(ids)}
+        t_map = {v: i for i, v in enumerate(times)}
+
+        n_ids = len(ids)
+        n_times = len(times)
+
+        # Build wide outcome matrix Y (n_ids x n_times)
+        Y = np.full((n_ids, n_times), np.nan, dtype=np.float64)
+        # and a treated indicator matrix (for computing S = W * treated_now)
+        treated_now = np.zeros((n_ids, n_times), dtype=np.float64)
+        for _, row in df.iterrows():
+            i = id_map[row[self.id_name]]
+            tt = t_map[row[self.t_name]]
+            val = row.get(self.y_name, np.nan)
+            try:
+                Y[i, tt] = float(val)
+            except (TypeError, ValueError):
+                Y[i, tt] = np.nan
+            tr = row.get(self.treat_name, 0)
+            treated_now[i, tt] = 1.0 if int(tr) == 1 else 0.0
+
+        # Cohort vector per id (G): cohort assigned to id or 0 if missing/<=0
+        G = np.zeros(n_ids, dtype=int)
+        cohort_series = df.drop_duplicates(subset=[self.id_name]).set_index(
+            self.id_name,
+        )[self.cohort_name]
+        for v, i in id_map.items():
+            try:
+                c = int(cohort_series.loc[v])
+            except (KeyError, TypeError, ValueError):
+                c = 0
+            G[i] = c
+        cohorts = np.unique(G)
+
+        # Validate W and compute exposure S = W * treated_now (row-normalize if requested)
+        if isinstance(self.W, pd.DataFrame):
+            Wdf = self.W.copy()
+            ids_sorted = ids
+            if set(Wdf.index) != set(ids_sorted) or set(Wdf.columns) != set(ids_sorted):
+                raise ValueError("W index/columns must match the set of ids.")
+            Wd = Wdf.loc[ids_sorted, ids_sorted].to_numpy(dtype=np.float64, copy=False)
+        else:
+            Wd = la.to_dense(self.W).astype(np.float64, copy=False)
+        # enforce zero diagonal (no self-exposure)
+        self_loops = float(np.sum(np.diag(Wd) != 0.0))
+        np.fill_diagonal(Wd, 0.0)
+        # non-negativity check
+        if (Wd < 0.0).any():
+            raise ValueError("W must be non-negative.")
+
+        # optional row-normalize (strict)
+        row_sums = Wd.sum(axis=1)
+        zero_rows = int(np.sum(row_sums == 0.0))
+        if not self.row_normalized:
+            nz = row_sums > 0.0
+            Wd[nz, :] = Wd[nz, :] / row_sums[nz].reshape(-1, 1)
+        # verify approximately row-normalized
+        elif np.max(np.abs(row_sums - 1.0)) > 1e-10:
+            raise ValueError(
+                "row_normalized=True is declared but row sums deviate from 1. Set row_normalized=False to normalize inside.",
+            )
+
+        # Exposure matrix S = W * treated_now (kept for diagnostics only)
+        S = la.dot(Wd, treated_now)
+
+        # Define wide indices *before* any use in multiplier grouping
+        df["_i"] = df[self.id_name].map(id_map).astype(int)
+        df["_tt"] = df[self.t_name].map(t_map).astype(int)
+
+        # Prepare bootstrap multipliers (observation-level by default). Build BootConfig if not supplied.
+        if self.boot is None:
+            # Do not force policy/enumeration here; inject only aligned ID arrays
+            # If both space_ids and time_ids are provided (space×time multiway),
+            # disable enumeration by default to match boottest parity for multiway.
+            if (self.space_ids is not None) and (self.time_ids is not None):
+                boot_cfg = BootConfig(
+                    cluster_ids=self.cluster_ids,
+                    space_ids=self.space_ids,
+                    time_ids=self.time_ids,
+                    use_enumeration=False,
+                    enumeration_mode="disabled",
+                )
+            else:
+                boot_cfg = BootConfig(
+                    cluster_ids=self.cluster_ids,
+                    space_ids=self.space_ids,
+                    time_ids=self.time_ids,
+                )
+        else:
+            # Respect user BootConfig: replace only IDs with aligned versions
+            # Build kwargs from existing BootConfig dataclass fields
+            bkw = {
+                field_name: getattr(self.boot, field_name)
+                for field_name in self.boot.__dataclass_fields__
+            }
+            if self.cluster_ids is not None:
+                bkw["cluster_ids"] = self.cluster_ids
+            if self.space_ids is not None:
+                bkw["space_ids"] = self.space_ids
+            if self.time_ids is not None:
+                bkw["time_ids"] = self.time_ids
+            # If caller provided both space_ids and time_ids, conservatively
+            # disable enumeration to avoid unintended enumeration for multiway.
+            if (self.space_ids is not None) and (self.time_ids is not None):
+                bkw["use_enumeration"] = False
+                bkw["enumeration_mode"] = "disabled"
+            boot_cfg = BootConfig(**bkw)
+        # BootConfig.make_multipliers returns (DataFrame, log)
+        W_obs_df, _log = boot_cfg.make_multipliers(n_obs=len(df))
+        # accept either DataFrame or ndarray
+        try:
+            W_obs = W_obs_df.to_numpy(dtype=np.float64)
+        except (AttributeError, TypeError, ValueError):
+            W_obs = np.asarray(W_obs_df, dtype=np.float64)
+        # centralize columns (global recenter). Per-cell recentering applied below.
+        W_obs = W_obs - W_obs.mean(axis=0, keepdims=True)
+        # Enforce multiplier variance per-column: scale to unit-variance for
+        # shared multipliers (shared across all cells). Zero-variance columns
+        # are invalid after recentering.
+        col_std = np.sqrt(np.var(W_obs, axis=0, ddof=0))
+        if not np.all(col_std > 0.0):
+            raise ValueError(
+                "Bootstrap multipliers have zero-variance column(s) after recentering.",
+            )
+        # Scale each bootstrap replication column to unit variance (across obs)
+        W_obs = W_obs / col_std.reshape(1, -1)
+
+        # NOTE: we intentionally do NOT enforce multiplier-constancy on (unit,D,S)
+        # groups here. Multiplier grouping/structure should be configured by
+        # the BootConfig (cluster_ids / multiway_ids) passed by the caller.
+
+        # (indices were assigned above)
+
+        def control_mask_strict(t_int: int, base_int: int) -> np.ndarray:
+            # controls must be untreated at BOTH time t AND base (g-1), like csdid.
+            m = max(int(t_int), int(base_int))
+            return (G == 0) | (m < G)
+
+        # Containers
+        atts_direct: list[
+            tuple[int, int, int, float, float]
+        ] = []  # (g,t,tau,β_D,n_treat)
+        atts_spill: list[
+            tuple[int, int, int, float, float]
+        ] = []  # (g,t,tau,spill,n_exposed)
+        atts_beta_s: list[
+            tuple[int, int, int, float, float]
+        ] = []  # (g,t,tau,β_S,n_exposed)
+        direct_boot: list[tuple[int, int, np.ndarray, float]] = []
+        spill_boot: list[tuple[int, int, np.ndarray, float]] = []
+        bs_boot: list[tuple[int, int, np.ndarray, float]] = []
+        used_rows: set[int] = set()
+
+        # Iterate cells (single canonical loop)
+        for g in np.sort(cohorts):
+            if int(g) <= 0:
+                continue
+            treat_units = int(g) == G
+            if not np.any(treat_units):
+                continue
+            for t in times:
+                base_time = int(g) - 1
+                # require base period present and control units untreated at t and base
+                if base_time not in t_map:
+                    continue
+                ctrl_units = control_mask_strict(int(t), base_time)
+                sample_units = treat_units | ctrl_units
+                if not np.any(sample_units):
+                    continue
+                tt = int(t_map[int(t)])
+                # rows where time==t and unit in sample_units
+                row_mask = (df[self.t_name].to_numpy() == int(t)) & sample_units[
+                    df["_i"].to_numpy()
+                ]
+                sub = df.loc[
+                    row_mask, [self.treat_name, self.cohort_name, "_i", "_tt"],
+                ].copy()
+                sub = sub[sub[self.treat_name].isin([0, 1])]
+                if sub.empty:
+                    continue
+                base_time = int(g) - 1
+                if base_time not in t_map:
+                    continue
+                tt_now = sub["_tt"].to_numpy(dtype=int)
+                Yi_now = Y[sub["_i"].to_numpy(dtype=int), tt_now]
+                Yi_base = Y[sub["_i"].to_numpy(dtype=int), t_map[base_time]]
+                ok = np.isfinite(Yi_now) & np.isfinite(Yi_base)
+                if not np.any(ok):
+                    continue
+                # strict row subsetting by finite long-diff
+                sub = sub.loc[ok, :].copy()
+                for rid in sub.index.to_numpy(dtype=int):
+                    used_rows.add(int(rid))
+                y = (Yi_now[ok] - Yi_base[ok]).reshape(-1, 1)
+                tau_val = int(t) - int(g)
+                treat_now = (
+                    sub[self.treat_name].to_numpy(dtype=np.float64).reshape(-1, 1)
+                )
+                cohort_indicator = (
+                    sub[self.cohort_name].astype(int).to_numpy().reshape(-1, 1)
+                    == int(g)
+                ).astype(np.float64)
+                # R/Stata parity: Z switches from cohort indicator (pre) to D_t (post)
+                Z = cohort_indicator if (tau_val < int(self.center_at)) else treat_now
+                # Event-study spillover: use COHORT membership for S in ALL periods
+                unit_indices = sub["_i"].to_numpy(dtype=int)
+                cohort_all = (int(g) == G).astype(np.float64)
+                Svec = la.dot(Wd[unit_indices, :], cohort_all.reshape(-1, 1))
+                X = la.hstack([np.ones((y.shape[0], 1), dtype=np.float64), Z, Svec])
+                # optional: flag degenerate columns (variance ~ 0) for audit trail
+                _deg = {
+                    "var_Z": float(np.var(Z, ddof=0)),
+                    "var_S": float(np.var(Svec, ddof=0)),
+                }
+                if (tau_val >= int(self.center_at)) and float(_deg["var_Z"]) < 1e-12:
+                    continue
+                try:
+                    # R/Stata parity: pivoted-QR with rank policy
+                    beta = la.solve(X, y, method="qr", rank_policy=self._rank_policy)
+                except (np.linalg.LinAlgError, RuntimeError, ValueError) as exc:
+                    LOGGER.debug(
+                        "Skipping tau=%s due to solver failure: %s",
+                        tau_val,
+                        exc,
+                    )
+                    continue
+                beta_D = float(beta[1, 0]) if beta.shape[0] > 1 else np.nan
+                # Extract beta_S: when S column dropped by rank policy, use NaN (not 0)
+                # to indicate non-identification rather than masking with zero.
+                beta_S = float(beta[2, 0]) if beta.shape[0] > 2 else np.nan
+                beta_Sc = beta_S
+                tau = int(t - g)
+                exposed_controls = (Svec.reshape(-1) > 0.0) & (Z.reshape(-1) == 0.0)
+                mean_S_exposed = (
+                    float(
+                        la.col_mean(Svec.reshape(-1)[exposed_controls].reshape(-1, 1))[
+                            0
+                        ],
+                    )
+                    if np.any(exposed_controls)
+                    else 0.0
+                )
+                # PRE: use raw β_S for ATT and inference (parallel trends on spill channel)
+                # POST: report β_S × mean(S | exposed controls); inference stays on β_S
+                spill_val = (
+                    beta_S if (tau < int(self.center_at)) else beta_S * mean_S_exposed
+                )
+                n_treat = float(np.sum(Z))
+                atts_direct.append((int(g), int(t), tau, beta_D, n_treat))
+                # Record spillover for ALL (g,t) cells regardless of n_exposed.
+                # When n_exposed == 0, spill_val == 0 but we still need the cell
+                # for proper event-study inference (parallel trends testing).
+                n_exposed = float(np.sum(exposed_controls))
+                atts_spill.append((int(g), int(t), tau, spill_val, max(n_exposed, 1.0)))
+                atts_beta_s.append((int(g), int(t), tau, beta_Sc, max(n_exposed, 1.0)))
+
+                # Bootstrap draws for the cell (observation-level multipliers prebuilt)
+                W_cell = W_obs[sub.index.to_numpy(dtype=int), :]
+                # per-cell recentering (shared across D/S series)
+                W_cell = W_cell - W_cell.mean(axis=0, keepdims=True)
+                # Per-cell scaling: where possible, normalize each bootstrap
+                # replication column to have unit variance within the cell. This
+                # is conservative: columns with zero variance are left as-is but
+                # noted for auditability.
+                std_cell = np.sqrt(np.var(W_cell, axis=0, ddof=0))
+                mask_pos = std_cell > 0.0
+                if np.any(mask_pos):
+                    W_cell[:, mask_pos] = W_cell[:, mask_pos] / std_cell[
+                        mask_pos
+                    ].reshape(1, -1)
+                if self.residual_type == "restricted":
+                    # --- D-only restriction ---
+                    R_D = np.array([[0.0, 1.0, 0.0]], dtype=np.float64)
+                    Gmat = la.tdot(X)
+                    Ginv_RT_D = la.solve(Gmat, R_D.T, sym_pos=True)
+                    lam_D = la.solve(
+                        la.dot(R_D, Ginv_RT_D), la.dot(R_D, beta), sym_pos=True,
+                    )
+                    beta_RD = beta - la.dot(Ginv_RT_D, lam_D)
+                    yhat_RD = la.dot(X, beta_RD)
+                    resid_RD = y - yhat_RD
+                    Ystar_D = yhat_RD + resid_RD * W_cell
+                    # --- S-only restriction ---
+                    R_S = np.array([[0.0, 0.0, 1.0]], dtype=np.float64)
+                    Ginv_RT_S = la.solve(Gmat, R_S.T, sym_pos=True)
+                    lam_S = la.solve(
+                        la.dot(R_S, Ginv_RT_S), la.dot(R_S, beta), sym_pos=True,
+                    )
+                    beta_RS = beta - la.dot(Ginv_RT_S, lam_S)
+                    yhat_RS = la.dot(X, beta_RS)
+                    resid_RS = y - yhat_RS
+                    Ystar_S = yhat_RS + resid_RS * W_cell
+                else:
+                    yhat = la.dot(X, beta)
+                    resid = y - yhat
+                    Ystar_D = yhat + resid * W_cell
+                    Ystar_S = Ystar_D
+
+                try:
+                    beta_star_D = la.solve(
+                        X, Ystar_D, method="qr", rank_policy=self._rank_policy,
+                    )
+                    beta_star_S = la.solve(
+                        X, Ystar_S, method="qr", rank_policy=self._rank_policy,
+                    )
+                except (np.linalg.LinAlgError, RuntimeError, ValueError) as exc:
+                    LOGGER.debug(
+                        "Skipping bootstrap refit for (g=%s, t=%s) due to failure: %s",
+                        g,
+                        t,
+                        exc,
+                    )
+                    continue
+                # Handle rank deficiency: when S has zero variance, beta_star has only 2 rows
+                betaD_star = (
+                    beta_star_D[1:2, :]
+                    if beta_star_D.shape[0] > 1
+                    else np.full((1, beta_star_D.shape[1]), np.nan)
+                )
+                # For beta_S: if dropped (shape[0] <= 2), fill with zeros (no spillover identified)
+                if beta_star_S.shape[0] > 2:
+                    betaS_star = beta_star_S[2:3, :] * mean_S_exposed
+                    bs_star_raw = beta_star_S[2:3, :]
+                else:
+                    # S was dropped; spillover coefficient is 0
+                    betaS_star = np.zeros((1, beta_star_S.shape[1]), dtype=np.float64)
+                    bs_star_raw = np.zeros((1, beta_star_S.shape[1]), dtype=np.float64)
+                direct_boot.append((int(g), int(t), betaD_star.reshape(-1), n_treat))
+                # Record spillover bootstrap for ALL cells (even n_exposed == 0)
+                spill_boot.append(
+                    (int(g), int(t), betaS_star.reshape(-1), max(n_exposed, 1.0)),
+                )
+                bs_boot.append(
+                    (int(g), int(t), bs_star_raw.reshape(-1), max(n_exposed, 1.0)),
+                )
+
+        if not atts_direct:
+            raise RuntimeError("No valid (g,t) cells for Spatial DID.")
+
+        # Build DataFrames
+        df_dir = pd.DataFrame(
+            atts_direct, columns=["g", "t", "tau", "beta_D", "n_w"],
+        )  # direct coefficient
+        df_spi = pd.DataFrame(
+            atts_spill, columns=["g", "t", "tau", "spill", "n_w"],
+        )  # spill interpreted
+        df_bs = pd.DataFrame(
+            atts_beta_s, columns=["g", "t", "tau", "beta_Sc", "n_w"],
+        )  # spill on controls (base)
+
+        # τ aggregation with weights (do not floor n_w; zero-exposure rows excluded above)
+        # group size n_g for "group" weights
+        # R did/csdid compatibility: N_g = number of unique ids with cohort == g
+        group_size: dict[int, int] = {}
+        cohort_vals = np.sort(np.unique(df[self.cohort_name].astype(int).to_numpy()))
+        for g in cohort_vals:
+            if int(g) <= 0:
+                continue
+            ids_g = df.loc[
+                df[self.cohort_name].astype(int).to_numpy() == int(g), self.id_name,
+            ].unique()
+            group_size[int(g)] = len(ids_g)
+
+        def _agg(df_in: pd.DataFrame, val_col: str, kind: str) -> pd.DataFrame:
+            if df_in.empty:
+                return pd.DataFrame({"tau": [], "params": []})
+
+            def _w_for_chunk(d: pd.DataFrame) -> float:
+                mode = self.tau_weight
+                if mode == "equal":
+                    w = np.ones(d.shape[0], dtype=np.float64)
+                elif mode == "group":
+                    w = np.array(
+                        [group_size.get(int(g), 0) for g in d["g"].to_numpy(dtype=int)],
+                        dtype=np.float64,
+                    )
+                else:  # "treated_t" : default direct uses treated_t; spill falls back to group
+                    tau_val = (
+                        int(d["tau"].iloc[0])
+                        if "tau" in d.columns and len(d) > 0
+                        else 0
+                    )
+                    if kind == "direct" and tau_val < 0:
+                        # pre-period cells have zero treated-at-time counts; fall back to cohort size
+                        w = np.array(
+                            [
+                                group_size.get(int(g), 0)
+                                for g in d["g"].to_numpy(dtype=int)
+                            ],
+                            dtype=np.float64,
+                        )
+                    elif kind == "direct":
+                        w = d["n_w"].to_numpy(
+                            dtype=np.float64,
+                        )  # number treated in cell (time t)
+                    else:
+                        w = np.array(
+                            [
+                                group_size.get(int(g), 0)
+                                for g in d["g"].to_numpy(dtype=int)
+                            ],
+                            dtype=np.float64,
+                        )
+                wsum = float(np.sum(w))
+                if wsum <= 0:
+                    return float("nan")
+                return float(np.sum(w * d[val_col].to_numpy(dtype=np.float64)) / wsum)
+
+            # Avoid pandas groupby.apply reduction FutureWarning by explicit iteration
+            rows = []
+            # preserve natural order of tau appearance
+            for tau_val, dchunk in df_in.groupby("tau", sort=False):
+                rows.append({"tau": int(tau_val), "params": _w_for_chunk(dchunk)})
+            return pd.DataFrame(rows)
+
+        dir_tau = (
+            _agg(df_dir, "beta_D", kind="direct")
+            .sort_values("tau")
+            .reset_index(drop=True)
+        )
+        spi_tau = (
+            _agg(df_spi, "spill", kind="spill")
+            .sort_values("tau")
+            .reset_index(drop=True)
+        )
+        bs_tau = (
+            _agg(df_bs, "beta_Sc", kind="spill")
+            .sort_values("tau")
+            .reset_index(drop=True)
+        )
+        if isinstance(dir_tau, pd.DataFrame) and not dir_tau.empty:
+            tau_grid = pd.Index(dir_tau["tau"].astype(int).tolist(), name="tau")
+
+            def _align(df_in: pd.DataFrame | None, fill: float) -> pd.DataFrame:
+                if df_in is None or df_in.empty:
+                    return pd.DataFrame(
+                        {
+                            "tau": tau_grid,
+                            "params": np.full(len(tau_grid), fill, dtype=np.float64),
+                        },
+                    )
+                df_tmp = df_in.set_index("tau").reindex(tau_grid)
+                df_tmp["params"] = df_tmp["params"].fillna(fill)
+                df_tmp = df_tmp.reset_index()
+                df_tmp["tau"] = df_tmp["tau"].astype(int)
+                return df_tmp.sort_values("tau").reset_index(drop=True)
+
+            # For spillover/beta_S series, fill missing τ with 0 to match R/Stata.
+            # All (g,t) cells now record spillover (even when n_exposed == 0),
+            # so missing τ values represent structural zeros (no such cohort-time pair).
+            spi_tau = _align(spi_tau, 0.0)
+            bs_tau = _align(bs_tau, 0.0)
+
+        # Bootstrap aggregation
+        def _aggregate_boot(
+            cell_boot: list[tuple[int, int, np.ndarray, float]],
+            df_in: pd.DataFrame,
+            kind: str,
+        ) -> tuple[np.ndarray, list[int]]:
+            tau_vals = sorted(df_in["tau"].unique().tolist())
+            K = len(tau_vals)
+            B = len(cell_boot[0][2]) if cell_boot else 0
+            out = np.zeros((K, B), dtype=np.float64)
+            for j, tau in enumerate(tau_vals):
+                rows = df_in[df_in["tau"] == tau]
+                accum = np.zeros(B, dtype=np.float64)
+                wsum = 0.0
+                for _, r in rows.iterrows():
+                    g_val = int(r["g"])
+                    t_val = int(r["t"])
+                    match = next(
+                        (cb for cb in cell_boot if cb[0] == g_val and cb[1] == t_val),
+                        None,
+                    )
+                    if match is None:
+                        continue
+                    (_, _, vec, w_cell) = match
+                    # use the same τ-aggregation weight rule
+                    if self.tau_weight == "equal":
+                        w = 1.0
+                    elif self.tau_weight == "group":
+                        w = float(group_size.get(g_val, 0))
+                    elif kind == "direct":
+                        # Pre-period τ: group-size weights; post: treated-at-time weights
+                        if int(tau) < int(self.center_at):
+                            w = float(group_size.get(g_val, 0))
+                        else:
+                            w = float(w_cell)
+                    else:
+                        w = float(group_size.get(g_val, 0))
+                    accum += w * vec
+                    wsum += w
+                if wsum > 0:
+                    out[j, :] = accum / wsum
+            return out, tau_vals
+
+        dir_tau_star, dir_star_grid = _aggregate_boot(
+            direct_boot, df_dir, kind="direct",
+        )
+        spi_tau_star, spi_star_grid = _aggregate_boot(spill_boot, df_spi, kind="spill")
+        bs_tau_star, bs_star_grid = _aggregate_boot(bs_boot, df_bs, kind="spill")
+
+        def _align_star_matrix(star: np.ndarray, tau_vals: list[int]) -> np.ndarray:
+            if dir_tau.empty:
+                return star
+            target = [int(t) for t in dir_tau["tau"].tolist()]
+            B = star.shape[1] if star.ndim == 2 else 0
+            aligned = np.full((len(target), B), np.nan, dtype=np.float64)
+            idx_map = {int(t): i for i, t in enumerate(tau_vals)}
+            for i, tau in enumerate(target):
+                j = idx_map.get(int(tau))
+                if j is not None and star.size:
+                    aligned[i, :] = star[j, :]
+            return aligned
+
+        dir_tau_star = _align_star_matrix(dir_tau_star, dir_star_grid)
+        spi_tau_star = _align_star_matrix(spi_tau_star, spi_star_grid)
+        bs_tau_star = _align_star_matrix(bs_tau_star, bs_star_grid)
+
+        # Bands helper (pre/post/full) using sup-t bootstrap
+        def _bands(
+            att_tau_df: pd.DataFrame,
+            att_tau_star: np.ndarray,
+        ) -> tuple[
+            tuple[pd.Series, pd.Series],
+            tuple[pd.Series, pd.Series],
+            tuple[pd.Series, pd.Series],
+        ]:
+            tau_array = att_tau_df["tau"].to_numpy(dtype=int)
+            tau_to_row = {tau: i for i, tau in enumerate(sorted(tau_array))}
+            star_ordered = (
+                np.vstack([att_tau_star[tau_to_row[tau], :] for tau in tau_array])
+                if att_tau_star.size
+                else np.zeros((len(tau_array), 0))
+            )
+            pre_mask = tau_array < self.center_at
+            # STRICT: exclude baseline (tau == center_at) from post
+            post_mask = tau_array > self.center_at
+            # full (exclude baseline): sup-t over all non-baseline τ
+            full_mask = tau_array != self.center_at
+
+            def _one(mask: np.ndarray) -> tuple[pd.Series, pd.Series]:
+                if not np.any(mask) or star_ordered.shape[1] == 0:
+                    return pd.Series(dtype=float), pd.Series(dtype=float)
+                theta = att_tau_df.loc[mask, "params"].to_numpy(dtype=np.float64)
+                th_star = star_ordered[mask, :]
+                lo, hi = bt.uniform_confidence_band(
+                    theta,
+                    th_star,
+                    alpha=0.05,
+                    studentize="bootstrap",
+                    context="eventstudy",
+                )
+                idx = att_tau_df.index[mask]
+                return pd.Series(lo, index=idx), pd.Series(hi, index=idx)
+
+            pre_pair = _one(pre_mask)
+            post_pair = _one(post_mask)
+            full_pair = _one(full_mask)
+            return pre_pair, post_pair, full_pair
+
+        bands_direct = _bands(dir_tau, dir_tau_star)
+        # Spillover inference: use unscaled beta_S coefficient (bs_tau) with
+        # its bootstrap distribution (bs_tau_star) for valid inference even when
+        # n_exposed = 0. This tests H0: beta_S = 0 (no spillover channel), which
+        # is the relevant parallel trends test for spillover effects.
+        bands_spill = _bands(bs_tau, bs_tau_star)  # Use beta_S for spillover inference
+        bands_beta_s = _bands(bs_tau, bs_tau_star)
+
+        # --- post-period aggregated ATE (tau >= center_at) with bootstrap bands (no p-values) ---
+        def _post_agg(
+            att_tau_df: pd.DataFrame, att_star: np.ndarray, df_cells: pd.DataFrame,
+        ) -> tuple[float, tuple[float, float]]:
+            if att_tau_df.empty or att_star.size == 0:
+                return np.nan, (np.nan, np.nan)
+            # STRICT: aggregate over post τ only (exclude baseline)
+            taus = att_tau_df.loc[att_tau_df["tau"] > self.center_at, "tau"].to_numpy(
+                dtype=int,
+            )
+            if taus.size == 0:
+                return np.nan, (np.nan, np.nan)
+            # PostATE aggregation strictly follows tau_weight
+            mode = self.tau_weight
+            if mode == "equal":
+                w = np.ones(taus.size, dtype=np.float64)
+            elif mode == "group":
+                # For each tau, find associated cohorts and sum their group sizes
+                w_list = []
+                for tau_val in taus:
+                    cohorts_for_tau = df_cells[df_cells["tau"] == tau_val]["g"].unique()
+                    w_tau = sum(group_size.get(int(g), 0) for g in cohorts_for_tau)
+                    w_list.append(w_tau)
+                w = np.array(w_list, dtype=np.float64)
+            # direct: treated_t; spill: fallback to group
+            elif "n_w" in df_cells.columns:
+                w = np.array(
+                    [df_cells.loc[df_cells["tau"] == t, "n_w"].sum() for t in taus],
+                    dtype=np.float64,
+                )
+            else:
+                # For spill, fallback to group
+                w_list = []
+                for tau_val in taus:
+                    cohorts_for_tau = df_cells[df_cells["tau"] == tau_val]["g"].unique()
+                    w_tau = sum(group_size.get(int(g), 0) for g in cohorts_for_tau)
+                    w_list.append(w_tau)
+                w = np.array(w_list, dtype=np.float64)
+            if w.sum() <= 0:
+                return np.nan, (np.nan, np.nan)
+            w = w / w.sum()
+            tau_to_param = att_tau_df.set_index("tau")["params"].to_dict()
+            vals = np.asarray(
+                [float(tau_to_param[t]) for t in taus],
+                dtype=np.float64,
+            )
+            theta = float(np.sum(w * vals))
+            rowpos = {t: i for i, t in enumerate(att_tau_df["tau"].to_list())}
+            rows = np.array([rowpos[t] for t in taus], dtype=int)
+            star = (w.reshape(-1, 1) * att_star[rows, :]).sum(axis=0)
+            # Use bootstrap studentization for Post ATE band via centralized helper.
+            lo_b, hi_b = bt.uniform_confidence_band(
+                np.array([theta], dtype=np.float64),
+                star.reshape(1, -1),
+                alpha=0.05,
+                studentize="bootstrap",
+                context="eventstudy",
+            )
+            return theta, (float(lo_b[0]), float(hi_b[0]))
+
+        post_direct, post_direct_band = _post_agg(dir_tau, dir_tau_star, df_dir)
+        # Use beta_S (unscaled) for post-aggregation spillover inference
+        post_spill, post_spill_band = _post_agg(bs_tau, bs_tau_star, df_bs)
+        post_beta_s, post_beta_s_band = _post_agg(bs_tau, bs_tau_star, df_bs)
+
+        def _attach(df_series: pd.DataFrame, bands) -> pd.DataFrame:
+            (lo_pre, hi_pre), (lo_post, hi_post), (lo_full, hi_full) = bands
+            out = df_series.copy()
+            for c in [
+                "pre_lower_95",
+                "pre_upper_95",
+                "post_lower_95",
+                "post_upper_95",
+                "full_lower_95",
+                "full_upper_95",
+            ]:
+                out[c] = np.nan
+            for idx, val in lo_pre.items():
+                out.loc[idx, "pre_lower_95"] = val
+                out.loc[idx, "pre_upper_95"] = hi_pre[idx]
+            for idx, val in lo_post.items():
+                out.loc[idx, "post_lower_95"] = val
+                out.loc[idx, "post_upper_95"] = hi_post[idx]
+            # write true full sup-t band (non-baseline)
+            for idx, val in lo_full.items():
+                out.loc[idx, "full_lower_95"] = val
+                out.loc[idx, "full_upper_95"] = hi_full[idx]
+            return out
+
+        dir_tau_out = _attach(dir_tau, bands_direct)
+        # Use beta_S (unscaled) for spillover parameter series with valid CIs
+        spi_tau_out = _attach(
+            bs_tau, bands_spill,
+        )  # Display beta_S, not scaled spillover
+        bs_tau_out = _attach(bs_tau, bands_beta_s)
+
+        # number of bootstrap replications used & store multipliers for reproducibility
+        _W_all_local = locals().get("W_all", None)
+        if _W_all_local is not None:
+            B = int(_W_all_local.shape[1])
+            W_used = _W_all_local
+        else:
+            B = int(W_obs.shape[1])
+            W_used = W_obs
+
+        bootstrap_desc = (
+            "wild residual (WCR/WCU), shared multipliers by "
+            + (
+                "cluster x time"
+                if (self.cluster_ids is not None and self.time_ids is not None)
+                else (
+                    "cluster"
+                    if self.cluster_ids is not None
+                    else (
+                        "calendar time" if self.time_ids is not None else "observation"
+                    )
+                )
+            )
+            + "; policy=delegated_to_BootConfig_or_user"
+        )
+
+        spill_interp = (
+            "β_S^C (controls) and β_S^C x mean(S | exposed controls); "
+            "β_S^T=β_S^C+β_DS (available in cell-level beta)"
+        )
+
+        info: dict[str, object] = {
+            "Estimator": "EventStudy: Spatial-DID",
+            "RowNormalizedW": self.row_normalized,
+            "ResidualType": self.residual_type,
+            "Bootstrap": bootstrap_desc,
+            "NoAnalyticPValues": True,
+            "CenterAt": self.center_at,
+            "ZeroRowsW": zero_rows,
+            "SelfLoops": self_loops,
+            "SpillInterpretation": spill_interp,
+            "B": int(B),
+            # Unified aggregated values for summary
+            "PostATT": post_direct,
+            "PostSpill": post_spill,
+            "PostBetaS": post_beta_s,
+            # Back-compat legacy container
+            "PostAggregates": {
+                "direct": {"value": post_direct, "band95": post_direct_band},
+                "spill": {"value": post_spill, "band95": post_spill_band},
+                "beta_s": {"value": post_beta_s, "band95": post_beta_s_band},
+            },
+            "TauWeight": self.tau_weight,
+            "GroupSizeMap": group_size,
+        }
+        # Add diagnostics about exposure matrix W and S among controls
+        try:
+            row_sums = Wd.sum(axis=1)
+            W_norm_flag = (
+                "row-stochastic"
+                if np.allclose(row_sums, 1.0, atol=1e-10)
+                else "not-row-stochastic"
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            LOGGER.debug("Unable to summarize row sums for W: %s", exc)
+            W_norm_flag = "unknown"
+        # Fraction of rows whose row-sum is (nearly) equal to the median row-sum.
+        try:
+            rs = Wd.sum(axis=1)
+            med = float(np.median(rs))
+            frac_close = float(np.mean(np.isclose(rs, med, atol=1e-8)))
+        except (TypeError, ValueError) as exc:
+            LOGGER.debug("Unable to compute W diagnostics: %s", exc)
+            frac_close = float("nan")
+        try:
+            # S controls: S values for units that are never-treated (G==0) and have positive exposure
+            S_controls_vals = S[(G == 0) & (S > 0.0)].ravel()
+            S_stats = {
+                "mean_S_controls": float(np.nanmean(S_controls_vals))
+                if S_controls_vals.size
+                else float("nan"),
+                "var_S_controls": float(np.nanvar(S_controls_vals))
+                if S_controls_vals.size
+                else float("nan"),
+            }
+        except (FloatingPointError, ValueError) as exc:
+            LOGGER.debug("Unable to compute spillover stats: %s", exc)
+            S_stats = {"mean_S_controls": None, "var_S_controls": None}
+        info.update({"W_norm": W_norm_flag, "S_stats": S_stats})
+        info.update({"W_RowSumFractionCloseToMedian": frac_close})
+
+        # --- STANDARD EstimationResult export (direct effects) ---
+        # Convert tuple bands to standard dict format for summary.py/plots.py compatibility
+        # STANDARDIZATION: All three series (direct, spill, beta_s) get pre/post/full uniform bands
+        (
+            (lo_pre_direct, hi_pre_direct),
+            (lo_post_direct, hi_post_direct),
+            (lo_full_direct, hi_full_direct),
+        ) = bands_direct
+        # Reindex band Series by actual tau values so plotting can match by tau
+        try:
+            tau_dir_vals = dir_tau.set_index("tau").index
+            lo_pre_direct.index = lo_pre_direct.index.map(
+                lambda i: int(dir_tau.loc[i, "tau"]),
+            )
+            hi_pre_direct.index = hi_pre_direct.index.map(
+                lambda i: int(dir_tau.loc[i, "tau"]),
+            )
+            lo_post_direct.index = lo_post_direct.index.map(
+                lambda i: int(dir_tau.loc[i, "tau"]),
+            )
+            hi_post_direct.index = hi_post_direct.index.map(
+                lambda i: int(dir_tau.loc[i, "tau"]),
+            )
+            lo_full_direct.index = lo_full_direct.index.map(
+                lambda i: int(dir_tau.loc[i, "tau"]),
+            )
+            hi_full_direct.index = hi_full_direct.index.map(
+                lambda i: int(dir_tau.loc[i, "tau"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            LOGGER.debug("Failed to realign direct uniform bands: %s", exc)
+        # Attach provenance metadata required by plotting API (uniform/sup-t)
+        _bands_meta = {
+            "origin": "bootstrap",
+            "policy": str(getattr(boot_cfg, "policy", "bootstrap"))
+            if "boot_cfg" in locals()
+            else "bootstrap",
+            "dist": getattr(boot_cfg, "dist", None) if "boot_cfg" in locals() else None,
+            "kind": "uniform",
+            "level": 95,
+            "B": int(B),
+            # mark as DiD/event-study family for uniform-band plots
+            "estimator": "did",
+        }
+        standard_bands_direct = {
+            "pre": pd.DataFrame({"lower": lo_pre_direct, "upper": hi_pre_direct}),
+            "post": pd.DataFrame({"lower": lo_post_direct, "upper": hi_post_direct}),
+            "full": pd.DataFrame({"lower": lo_full_direct, "upper": hi_full_direct}),
+            "__meta__": _bands_meta,
+        }
+
+        (
+            (lo_pre_spill, hi_pre_spill),
+            (lo_post_spill, hi_post_spill),
+            (lo_full_spill, hi_full_spill),
+        ) = bands_spill
+        # index を確実に τ（int）へ（NaN バンドの原因を除去）
+        for s in (
+            lo_pre_spill,
+            hi_pre_spill,
+            lo_post_spill,
+            hi_post_spill,
+            lo_full_spill,
+            hi_full_spill,
+        ):
+            if isinstance(s, pd.Series):
+                s.index = s.index.map(lambda i: int(spi_tau.loc[i, "tau"]))
+        standard_bands_spill = {
+            "pre": pd.DataFrame({"lower": lo_pre_spill, "upper": hi_pre_spill}),
+            "post": pd.DataFrame({"lower": lo_post_spill, "upper": hi_post_spill}),
+            "full": pd.DataFrame({"lower": lo_full_spill, "upper": hi_full_spill}),
+            "post_scalar_spill": pd.DataFrame(
+                {
+                    "lower": [float(post_spill_band[0])],
+                    "upper": [float(post_spill_band[1])],
+                },
+            ),
+            "__meta__": _bands_meta,
+        }
+
+        (lo_pre_bs, hi_pre_bs), (lo_post_bs, hi_post_bs), (lo_full_bs, hi_full_bs) = (
+            bands_beta_s
+        )
+        try:
+            lo_pre_bs.index = lo_pre_bs.index.map(lambda i: int(bs_tau.loc[i, "tau"]))
+            hi_pre_bs.index = hi_pre_bs.index.map(lambda i: int(bs_tau.loc[i, "tau"]))
+            lo_post_bs.index = lo_post_bs.index.map(lambda i: int(bs_tau.loc[i, "tau"]))
+            hi_post_bs.index = hi_post_bs.index.map(lambda i: int(bs_tau.loc[i, "tau"]))
+            lo_full_bs.index = lo_full_bs.index.map(lambda i: int(bs_tau.loc[i, "tau"]))
+            hi_full_bs.index = hi_full_bs.index.map(lambda i: int(bs_tau.loc[i, "tau"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            LOGGER.debug("Failed to realign beta_s uniform bands: %s", exc)
+        standard_bands_beta_s = {
+            "pre": pd.DataFrame({"lower": lo_pre_bs, "upper": hi_pre_bs}),
+            "post": pd.DataFrame({"lower": lo_post_bs, "upper": hi_post_bs}),
+            "full": pd.DataFrame({"lower": lo_full_bs, "upper": hi_full_bs}),
+            "post_scalar_beta_s": pd.DataFrame(
+                {
+                    "lower": [float(post_beta_s_band[0])],
+                    "upper": [float(post_beta_s_band[1])],
+                },
+            ),
+            "__meta__": _bands_meta,
+        }
+
+        # Primary return: EstimationResult for direct effects (standard format)
+        return EstimationResult(
+            params=dir_tau_out.set_index("tau")["params"],
+            bands={
+                **standard_bands_direct,
+                "post_scalar": pd.DataFrame(
+                    {
+                        "lower": [float(post_direct_band[0])],
+                        "upper": [float(post_direct_band[1])],
+                    },
+                ),
+                "post_scalar_spill": pd.DataFrame(
+                    {
+                        "lower": [float(post_spill_band[0])],
+                        "upper": [float(post_spill_band[1])],
+                    },
+                ),
+            },
+            n_obs=len(used_rows),
+            model_info={
+                **info,
+                "EffectType": "Direct",
+                "Note": "Use .extra['custom_result'] for full SpatialDIDResult with spill effects",
+                "CenterAt": int(self.center_at),
+                "UniformBandsStandardized": {
+                    "description": "All three series (direct, spill, beta_s) use pre/post/full uniform bands with bootstrap studentization",
+                    "series": ["direct_tau", "spill_tau", "beta_s_tau"],
+                    "bands_available": ["pre", "post", "full"],
+                    "studentization": "bootstrap (B+1) sup-t over non-baseline τ",
+                },
+            },
+            extra={
+                "custom_result": SpatialDIDResult(
+                    direct_tau=dir_tau_out,
+                    spill_tau=spi_tau_out,
+                    beta_s_tau=bs_tau_out,
+                    bands_direct=bands_direct,
+                    bands_spill=bands_spill,
+                    bands_beta_s=bands_beta_s,
+                    model_info=info,
+                ),
+                "spill_tau": spi_tau_out,
+                "beta_s_tau": bs_tau_out,
+                "W_multipliers_inference": W_used,
+                "bands_source": "bootstrap",
+                "bands_spill_standard": standard_bands_spill,
+                "bands_beta_s_standard": standard_bands_beta_s,
+                "post_scalar_direct": pd.DataFrame(
+                    {
+                        "lower": [float(post_direct_band[0])],
+                        "upper": [float(post_direct_band[1])],
+                    },
+                ),
+                "post_scalar_spill": pd.DataFrame(
+                    {
+                        "lower": [float(post_spill_band[0])],
+                        "upper": [float(post_spill_band[1])],
+                    },
+                ),
+                "post_scalar_beta_s": pd.DataFrame(
+                    {
+                        "lower": [float(post_beta_s_band[0])],
+                        "upper": [float(post_beta_s_band[1])],
+                    },
+                ),
+            },
+        )
+
+    @classmethod
+    def from_formula(  # noqa: PLR0913
+        cls,
+        *,
+        data: pd.DataFrame,
+        formula: str | None = None,
+        id_col: str | None = None,
+        time_col: str | None = None,
+        options: str | None = None,
+        W_dict: dict | None = None,
+        W: la.Matrix | None = None,
+        boot: BootConfig | None = None,
+        **kwargs,
+    ) -> SpatialDID:
+        parsed = None
+        if formula is not None:
+            parser = FormulaParser(
+                data,
+                id_name=id_col,
+                t_name=time_col,
+                W_dict=W_dict,
+            )
+            parsed = parser.parse(formula, iv=None, options=options)
+
+        df_use, boot_eff, meta = prepare_formula_environment(
+            formula=formula,
+            data=data,
+            parsed=parsed,
+            boot=boot,
+            default_boot_kwargs={
+                "policy": "boottest",
+                "enumeration_mode": "boottest",
+                "dist": "standard_normal",
+            },
+        )
+        meta.attrs["_formula_df"] = df_use
+
+        kw = dict(kwargs) if kwargs else {}
+        id_name = id_col if id_col is not None else kw.pop("id_name", None)
+        t_name = time_col if time_col is not None else kw.pop("t_name", None)
+        cohort_name = kw.pop("cohort_name", None)
+        treat_name = kw.pop("treat_name", None)
+        y_name = kw.pop("y_name", None)
+        # Infer y_name from formula LHS if not explicitly provided
+        if y_name is None and formula is not None and "~" in formula:
+            y_name = formula.split("~", 1)[0].strip()
+        kw.pop("W", None)
+        kw.pop("boot", None)
+
+        boot_to_use = boot_eff if boot_eff is not None else boot
+
+        inst = cls(
+            id_name=id_name,
+            t_name=t_name,
+            cohort_name=cohort_name,
+            treat_name=treat_name,
+            y_name=y_name,
+            W=W,
+            boot=boot_to_use,
+            **kw,
+        )
+        attach_formula_metadata(inst, meta)
+        inst._formula_df = df_use
+        return inst
+
+    @classmethod
+    def fit_from_formula(  # noqa: PLR0913
+        cls,
+        *,
+        data: pd.DataFrame,
+        formula: str | None = None,
+        id_col: str | None = None,
+        time_col: str | None = None,
+        options: str | None = None,
+        W_dict: dict | None = None,
+        W: la.Matrix | None = None,
+        boot: BootConfig | None = None,
+        fit_kwargs: dict | None = None,
+        **kwargs,
+    ) -> EstimationResult:
+        est = cls.from_formula(
+            data=data,
+            formula=formula,
+            id_col=id_col,
+            time_col=time_col,
+            options=options,
+            W_dict=W_dict,
+            W=W,
+            boot=boot,
+            **kwargs,
+        )
+        extra = fit_kwargs or {}
+        return est.fit(**extra)

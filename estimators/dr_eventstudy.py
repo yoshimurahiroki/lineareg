@@ -845,11 +845,9 @@ class DREventStudy:
         if n == 0 or n_treat in {0, n}:
             return np.zeros(0, dtype=np.float64), 0.0, 0, keep_index[:0], None
 
-        # Treated and control IPW weights (Hájek-style numerators)
-        w1 = (Dg / p_safe).reshape(-1)
-        w0 = ((1.0 - Dg) / (1.0 - p_safe)).reshape(-1)
+        w1 = Dg.reshape(-1)
+        w0 = ((1.0 - Dg) * p_safe / (1.0 - p_safe)).reshape(-1)
 
-        # Hájek denominators (sum of weights)
         if hajek:
             den1 = float(w1.sum()) if w1.sum() > 0 else 1.0
             den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
@@ -911,15 +909,15 @@ class DREventStudy:
             ph = ph[keep]
             keep_index = orig_index[keep]
         p_safe = np.clip(ph, hajek_eps, 1.0 - hajek_eps)
-        w1 = (Dg / p_safe).reshape(-1)
-        w0 = ((1.0 - Dg) / (1.0 - p_safe)).reshape(-1)
+        w1 = Dg.reshape(-1)
+        w0 = ((1.0 - Dg) * p_safe / (1.0 - p_safe)).reshape(-1)
         if hajek:
             den1 = float(w1.sum()) if w1.sum() > 0 else 1.0
             den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
         else:
             den1 = max(float(n_treat), 1.0)
             den0 = max(float(Dg.size - n_treat), 1.0)
-        n_treat = int(Dg.sum())  # UPDATED after potential drop
+        n_treat = int(Dg.sum())
         if dY.size == 0 or n_treat in {0, Dg.size}:
             return np.zeros(0, dtype=np.float64), 0.0, 0, keep_index[:0], None
         mu1 = float((w1 * dY).sum() / den1)

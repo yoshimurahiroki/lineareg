@@ -775,8 +775,9 @@ class OLS(BaseEstimator):
                 ),
                 "constant_position": (
                     "last"
-                    if self._const_name
-                    in (self._var_names[-1] if self._var_names else [])
+                    if (self._const_name is not None
+                        and self._var_names
+                        and self._const_name == self._var_names[-1])
                     else None
                 ),
             },

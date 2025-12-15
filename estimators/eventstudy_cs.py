@@ -556,19 +556,16 @@ class CallawaySantAnnaES:
                     (1.0 - Dg) * ((dY - m0) - mu0) / max(float((1.0 - Dg).sum()), 1.0)
                 )
             elif cov_mode == "ipw" and ps is not None:
-                w1 = Dg / max(float(Dg.sum()), 1.0)
-                w0 = (1.0 - Dg) / max(float((1.0 - Dg).sum()), 1.0)
-                # Stabilized inverse-probability weights
-                sw1 = w1 / np.maximum(ps, 1e-8)
-                sw0 = w0 / np.maximum(1.0 - ps, 1e-8)
-                sw1 = sw1 / np.sum(sw1)
-                sw0 = sw0 / np.sum(sw0)
-                att = float((sw1 * dY).sum() - (sw0 * dY).sum())
-                mu1 = float((sw1 * dY).sum())
-                mu0 = float((sw0 * dY).sum())
-                psi = (Dg * (dY - mu1) / max(float(Dg.sum()), 1.0)) - (
-                    (1.0 - Dg) * (dY - mu0) / max(float((1.0 - Dg).sum()), 1.0)
-                )
+                ps_safe = np.clip(ps, 1e-8, 1.0 - 1e-8)
+                w1 = Dg / ps_safe
+                w0 = (1.0 - Dg) * ps_safe / (1.0 - ps_safe)
+                den1 = float(w1.sum()) if w1.sum() > 0 else 1.0
+                den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
+                mu1 = float((w1 * dY).sum() / den1)
+                mu0 = float((w0 * dY).sum() / den0)
+                att = mu1 - mu0
+                psi = (w1 * (dY - mu1)) / den1 - (w0 * (dY - mu0)) / den0
+                psi = psi - float(psi.mean())
             elif cov_mode == "dr" and X is not None and ps is not None:
                 # Outcome regressions
                 Xt = X[Dg == 1.0, :]
@@ -579,17 +576,24 @@ class CallawaySantAnnaES:
                 beta_c, *_ = lstsq(np.c_[np.ones(Xc.shape[0]), Xc], yc, rcond=None)
                 m1 = beta_t[0] + (beta_t[1:].reshape(1, -1) @ X.T).reshape(-1)
                 m0 = beta_c[0] + (beta_c[1:].reshape(1, -1) @ X.T).reshape(-1)
-                # DR score for long differences (Hájek normalization implied)
-                sw1 = Dg / np.maximum(ps, 1e-8)
-                sw0 = (1.0 - Dg) / np.maximum(1.0 - ps, 1e-8)
-                sw1 = sw1 / np.sum(sw1)
-                sw0 = sw0 / np.sum(sw0)
-                att = float((sw1 * (dY - m0)).sum() - (sw0 * (dY - m0)).sum())
-                mu1 = float((sw1 * (dY - m0)).sum())
-                mu0 = float((sw0 * (dY - m0)).sum())
-                psi = (Dg * ((dY - m0) - mu1) / max(float(Dg.sum()), 1.0)) - (
-                    (1.0 - Dg) * ((dY - m0) - mu0) / max(float((1.0 - Dg).sum()), 1.0)
-                )
+                ps_safe = np.clip(ps, 1e-8, 1.0 - 1e-8)
+                w1 = Dg / ps_safe
+                w0 = (1.0 - Dg) * ps_safe / (1.0 - ps_safe)
+                den1 = float(w1.sum()) if w1.sum() > 0 else 1.0
+                den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
+                R1 = float((w1 * (dY - m0)).sum() / den1)
+                R0 = float((w0 * (dY - m0)).sum() / den0)
+                n_treat_local = int(Dg.sum())
+                mu_aug = float((Dg * (m1 - m0)).sum() / n_treat_local) if n_treat_local > 0 else 0.0
+                att = mu_aug + R1 - R0
+                psi_t = (w1 * (dY - m0)) / den1 - R1 * (w1 / den1)
+                psi_c = -(w0 * (dY - m0)) / den0 + R0 * (w0 / den0)
+                aug = np.zeros_like(dY)
+                if n_treat_local > 0:
+                    aug_mask = Dg == 1
+                    aug[aug_mask] = ((m1 - m0)[aug_mask] - mu_aug) / float(n_treat_local)
+                psi = psi_t + psi_c + aug
+                psi = psi - float(psi.mean())
             else:
                 # No covariates (default): original Hájek difference-in-means on dY
                 w1 = Dg / max(float(Dg.sum()), 1.0)
@@ -603,8 +607,8 @@ class CallawaySantAnnaES:
             # map indices back to df_aug to align with W rows
             used_idx = sub.index.to_numpy(dtype=int)
             # multiplier bootstrap draws: att* = att + sum_i ψ_i * W_i (per-column b)
-            att_star = att + psi.reshape(-1, 1) * W[used_idx, :]
-            att_star = att_star.sum(axis=0, keepdims=False).reshape(1, -1)
+            att_star = att + (psi.reshape(-1, 1) * W[used_idx, :]).sum(axis=0, keepdims=False)
+            att_star = att_star.reshape(1, -1)
 
             tau = int(t) - int(g)
             att_rows.append((int(g), int(t), int(tau), float(att), int(n1)))

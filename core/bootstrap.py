@@ -1568,14 +1568,11 @@ def uniform_confidence_band(  # noqa: PLR0913
             fam_max = np.max(np.abs(T[cols, :]), axis=0)
             Tmax_fam = np.maximum(Tmax_fam, fam_max)
         _c = float(finite_sample_quantile(Tmax_fam, 1.0 - float(alpha)))
-    # Avoid invalid multiply warnings: only scale finite standard errors
     theta_arr = np.asarray(theta, dtype=np.float64).reshape(-1)
     se_arr = np.asarray(se, dtype=np.float64).reshape(-1)
     finite = np.isfinite(se_arr)
-    # Initialize with NaN so non-finite SEs propagate to NaN bounds without ops
-    delta = np.full_like(se_arr, np.nan, dtype=np.float64)
+    delta = np.zeros_like(se_arr, dtype=np.float64)
     if np.any(finite):
-        # Compute only on finite entries; guard floating warnings explicitly
         with np.errstate(invalid="ignore", over="ignore", under="ignore"):
             delta[finite] = _c * se_arr[finite]
     lo = theta_arr - delta

@@ -942,7 +942,6 @@ class DREventStudy:
         treated = Dg == 1
         Xc = X[~treated, :]
         yc = y[~treated].reshape(-1, 1)
-        # OLS via QR
         Q, R = la.qr(Xc, pivoting=False, mode="economic")
         beta = la.qr_coef_R(R, la.dot(Q.T, yc))
         e_c = (yc - la.dot(Xc, beta)).reshape(-1)
@@ -950,83 +949,6 @@ class DREventStudy:
         Gc_inv = la.solve(Gc, la.eye(Gc.shape[0]), sym_pos=True)
         xbar1 = la.col_mean(X[treated, :]).reshape(-1)
         return Gc_inv, e_c, xbar1
-
-    def _if_gamma_ipw(  # noqa: PLR0913
-        self,
-        D: np.ndarray,
-        dY: np.ndarray,
-        p: np.ndarray,
-        Xps: np.ndarray,
-        Iinv: np.ndarray,
-        *,
-        hajek_eps: float,
-    ) -> np.ndarray:
-        """Add logit first-stage IF contribution to IPW-Hajek ATT.
-
-        Note: For Hájek-normalized IPW, the sensitivity of mu1 cancels and only
-        the mu0 side contributes to the first-stage influence function. This
-        docstring clarifies the analytic cancellation; implementation remains
-        unchanged (matching R did semantics when hajek=True).
-        """
-        p = np.clip(p.reshape(-1), hajek_eps, 1.0 - hajek_eps)
-        w0 = (1.0 - D) / (1.0 - p)
-        den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
-        mu0 = float((w0 * dY).sum() / den0)
-        # sensitivity wrt gamma: d(mu0)/dγ = (1/den0) Σ w0 (dY - mu0) X
-        s = (la.dot((w0 * (dY - mu0)).reshape(1, -1), Xps).reshape(-1)) / den0
-        IF_gamma = la.dot(Xps, Iinv) * (D - p).reshape(-1, 1)
-        return la.dot(IF_gamma, s.reshape(-1, 1)).reshape(-1)
-
-    def _if_beta_or_dr(
-        self,
-        D: np.ndarray,
-        X: np.ndarray,
-        p: np.ndarray,
-        ols_info: tuple[np.ndarray, np.ndarray, np.ndarray],
-        n_treat: int,
-    ) -> np.ndarray:
-        """Add OLS(controls) first-stage IF to DR via dATT/dbeta_m."""
-        Gc_inv, e_c, xbar1 = ols_info
-        p = p.reshape(-1)
-        treated = D == 1
-        # dATT/dbeta_m = -( xbar1 + (1/n_treat) Σ_{D=0} (p/(1-p)) X )
-        w = np.zeros_like(p)
-        w[~treated] = p[~treated] / np.maximum(1.0 - p[~treated], 1e-12)
-        denom = max(float(n_treat), 1.0)
-        weighted_controls = w[~treated].reshape(-1, 1) * X[~treated, :]
-        sum_controls = np.sum(weighted_controls, axis=0)
-        sens = -(xbar1 + sum_controls / denom)
-        Xc = X[~treated, :]
-        psi_c = -la.dot(Xc, la.dot(Gc_inv, sens.reshape(-1, 1))).reshape(-1) * e_c
-        # Return full-length array (controls get contribution, treated get 0)
-        psi = np.zeros(D.shape[0], dtype=np.float64)
-        psi[~treated] = psi_c
-        return psi
-
-    def _if_gamma_dr(  # noqa: PLR0913
-        self,
-        D: np.ndarray,
-        dY: np.ndarray,
-        Xps: np.ndarray,
-        p: np.ndarray,
-        Iinv: np.ndarray,
-        m0: np.ndarray,
-        m1: np.ndarray,
-        n_treat: int,
-    ) -> np.ndarray:
-        """Add logit first-stage IF to DR via dATT/dgamma."""
-        if m0.shape != m1.shape:
-            raise ValueError("m0 and m1 must have matching shapes.")
-        if int(n_treat) <= 0:
-            raise ValueError("n_treat must be positive.")
-        p = p.reshape(-1)
-        treated = D == 1
-        resid = dY - m0  # use (dY - m0) in control-based residual part
-        w = np.zeros_like(p)
-        w[~treated] = p[~treated] / np.maximum(1.0 - p[~treated], 1e-12)
-        sens = la.col_mean(w.reshape(-1, 1) * (resid.reshape(-1, 1) * Xps)).reshape(-1)
-        IF_gamma = la.dot(Xps, Iinv) * (D - p).reshape(-1, 1)
-        return la.dot(IF_gamma, sens.reshape(-1, 1)).reshape(-1)
 
     @classmethod
     def from_formula(  # noqa: PLR0913

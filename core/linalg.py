@@ -432,7 +432,7 @@ def _rank_from_diag(diagR: NDArray[np.float64], ncols: int, mode: str = "stata")
     ----------
     - diagR: absolute values of R diagonal entries
     - ncols: number of columns in the original design (used to scale tol)
-    - mode: "stata" (default) or "numpy"/"R" — defines tolerance recipe
+    - mode: "stata" (default) or "numpy"/"R"/"r" — defines tolerance recipe
 
     Returns
     -------
@@ -442,12 +442,13 @@ def _rank_from_diag(diagR: NDArray[np.float64], ncols: int, mode: str = "stata")
     d = np.asarray(diagR, dtype=float).reshape(-1)
     if d.size == 0:
         return 0
+    mode_lower = str(mode).lower()
     # Stata (Mata qrsolve) default tolerance: eta = 1e-13 * trace(|R|)/rows(R)
-    if mode == "stata":
+    if mode_lower == "stata":
         # use explicit trace(|R|)/rows(R) as in Stata Mata qrsolve documentation
         eta = 1e-13 * (float(np.sum(np.abs(d))) / float(d.size))
         tol = eta
-    elif mode in ("R", "R_strict"):
+    elif mode_lower in ("r", "r_strict"):
         # R's lm.fit documented default: tol = 1e-7 * max(|diag(R)|)
         # Use this relative threshold to mimic dqrdc2/dgeqp3 behavior in practice.
         tol = 1e-7 * float(np.max(np.abs(d)))

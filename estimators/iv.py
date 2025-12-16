@@ -121,9 +121,7 @@ def _cd_kp_stats(  # noqa: PLR0913
         lam_cd = float("nan")
     if np.isfinite(lam_cd):
         out["cd_min_eig"] = float(lam_cd)
-        out["cd_wald_F"] = (
-            float(lam_cd * (n - K) / K) if (K > 0 and n > K) else float("nan")
-        )
+        out["cd_wald_F"] = float(lam_cd / K) if K > 0 else float("nan")
 
     # ---- Kleibergen-Paap rk statistic (heterosked/cluster robust) ----
     if u is None or Z2_t.shape[1] == 0:

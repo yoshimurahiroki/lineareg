@@ -137,11 +137,13 @@ def cholesky(A: Any, lower: bool = True, prefer_gpu: bool | None = None):
     Ad = asarray(A, xp=xp, dtype=np.float64)
     try:
         if xp is np:
-            return np.linalg.cholesky(Ad)
+            L = np.linalg.cholesky(Ad)
+            return L if lower else L.T
         # cupy path
         if _cpxla is not None:
             return to_cpu(_cpxla.cholesky(Ad, lower=lower))  # type: ignore[attr-defined]
-        return to_cpu(xp.linalg.cholesky(Ad))
+        L_gpu = xp.linalg.cholesky(Ad)
+        return to_cpu(L_gpu) if lower else to_cpu(L_gpu).T
     finally:
         # be proactive about freeing large temporaries
         free_gpu_cache()

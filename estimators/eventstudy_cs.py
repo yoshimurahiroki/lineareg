@@ -518,7 +518,7 @@ class CallawaySantAnnaES:
                 # CRITICAL: Never use outcome dY as features for PS. If X is None, use a constant-only design.
                 X_ps = X if X is not None else np.ones((dY.shape[0], 1), dtype=np.float64)
                 clf = LogisticRegression(
-                    penalty="none",
+                    penalty=None,
                     solver="lbfgs",
                     max_iter=1000,
                 )
@@ -557,7 +557,7 @@ class CallawaySantAnnaES:
                 )
             elif cov_mode == "ipw" and ps is not None:
                 ps_safe = np.clip(ps, 1e-8, 1.0 - 1e-8)
-                w1 = Dg / ps_safe
+                w1 = Dg
                 w0 = (1.0 - Dg) * ps_safe / (1.0 - ps_safe)
                 den1 = float(w1.sum()) if w1.sum() > 0 else 1.0
                 den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
@@ -565,7 +565,19 @@ class CallawaySantAnnaES:
                 mu0 = float((w0 * dY).sum() / den0)
                 att = mu1 - mu0
                 psi = (w1 * (dY - mu1)) / den1 - (w0 * (dY - mu0)) / den0
-                psi = psi - float(psi.mean())
+                psi_centered = psi - float(psi.mean())
+                if X_ps is not None and X_ps.shape[0] == psi_centered.shape[0]:
+                    score = (Dg - ps_safe).reshape(-1, 1) * X_ps
+                    Ihat = (X_ps.T * (ps_safe * (1.0 - ps_safe)).reshape(1, -1)) @ X_ps
+                    try:
+                        Iinv = np.linalg.solve(Ihat, np.eye(Ihat.shape[0]))
+                    except np.linalg.LinAlgError:
+                        Iinv = np.linalg.pinv(Ihat)
+                    sens = (X_ps.T @ (w0 * (dY - mu0)).reshape(-1, 1)).reshape(-1) / den0
+                    IF_gamma = score @ Iinv
+                    psi_fs = (IF_gamma @ sens.reshape(-1, 1)).reshape(-1)
+                    psi_centered = psi_centered + psi_fs - float(psi_fs.mean())
+                psi = psi_centered
             elif cov_mode == "dr" and X is not None and ps is not None:
                 # Outcome regressions
                 Xt = X[Dg == 1.0, :]
@@ -577,7 +589,7 @@ class CallawaySantAnnaES:
                 m1 = beta_t[0] + (beta_t[1:].reshape(1, -1) @ X.T).reshape(-1)
                 m0 = beta_c[0] + (beta_c[1:].reshape(1, -1) @ X.T).reshape(-1)
                 ps_safe = np.clip(ps, 1e-8, 1.0 - 1e-8)
-                w1 = Dg / ps_safe
+                w1 = Dg
                 w0 = (1.0 - Dg) * ps_safe / (1.0 - ps_safe)
                 den1 = float(w1.sum()) if w1.sum() > 0 else 1.0
                 den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
@@ -593,7 +605,34 @@ class CallawaySantAnnaES:
                     aug_mask = Dg == 1
                     aug[aug_mask] = ((m1 - m0)[aug_mask] - mu_aug) / float(n_treat_local)
                 psi = psi_t + psi_c + aug
-                psi = psi - float(psi.mean())
+                psi_centered = psi - float(psi.mean())
+                Xc_aug = np.c_[np.ones(Xc.shape[0]), Xc]
+                e_c = yc - (Xc_aug @ beta_c)
+                try:
+                    Gc_inv = np.linalg.solve(Xc_aug.T @ Xc_aug, np.eye(Xc_aug.shape[1]))
+                except np.linalg.LinAlgError:
+                    Gc_inv = np.linalg.pinv(Xc_aug.T @ Xc_aug)
+                X_aug = np.c_[np.ones(X.shape[0]), X]
+                xbar1 = np.mean(X_aug[Dg == 1, :], axis=0)
+                w_ctrl = np.zeros_like(ps_safe)
+                w_ctrl[Dg == 0] = ps_safe[Dg == 0] / np.maximum(1.0 - ps_safe[Dg == 0], 1e-12)
+                sens_or = -(xbar1 + np.sum(w_ctrl[Dg == 0].reshape(-1, 1) * X_aug[Dg == 0, :], axis=0) / max(float(n_treat_local), 1.0))
+                psi_or = np.zeros_like(psi_centered)
+                psi_or[Dg == 0] = -(Xc_aug @ (Gc_inv @ sens_or.reshape(-1, 1))).reshape(-1) * e_c
+                psi_centered = psi_centered + psi_or - float(psi_or.mean())
+                if X_ps is not None and X_ps.shape[0] == psi_centered.shape[0]:
+                    score = (Dg - ps_safe).reshape(-1, 1) * X_ps
+                    Ihat = (X_ps.T * (ps_safe * (1.0 - ps_safe)).reshape(1, -1)) @ X_ps
+                    try:
+                        Iinv = np.linalg.solve(Ihat, np.eye(Ihat.shape[0]))
+                    except np.linalg.LinAlgError:
+                        Iinv = np.linalg.pinv(Ihat)
+                    resid_dr = dY - m0
+                    sens_ps = np.mean(w0.reshape(-1, 1) * resid_dr.reshape(-1, 1) * X_ps, axis=0)
+                    IF_gamma = score @ Iinv
+                    psi_ps = (IF_gamma @ sens_ps.reshape(-1, 1)).reshape(-1)
+                    psi_centered = psi_centered + psi_ps - float(psi_ps.mean())
+                psi = psi_centered
             else:
                 # No covariates (default): original Hájek difference-in-means on dY
                 w1 = Dg / max(float(Dg.sum()), 1.0)

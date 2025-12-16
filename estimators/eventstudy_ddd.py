@@ -181,20 +181,19 @@ class DDDEventStudy:
                 clusters_all.append(np.asarray(boot_shared.space_ids))
                 clusters_all.append(np.asarray(boot_shared.time_ids))
             bootcluster = "intersection" if len(clusters_all) > 1 else "first"
-            # Delegate enumeration and policy decisions to BootConfig defaults
             W_all, wlog = bt.cluster_multipliers(
                 clusters_all,
                 n_boot=boot_shared.n_boot,
                 dist=getattr(boot_shared, "dist", "standard_normal"),
                 use_enumeration=(
-                    "disabled"
+                    False
                     if len(clusters_all) > 1
-                    else getattr(boot_shared, "use_enumeration", None)
+                    else getattr(boot_shared, "use_enumeration", True)
                 ),
                 enumeration_mode=(
-                    "disabled"
+                    "boottest"
                     if len(clusters_all) > 1
-                    else getattr(boot_shared, "enumeration_mode", None)
+                    else getattr(boot_shared, "enumeration_mode", "boottest")
                 ),
                 enum_max_g=None,
                 policy=getattr(boot_shared, "policy", None),

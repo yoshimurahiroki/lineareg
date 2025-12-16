@@ -901,9 +901,6 @@ def _demean_given_codes(  # noqa: PLR0913
             return corrections / float(len(codes_sel))
         return A
 
-    # Fallback: perform a single symmetric sweep when transform is unrecognized
-    return sweep_once_on(codes_list, X.copy())
-
     def sweep_top2(A: NDArray[np.float64]) -> NDArray[np.float64]:
         """Sweep only the top-2 FE levels (used by fixest warmup/two-FE checks).
 

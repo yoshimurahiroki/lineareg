@@ -752,7 +752,7 @@ class WildDist:
             )
             probs = np.array([1.0 / 6.0] * 6, dtype=np.float64)
             return rng.choice(vals, size=(r, c), p=probs).astype(np.float64, copy=False)
-        if self.name in {"normal", "gaussian"}:
+        if self.name in {"normal", "gaussian", "standard_normal"}:
             # Standard normal draws (mean 0, variance 1)
             return rng.standard_normal(size=(r, c)).astype(np.float64, copy=False)
         if self.name == "exp":
@@ -951,24 +951,31 @@ def cluster_multipliers(  # noqa: PLR0913
     # provided enum_max_g (safety cap) allows enumeration. Nonstandard convenience
     # modes (e.g. 'always_if_feasible') are intentionally removed for strictness.
     if use_enumeration and D.name in {"rademacher", "rad", "webb"}:
-        total = 1 << G
         if enumeration_mode != "boottest":
             raise ValueError("invalid enumeration_mode")
-        # boottest: require at least 2**G draws and optional safety cap enum_max_g
-        should_enum = (int(n_boot) >= (1 << G)) and (
-            (enum_max_g is None) or (int(enum_max_g) >= G)
-        )
+        if D.name in {"rademacher", "rad"}:
+            total = 1 << G
+            should_enum = (int(n_boot) >= total) and (
+                (enum_max_g is None) or (int(enum_max_g) >= G)
+            )
+        elif D.name == "webb":
+            emw = (
+                4 if enum_max_g_webb is None else int(enum_max_g_webb)
+            )
+            if G > emw:
+                should_enum = False
+                total = 0
+            else:
+                total = 6 ** G
+                should_enum = (int(n_boot) >= total) and (int(emw) >= G)
+        else:
+            total = 0
+            should_enum = False
         if should_enum:
             if D.name in {"rademacher", "rad"}:
                 Wg = rademacher_enumeration(G)
                 total = Wg.shape[0]
             elif D.name == "webb":
-                # guard Webb enumeration size by caller-supplied enum_max_g_webb (default 4)
-                emw = (
-                    ENUM_THRESH_BOOTTEST
-                    if enum_max_g_webb is None
-                    else int(enum_max_g_webb)
-                )
                 Wg = webb_enumeration(G, enum_max_g_webb=emw)
                 total = Wg.shape[0]
             elif D.name == "mammen":
@@ -1165,8 +1172,10 @@ def _wls_fit_restricted(  # noqa: PLR0913
     """
     y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
     r = np.asarray(r, dtype=np.float64).reshape(-1, 1)
-    Xd = to_dense(X)
-    R_eff = np.asarray(R, dtype=np.float64)
+    Xd_orig = to_dense(X)
+    R_orig = np.asarray(R, dtype=np.float64)
+    Xd = Xd_orig.copy()
+    R_eff = R_orig.copy()
     keep_mask: NDArray[np.bool_] | None = None
     if drop_rank_deficient:
         Xd_reduced, keep_mask = la.drop_rank_deficient_cols_stata(Xd)
@@ -1182,7 +1191,6 @@ def _wls_fit_restricted(  # noqa: PLR0913
         msg = "r must have the same number of rows as R."
         raise ValueError(msg)
     if R_eff.shape[0] == 0:
-        # Unconstrained case: use QR/SVD solve on sqrt-weighted design when weights provided
         if weights is None:
             beta = la.solve(Xd, y, method=(method if method in {"qr", "svd"} else "qr"))
         else:
@@ -1193,18 +1201,22 @@ def _wls_fit_restricted(  # noqa: PLR0913
             beta = la.solve(
                 Xw, yw, method=(method if method in {"qr", "svd"} else "qr"),
             )
-        yhat = dot(Xd, beta)
+        if keep_mask is not None:
+            beta_full = np.zeros((keep_mask.size, 1), dtype=np.float64)
+            beta_full[keep_mask, :] = beta
+            beta = beta_full
+            yhat = dot(Xd_orig, beta)
+        else:
+            yhat = dot(Xd, beta)
         resid = y - yhat
         return np.asarray(yhat, dtype=np.float64), np.asarray(resid, dtype=np.float64)
 
-    # Null space method to avoid Gram
     U, s, Vt = la.svd(R_eff, full_matrices=False)
     eps = np.finfo(float).eps
     rcond = max(R_eff.shape) * eps
     tol = rcond * (s.max() if s.size else 1.0)
     rank = np.sum(s > tol)
     null_space = Vt[rank:].T  # (p, p - rank)
-    # particular solution via the same SVD (no standalone pinv)
     if rank == 0:
         particular = np.zeros((Xd.shape[1], 1), dtype=np.float64)
     else:
@@ -1227,19 +1239,21 @@ def _wls_fit_restricted(  # noqa: PLR0913
         )
 
     beta_R = particular + dot(null_space, gamma)
-    if keep_mask is not None:
-        beta_full = np.zeros((keep_mask.size, 1), dtype=np.float64)
-        beta_full[keep_mask.reshape(-1, 1)] = beta_R
-        beta_R = beta_full
 
-    # Check constraint feasibility
     res = norm(dot(R_eff, beta_R) - r)
     if not np.isfinite(res) or res > 1e-10 * (
         norm(R_eff) * norm(beta_R) + norm(r) + 1.0
     ):
         msg = "Infeasible linear restrictions: ||R beta - r|| too large."
         raise ValueError(msg)
-    yhat = dot(Xd, beta_R)
+
+    if keep_mask is not None:
+        beta_full = np.zeros((keep_mask.size, 1), dtype=np.float64)
+        beta_full[keep_mask, :] = beta_R
+        beta_R = beta_full
+        yhat = dot(Xd_orig, beta_R)
+    else:
+        yhat = dot(Xd, beta_R)
     resid = y - yhat
     return np.asarray(yhat, dtype=np.float64), np.asarray(resid, dtype=np.float64)
 
@@ -2948,7 +2962,6 @@ def sparse_bootstrap_meat(
         u = hadamard(u, np.sqrt(weights))
 
     if cluster is not None:
-        # Clustered meat: sum within clusters
         G = len(np.unique(cluster))
         meat = np.zeros((K, K), dtype=np.float64)
         for g in range(G):
@@ -2961,16 +2974,14 @@ def sparse_bootstrap_meat(
                 w_g = weights[mask]
                 X_g = hadamard(X_g, np.sqrt(w_g))
                 u_g = hadamard(u_g, np.sqrt(w_g))
-            meat += dot(X_g.T, hadamard(X_g, u_g))
-    # Non-clustered meat
+            s_g = dot(X_g.T, u_g)
+            meat += dot(s_g, s_g.T)
     elif sparse.issparse(X):
-        # Sparse-aware computation
         X_sparse = sparse.csr_matrix(X) if not sparse.issparse(X) else X
-        Xu = X_sparse.multiply(u.T)  # Element-wise multiply
-        meat = to_dense(dot(Xu.T, X_sparse))
+        Xu = X_sparse.multiply(u)
+        meat = to_dense(dot(Xu.T, Xu))
     else:
-        # Dense computation
         Xu = hadamard(X, u)
-        meat = dot(Xu.T, X)
+        meat = dot(Xu.T, Xu)
 
     return meat

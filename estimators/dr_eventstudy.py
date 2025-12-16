@@ -517,7 +517,7 @@ class DREventStudy:
         for g, t in att_gt[["g", "t"]].itertuples(index=False, name=None):
             idx = idx_store[(g, t)]
             phi = phi_store[(g, t)]
-            incr = la.dot(phi.reshape(1, -1), W[idx, :]) / float(phi.shape[0])
+            incr = la.dot(phi.reshape(1, -1), W[idx, :])
             point = float(
                 att_gt.loc[(att_gt["g"] == g) & (att_gt["t"] == t), "att"].iloc[0],
             )

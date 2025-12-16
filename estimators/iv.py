@@ -1465,7 +1465,10 @@ class IV2SLS(BaseEstimator):
                 and time_ids_proc is None
             ):
                 try:
-                    scale = float(Xw.shape[0])
+                    n = Xw.shape[0]
+                    scale = float(n)
+                    # Compute residual variance (sigma^2)
+                    sigma2 = float(la.dot(uhat.T, uhat) / (n - k))
                     gbar = la.crossprod(Zw, uhat) / scale
                     S_bar = la.tdot(Zw) / scale
                     try:
@@ -1473,7 +1476,8 @@ class IV2SLS(BaseEstimator):
                     except Exception:  # noqa: BLE001
                         S_inv = la.pinv(S_bar)
                     J = la.dot(gbar.T, la.dot(S_inv, gbar))
-                    J_stat = float(la.to_dense(J).squeeze()) * scale
+                    # Standard Sargan: J = u'Z(Z'Z)^{-1}Z'u / sigma^2 ~ chi^2(L-k)
+                    J_stat = float(la.to_dense(J).squeeze()) * scale / sigma2
                     OverID_label = "Sargan"
                 except Exception:  # noqa: BLE001
                     J_stat = float("nan")

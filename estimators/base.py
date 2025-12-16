@@ -491,12 +491,18 @@ class EstimationResult:
                     continue
                 if isinstance(v, np.ndarray):
                     continue
-                # allow lists/tuples of numeric scalars
+                # allow bool (for masks like keep_mask)
+                if isinstance(v, (bool, np.bool_)):
+                    continue
+                # allow strings (for diagnostic labels)
+                if isinstance(v, str):
+                    continue
+                # allow lists/tuples of numeric scalars or strings (e.g. dropped_collinear)
                 if isinstance(v, (list, tuple)) and all(
-                    isinstance(xx, (int, float, np.integer, np.floating)) for xx in v
+                    isinstance(xx, (int, float, np.integer, np.floating, str, bool, np.bool_)) for xx in v
                 ):
                     continue
-                msg = f"Diagnostic '{k}' must be numeric scalar/array (values-only); found type {type(v)}."
+                msg = f"Diagnostic '{k}' must be numeric scalar/array/list or string (values-only); found type {type(v)}."
                 raise ValueError(msg)
 
         # Enforce that provided standard errors are bootstrap-derived (no analytic SE)

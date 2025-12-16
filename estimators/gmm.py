@@ -906,8 +906,13 @@ class GMM(BaseEstimator):
                     msg = "S_bar is singular; 2-step GMM weight undefined."
                     raise ValueError(msg)
                 Sk = la.dot(Q[:, keep].T, la.dot(S_bar, Q[:, keep]))
-                Lk = la.safe_cholesky(Sk)
-                Wk = la.chol_solve(Lk, la.eye(Sk.shape[0]))
+                # Use safe_cholesky with fallback to pseudoinverse for near-singular cases
+                try:
+                    Lk = la.safe_cholesky(Sk)
+                    Wk = la.chol_solve(Lk, la.eye(Sk.shape[0]))
+                except RuntimeError:
+                    # Fallback to pseudoinverse for numerically unstable cases
+                    Wk = la.pinv(Sk)
                 W = la.dot(Q[:, keep], la.dot(Wk, Q[:, keep].T))
                 beta_hat = self._gmm_solve(
                     X,

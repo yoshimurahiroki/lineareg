@@ -1392,8 +1392,12 @@ def _absorb_impl(  # noqa: PLR0913
     raw_fe_list = fe_ids if isinstance(fe_ids, (list, tuple)) else [fe_ids]
 
     # Defensive validation: ensure FE IDs are properly structured
-    if isinstance(raw_fe_list[0], np.ndarray) and raw_fe_list[0].ndim == 2:
-        # If first element is 2D, split columns into separate arrays
+    # Handle pandas DataFrame: split each column into a separate 1D array
+    if hasattr(raw_fe_list[0], "columns"):  # DataFrame-like
+        df = raw_fe_list[0]
+        raw_fe_list = [df[col].to_numpy() for col in df.columns]
+    elif isinstance(raw_fe_list[0], np.ndarray) and raw_fe_list[0].ndim == 2:
+        # If first element is 2D ndarray, split columns into separate arrays
         fe_arr = raw_fe_list[0]
         raw_fe_list = [fe_arr[:, j] for j in range(fe_arr.shape[1])]
 

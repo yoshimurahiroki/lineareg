@@ -588,8 +588,9 @@ class DREventStudy:
         # --- PostATT (period-aggregated over post-τ) with bootstrap scalar CI ---
         # Post scalar aggregated ATT using the same group_size map and uniform-band helper
         post_mask_tau = att_tau_plot["tau"] > self.base_tau
+        PostATT_se = float("nan")
         if np.any(post_mask_tau):
-            post_att, (lo_s, hi_s) = post_aggregate_uniform_band(
+            post_att, (lo_s, hi_s), PostATT_se = post_aggregate_uniform_band(
                 att_gt=att_gt,
                 att_tau=att_tau_plot[["tau", "att"]],
                 att_tau_star=att_tau_star,
@@ -627,6 +628,7 @@ class DREventStudy:
             # Keep BaseTau as well for backward compatibility/diagnostics
             "BaseTau": self.base_tau,
             "PostATT": PostATT,
+            "PostATT_se": PostATT_se,
             "SkippedCells": skipped,
             "SkippedSummary": skipped_summary,
             "FoldSeed": self.fold_seed,
@@ -708,8 +710,17 @@ class DREventStudy:
                 "payloads": sanitized,
                 "default": sanitized[0]["name"] if sanitized else None,
             }
+
+        se_series = pd.Series(
+            bt.bootstrap_se(att_tau_star),
+            index=att_tau_plot["tau"].astype(int).to_numpy(),
+        )
+        if int(self.base_tau) in se_series.index:
+            se_series.loc[int(self.base_tau)] = 0.0
+
         return EstimationResult(
             params=att_tau_plot.set_index("tau")["att"],
+            se=se_series,
             bands=bands,
             n_obs=total_used,
             model_info=model_info,

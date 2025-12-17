@@ -167,11 +167,11 @@ def post_aggregate_uniform_band(  # noqa: PLR0913
     tau_weight: str = "group",
     alpha: float = 0.05,
     group_size_map: dict[int, int] | None = None,
-) -> tuple[float, tuple[float, float]]:
+) -> tuple[float, tuple[float, float], float]:
     taus = att_tau["tau"].to_numpy(dtype=int)
     sel = taus > int(base_tau)
     if not np.any(sel):
-        return float("nan"), (float("nan"), float("nan"))
+        return float("nan"), (float("nan"), float("nan")), float("nan")
     if tau_weight not in {"equal", "group", "treated_t"}:
         raise ValueError("tau_weight must be one of {'equal','group','treated_t'}.")
 
@@ -221,6 +221,7 @@ def post_aggregate_uniform_band(  # noqa: PLR0913
         np.sum(w_norm.reshape(-1) * att_tau.loc[sel, "att"].to_numpy(dtype=np.float64)),
     )
     post_star = (w_norm * att_tau_star[sel_idx, :]).sum(axis=0).reshape(1, -1)
+    post_se = float(bt.bootstrap_se(post_star)[0]) if post_star.size else float("nan")
 
     lo, hi = bt.uniform_confidence_band(
         np.array([theta], dtype=np.float64),
@@ -229,7 +230,7 @@ def post_aggregate_uniform_band(  # noqa: PLR0913
         studentize="bootstrap",
         context="eventstudy",
     )
-    return float(theta), (float(lo[0]), float(hi[0]))
+    return float(theta), (float(lo[0]), float(hi[0])), post_se
 
 
 class CallawaySantAnnaES:
@@ -794,8 +795,9 @@ class CallawaySantAnnaES:
         # explicit group_size mapping; otherwise the helper will infer a
         # conservative mapping from att_gt when possible.
         post_mask_tau = plot_df["tau"] > self.center_at
+        post_att_se = float("nan")
         if np.any(post_mask_tau):
-            post_att, (lo_s, hi_s) = post_aggregate_uniform_band(
+            post_att, (lo_s, hi_s), post_att_se = post_aggregate_uniform_band(
                 att_gt=att_gt,
                 att_tau=plot_df[["tau", "att"]],
                 att_tau_star=att_tau_star,
@@ -840,6 +842,7 @@ class CallawaySantAnnaES:
             "BalanceE": self.balance_e,
             "TauSetPolicy": tau_flag,
             "PostATT": post_att,
+            "PostATT_se": post_att_se,
             # audit metadata
             "GroupSizes": group_size,
             "NumCells": int(att_gt.shape[0]),
@@ -881,8 +884,16 @@ class CallawaySantAnnaES:
             },
         }
 
+        se_series = pd.Series(
+            bt.bootstrap_se(att_tau_star),
+            index=plot_df["tau"].astype(int).to_numpy(),
+        )
+        if int(self.center_at) in se_series.index:
+            se_series.loc[int(self.center_at)] = 0.0
+
         return EstimationResult(
             params=plot_df.set_index("tau")["att"],
+            se=se_series,
             bands=bands,
             n_obs=n_unique,
             model_info=model_info,

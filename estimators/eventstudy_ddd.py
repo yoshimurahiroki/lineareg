@@ -333,6 +333,7 @@ class DDDEventStudy:
 
         # Compute weighted average post-ATT for reporting and produce a scalar bootstrap CI
         post_att_diff = float("nan")
+        post_att_diff_se = float("nan")
         post_scalar = pd.DataFrame(
             {"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)},
         )
@@ -374,6 +375,7 @@ class DDDEventStudy:
                 sd_boot = (
                     float(np.std(theta_star, ddof=1)) if theta_star.size > 1 else np.nan
                 )
+                post_att_diff_se = float(sd_boot) if np.isfinite(sd_boot) else float("nan")
                 if np.isfinite(sd_boot) and sd_boot > 0.0:
                     t_abs = np.abs((theta_star - post_att_diff) / sd_boot)
                     # finite-sample friendly rank (B+1) for the upper quantile
@@ -457,6 +459,7 @@ class DDDEventStudy:
             "TauSupport": "intersection-only (no zero-filling outside common support)",
             # Unified aggregate name: expose as PostATT (diff series aggregate)
             "PostATT": post_att_diff,
+            "PostATT_se": post_att_diff_se,
             "PostWeights": (None if post_weights is None else post_weights.to_dict()),
             "n_obs_A": int(resA.n_obs),
             "n_obs_B": int(resB.n_obs),
@@ -490,8 +493,16 @@ class DDDEventStudy:
             },
         }
 
+        se_series = pd.Series(
+            bt.bootstrap_se(diff_star),
+            index=diff_tau["tau"].astype(int).to_numpy(),
+        )
+        if int(self.center_at) in se_series.index:
+            se_series.loc[int(self.center_at)] = 0.0
+
         return EstimationResult(
             params=diff_tau.set_index("tau")["params"],
+            se=se_series,
             bands=bands,
             # >>> PATCH: total observations actually used by ES (sum of A and B)
             n_obs=int(resA.n_obs + resB.n_obs),

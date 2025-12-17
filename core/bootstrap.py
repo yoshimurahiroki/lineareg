@@ -2985,3 +2985,86 @@ def sparse_bootstrap_meat(
         meat = dot(Xu.T, Xu)
 
     return meat
+
+
+def resample_units_block(df, id_name: str, rng):
+    import pandas as pd
+    ids = pd.Index(df[id_name].unique())
+    n = int(ids.size)
+    draw = rng.choice(ids.to_numpy(), size=n, replace=True)
+    parts = []
+    for j, orig in enumerate(draw):
+        tmp = df.loc[df[id_name] == orig].copy()
+        tmp[id_name] = j
+        parts.append(tmp)
+    return pd.concat(parts, ignore_index=True)
+
+
+def two_way_demean(M):
+    mu_i = np.mean(M, axis=1, keepdims=True)
+    mu_t = np.mean(M, axis=0, keepdims=True)
+    mu = float(np.mean(M))
+    Md = M - mu_i - mu_t + mu
+    return Md, mu_i, mu_t, mu
+
+
+def pca_low_rank(Md, r: int):
+    if r <= 0:
+        return np.zeros_like(Md)
+    U, s, Vt = np.linalg.svd(Md, full_matrices=False)
+    r = int(min(r, s.size))
+    return (U[:, :r] * s[:r]) @ Vt[:r, :]
+
+
+def select_r_ic1(Md, rmax: int = 8) -> int:
+    N, T = Md.shape
+    rmax = int(min(rmax, min(N, T) - 1))
+    if rmax <= 0:
+        return 0
+    NT = N * T
+    pen = (N + T) / NT * np.log(NT / (N + T))
+    best_r, best = 0, np.inf
+    for r in range(0, rmax + 1):
+        Lr = pca_low_rank(Md, r)
+        sigma2 = float(np.mean((Md - Lr) ** 2))
+        ic = np.log(max(sigma2, 1e-12)) + r * pen
+        if ic < best:
+            best = ic
+            best_r = r
+    return int(best_r)
+
+
+def fit_ife_dgp(Y, W, tau_it, *, control_mask, r=None, rmax: int = 8, ridge: float = 1e-8) -> dict:
+    Yc = Y[control_mask, :].astype(float)
+    Md, _, _, _ = two_way_demean(Yc)
+    r_sel = select_r_ic1(Md, rmax=rmax) if r is None else int(r)
+    if r_sel > 0:
+        U, s, Vt = np.linalg.svd(Md, full_matrices=False)
+        F = Vt[:r_sel, :].T
+        X_full = np.column_stack([np.ones(Y.shape[1]), F])
+    else:
+        X_full = np.ones((Y.shape[1], 1))
+    delta_t = np.mean(Yc - np.mean(Yc, axis=1, keepdims=True), axis=0)
+    Y0_hat = np.zeros_like(Y, dtype=float)
+    for i in range(Y.shape[0]):
+        untreated = (W[i, :] == 0)
+        if not np.any(untreated):
+            Y0_hat[i, :] = float(np.mean(Y[i, :]))
+            continue
+        y_tilde = Y[i, :] - delta_t
+        X = X_full[untreated, :]
+        y_u = y_tilde[untreated]
+        XtX = X.T @ X + ridge * np.eye(X.shape[1])
+        beta = np.linalg.solve(XtX, X.T @ y_u)
+        Y0_hat[i, :] = (X_full @ beta) + delta_t
+    resid = Y - (Y0_hat + tau_it * W)
+    return {"Y0_hat": Y0_hat, "resid": resid, "r": r_sel}
+
+
+def wild_unit_multiplier(rng, n: int, dist: str = "rademacher"):
+    dist = (dist or "rademacher").lower()
+    if dist in {"rademacher", "r"}:
+        return rng.choice(np.array([-1.0, 1.0]), size=n, replace=True)
+    if dist in {"normal", "gaussian"}:
+        return rng.standard_normal(size=n)
+    raise ValueError(f"Unknown dist: {dist}")

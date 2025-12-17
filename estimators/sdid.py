@@ -9,7 +9,7 @@ Analytical SEs and p-values remain intentionally unavailable (project policy).
 PATCH (event-time grid & post shrinkage):
 - Build the union τ-grid implied by all treated cohorts x observed calendar times.
 - Preserve τ with zero treated denominator; keep the row and mark ``NaN``.
-- Align placebo/bootstrap draws to the full τ-grid so summaries and plots retain
+- Align bootstrap draws to the full τ-grid so summaries and plots retain
   every event time (mirrors R/stata behavior).
 """
 
@@ -48,7 +48,7 @@ class SDID:
     cohort_name: optional cohort column name (adoption time) if present
     control_group: 'notyet' (default) or 'never'
     eta_omega, eta_lambda: regularization defaults (None -> formula for eta_omega)
-    boot: BootConfig for placebo bootstrap (default None -> no bootstrap)
+    boot: BootConfig for unit/IFE bootstrap (default None -> no bootstrap)
     alpha: confidence level for bootstrap bands
     fw_max_iter, fw_tol: Frank-Wolfe solver controls
     omega_intercept/lambda_intercept: whether to demean rows/cols before solving
@@ -91,7 +91,7 @@ class SDID:
     def fit(self, df: pd.DataFrame | None = None) -> EstimationResult:
         """Fit SDID on a long balanced panel DataFrame.
 
-        Returns an EstimationResult with params (event-time series indexed by τ), bands (placebo CI and uniform sup-t),
+        Returns an EstimationResult with params (event-time series indexed by τ), bands (bootstrap CI and uniform sup-t),
         model_info and extra fields including per-cohort weights and time series.
         """
         if df is None:
@@ -231,234 +231,136 @@ class SDID:
             float(valid_post["att"].mean()) if not valid_post.empty else float("nan")
         )
 
-        # Placebo bootstrap for post_ATT if requested
+        tau_grid = np.array(tau_union_sorted, dtype=int)
+        n_treated_total = sum(int(idx_tr.sum()) for idx_tr in cohorts.values())
+
         bands = None
-        boot_info: dict[str, object] = {"B": 0}
-        info_bands_meta: dict[str, object] = {}
+        boot_info: dict[str, object] = {"B": 0, "post_ATT_draws": np.empty(0, float), "ATT_tau_draws": np.full((0, 0), np.nan, dtype=float)}
+        se_series = None
+
         if self.boot is not None and getattr(self.boot, "n_boot", 0) > 0:
-            boot = self.boot or BootConfig(n_boot=bt.DEFAULT_BOOTSTRAP_ITERATIONS)
-            mode_raw = getattr(boot, "mode", None)
-            mode = "placebo" if not mode_raw else str(mode_raw).lower()
-            if mode not in {"placebo"}:
-                msg = "SDID bootstrap currently supports mode='placebo' only."
-                raise ValueError(msg)
-
-            B = int(boot.n_boot)
-            rng = np.random.default_rng(getattr(boot, "seed", None))
-            att_b = np.full(B, np.nan, dtype=float)
-            att_tau_star: np.ndarray | None = None
-            att_tau_grid: np.ndarray | None = None
-
-            controls_all = W.sum(axis=1) == 0
-            co_ids = np.where(controls_all)[0]
-            if len(co_ids) <= 1:
-                import warnings as _w
-
-                _w.warn(
-                    "SDID placebo bootstrap requires at least 2 control units; skipping bootstrap.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                B = 0
+            B = int(self.boot.n_boot)
+            alpha_level = float(self.alpha)
+            rng = np.random.default_rng(getattr(self.boot, "seed", None))
+            mode_raw = getattr(self.boot, "mode", None)
+            if mode_raw is None or str(mode_raw).lower() == "auto":
+                mode = "unit" if n_treated_total >= 2 else "ife_wild"
             else:
-                cohort_items = list(cohorts.items())
-                cohort_sizes = [int(idx_tr.sum()) for _, idx_tr in cohort_items]
-                for b in range(B):
-                    Wb = np.zeros_like(W)
-                    assigned_units: list[np.ndarray] = []
-                    for (g, _idx_tr), sz in zip(cohort_items, cohort_sizes):
-                        if sz == 0:
-                            assigned_units.append(np.empty(0, dtype=np.int64))
-                            continue
-                        draw = rng.choice(co_ids, size=sz, replace=(len(co_ids) < sz))
-                        for u in np.asarray(draw, dtype=int):
-                            Wb[u, times >= g] = 1
-                        assigned_units.append(np.asarray(draw, dtype=np.int64))
-                    boot_info.setdefault("assignments", []).append(assigned_units)
+                mode = str(mode_raw).lower()
+            if mode == "unit" and n_treated_total < 2:
+                raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='ife_wild'.")
+
+            theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
+            att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
+            att_b = np.full(B, np.nan, dtype=float)
+            filled = 0
+
+            if mode == "ife_wild":
+                tau_it = np.zeros_like(Y, dtype=float)
+                for g, meta in results_g.items():
+                    delta_gt = np.asarray(meta["delta_t"], dtype=float)
+                    idx_tr = cohorts[g]
+                    for i in np.where(idx_tr)[0]:
+                        tau_it[i, :] = delta_gt
+                control_mask = W.sum(axis=1) == 0
+                dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask)
+                Y0_hat, resid = dgp["Y0_hat"], dgp["resid"]
+
+            for b in range(B):
+                try:
+                    if mode == "unit":
+                        df_b = bt.resample_units_block(df, self.id_name, rng)
+                        Y_b, W_b, _, times_b = self._panel_matrices(df_b)
+                    else:
+                        v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
+                        Y_b = Y0_hat + tau_it * W + (v[:, None] * resid)
+                        W_b, times_b = W, times
+
                     att_post_b, att_tau_b = self._att_path_from_w(
-                        Y,
-                        Wb,
-                        times,
-                        zeta_omega=None,
-                        zeta_lambda=None,
+                        Y_b, W_b, times_b,
+                        zeta_omega=None, zeta_lambda=None,
                         omega_intercept=self.omega_intercept,
                         lambda_intercept=self.lambda_intercept,
                         max_iter=self.fw_max_iter,
                         tol=self.fw_tol,
                     )
-                    att_b[b] = float(att_post_b)
-                    taus_b = np.array(sorted(att_tau_b.keys()), dtype=int)
-                    if att_tau_star is None:
-                        att_tau_grid = taus_b
-                        att_tau_star = np.full((taus_b.size, B), np.nan, dtype=float)
-                    else:
-                        new_grid = np.union1d(att_tau_grid, taus_b).astype(int)
-                        if new_grid.size != att_tau_grid.size or np.any(
-                            new_grid != att_tau_grid,
-                        ):
-                            old = att_tau_star
-                            att_tau_star = np.full(
-                                (new_grid.size, B), np.nan, dtype=float,
-                            )
-                            idx_old = {int(t): i for i, t in enumerate(att_tau_grid)}
-                            for i_t, t in enumerate(new_grid):
-                                j = idx_old.get(int(t))
-                                if j is not None:
-                                    att_tau_star[i_t, :b] = old[j, :b]
-                            att_tau_grid = new_grid
-                    assert att_tau_star is not None  # for type checkers
-                    assert att_tau_grid is not None
-                    pos = {int(t): i for i, t in enumerate(att_tau_grid)}
-                    for t, v in att_tau_b.items():
-                        att_tau_star[pos[int(t)], b] = float(v)
 
-            if B > 0 and att_tau_star is not None and att_tau_grid is not None:
-                with np.errstate(all="ignore"):
-                    col_means = np.nanmean(att_tau_star, axis=0, keepdims=True)
-                    att_tau_star = att_tau_star - col_means
-                    col_std = np.nanstd(att_tau_star, axis=0, ddof=1, keepdims=True)
-                    safe_std = np.where(col_std > 0, col_std, 1.0)
-                    att_tau_star = att_tau_star / safe_std
-                placebo_se = float(np.nanstd(att_b, ddof=1) * np.sqrt((B - 1) / B))
-                from scipy.stats import norm
-                z_crit = float(norm.ppf(1.0 - self.alpha / 2.0))
-                lo_center = float(att_post) - z_crit * placebo_se
-                hi_center = float(att_post) + z_crit * placebo_se
-                bands = {
-                    "post_ATT": pd.DataFrame(
-                        {"lower": [float(lo_center)], "upper": [float(hi_center)]},
-                    ),
-                }
-                bands.setdefault("__meta__", {})
-                bands["__meta__"].update(
-                    {
-                        "origin": "placebo",
-                        "kind": "uniform",
-                        "policy": "placebo-reassignment",
-                        "level": int(100 * (1.0 - self.alpha)),
-                        "B": int(B),
-                        "estimator": "sdid",
-                    },
-                )
-                placebo_assignments = boot_info.get("assignments")
-                if placebo_assignments is not None:
-                    formatted = []
-                    for draw in placebo_assignments:
-                        draw_fmt = []
-                        for g_key, arr in zip(sorted(cohorts.keys()), draw):
-                            draw_fmt.append(
-                                {
-                                    "g": int(g_key),
-                                    "units": [
-                                        int(u) for u in np.asarray(arr, dtype=int)
-                                    ],
-                                },
-                            )
-                        formatted.append(draw_fmt)
-                    bands["__meta__"]["assignments"] = formatted
+                    vec_b = np.full(tau_grid.size, np.nan, dtype=float)
+                    for j, tau in enumerate(tau_grid):
+                        if int(tau) in att_tau_b:
+                            vec_b[j] = att_tau_b[int(tau)]
+                    mask_post_b = tau_grid >= 0
+                    if np.any(~np.isfinite(vec_b[mask_post_b])):
+                        continue
+                    att_tau_star[:, filled] = vec_b
+                    att_b[filled] = float(att_post_b)
+                    filled += 1
+                except Exception:
+                    continue
 
-                att_hat = att_tau.set_index("tau")["att"].astype(float)
-                grid_hat = att_hat.index.to_numpy(dtype=int)
-                tau_union_boot = np.union1d(att_tau_grid, grid_hat).astype(int)
-                if tau_union_boot.size != grid_hat.size or np.any(
-                    tau_union_boot != grid_hat,
-                ):
-                    att_hat = att_hat.reindex(tau_union_boot)
-                    grid_hat = tau_union_boot
-                if tau_union_boot.size != att_tau_grid.size or np.any(
-                    tau_union_boot != att_tau_grid,
-                ):
-                    old = att_tau_star
-                    new_star = np.full((tau_union_boot.size, B), np.nan, dtype=float)
-                    idx_old = {int(t): i for i, t in enumerate(att_tau_grid)}
-                    for i_t, t in enumerate(tau_union_boot):
-                        j = idx_old.get(int(t))
-                        if j is not None:
-                            new_star[i_t, :] = old[j, :]
-                    att_tau_star = new_star
-                    att_tau_grid = tau_union_boot
+            if filled < B:
+                import warnings as _w
+                _w.warn(f"SDID bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
+                att_tau_star = att_tau_star[:, :filled]
+                att_b = att_b[:filled]
 
-                # ---- CenterAt=-1 に合わせて帯域を分割（uniform sup-t のみ） ----
-                mask_full = np.isfinite(att_hat.to_numpy())
-                mask_pre = mask_full & (grid_hat < base_tau)  # τ < -1
-                mask_post = mask_full & (grid_hat > base_tau)  # τ >= 0
+            boot_info["B"] = filled
+            boot_info["post_ATT_draws"] = att_b
+            boot_info["ATT_tau_draws"] = att_tau_star
 
-                def _sup_t_band(mask: np.ndarray) -> pd.DataFrame | None:
-                    idx = np.where(mask)[0]
-                    if idx.size == 0:
+            if filled > 1:
+                se_vals = bt.bootstrap_se(att_tau_star)
+                se_series_tau = pd.Series(se_vals, index=tau_grid)
+                if base_tau in se_series_tau.index:
+                    se_series_tau.loc[base_tau] = 0.0
+                post_att_se = float(np.std(att_b, ddof=1))
+
+                def _sup_t_band(mask):
+                    idx = np.flatnonzero(mask)
+                    if idx.size == 0 or filled < 2:
                         return None
-                    diffs = att_tau_star[idx, :] - att_hat.to_numpy()[idx, None]
+                    th = theta_hat[idx]
+                    thb = att_tau_star[idx, :]
+                    diffs = thb - th[:, None]
                     se = np.nanstd(diffs, axis=1, ddof=1)
                     ok = np.isfinite(se) & (se > 0)
                     if not np.any(ok):
                         return None
-                    tdraw = np.full_like(diffs, np.nan, dtype=float)
-                    tdraw[ok, :] = diffs[ok, :] / se[ok, None]
+                    tdraw = diffs[ok, :] / se[ok, None]
                     sup_abs = np.nanmax(np.abs(tdraw), axis=0)
-                    c = float(np.nanquantile(sup_abs, 1 - self.alpha))
-                    lo_vec = att_hat.to_numpy()[idx] - c * se
-                    hi_vec = att_hat.to_numpy()[idx] + c * se
-                    return pd.DataFrame(
-                        {
-                            "lower": pd.Series(lo_vec, index=grid_hat[idx]),
-                            "upper": pd.Series(hi_vec, index=grid_hat[idx]),
-                        },
-                    ).sort_index()
+                    c = float(np.nanquantile(sup_abs, 1.0 - alpha_level))
+                    lo = th.copy()
+                    hi = th.copy()
+                    lo[ok] = th[ok] - c * se[ok]
+                    hi[ok] = th[ok] + c * se[ok]
+                    return pd.DataFrame({"lower": pd.Series(lo, index=tau_grid[idx]), "upper": pd.Series(hi, index=tau_grid[idx])}).sort_index()
 
-                bands["full"] = _sup_t_band(mask_full)
-                bands["pre"] = _sup_t_band(mask_pre)
-                bands["post"] = _sup_t_band(mask_post)
-                bands_meta = bands.setdefault("__meta__", {})
-                bands_meta.update(
-                    {
-                        "kind": "uniform",
-                        "estimator": "eventstudy",
-                        "level": float(100.0 * (1.0 - self.alpha)),
-                        "B": int(B),
-                        # Document regularization defaults for reproducibility
-                        "eta_omega_default": (
-                            "(N_tr*T_post)^(1/4)"
-                            if self.eta_omega is None
-                            else float(self.eta_omega)
-                        ),
-                        "eta_lambda_default": float(self.eta_lambda),
-                    },
-                )
+                mask_full = np.isfinite(theta_hat)
+                mask_pre = mask_full & (tau_grid < base_tau)
+                mask_post = mask_full & (tau_grid > base_tau)
 
-                # --- PostATT scalar: bootstrap studentized（uniform for scalar）---
-                try:
-                    post_vals = att_hat.loc[grid_hat[mask_post]].to_numpy()
-                    if post_vals.size > 0 and np.isfinite(post_vals).any():
-                        theta_hat = float(np.nanmean(post_vals))
-                        se_hat = float(np.nanstd(att_b, ddof=1))
-                        if np.isfinite(se_hat) and se_hat > 0:
-                            with np.errstate(all="ignore"):
-                                t_abs = np.abs((att_b - theta_hat) / se_hat)
-                                c = float(np.nanquantile(t_abs, 1.0 - self.alpha))
-                            lo_s = theta_hat - c * se_hat
-                            hi_s = theta_hat + c * se_hat
-                            bands["post_scalar"] = pd.DataFrame(
-                                {"lower": [float(lo_s)], "upper": [float(hi_s)]},
-                            )
-                        else:
-                            bands["post_scalar"] = pd.DataFrame(
-                                {"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}
-                            )
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.debug("Failed to compute post ATT scalar band (uniform): %s", exc)
-
-                boot_info = {
-                    "B": B,
-                    "post_ATT_draws": att_b,
-                    "ATT_tau_draws": att_tau_star,
+                bands = {
+                    "full": _sup_t_band(mask_full),
+                    "pre": _sup_t_band(mask_pre),
+                    "post": _sup_t_band(mask_post),
                 }
-            else:
-                bands = None
-                boot_info = {
-                    "B": 0,
-                    "post_ATT_draws": np.empty(0, float),
-                    "ATT_tau_draws": np.full((0, 0), np.nan, dtype=float),
+
+                from scipy.stats import norm
+                z_crit = float(norm.ppf(1.0 - alpha_level / 2.0))
+                lo_post = att_post - z_crit * post_att_se
+                hi_post = att_post + z_crit * post_att_se
+                bands["post_ATT"] = pd.DataFrame({"lower": [lo_post], "upper": [hi_post]})
+                bands["post_scalar"] = bands["post_ATT"]
+                bands["__meta__"] = {
+                    "origin": "bootstrap",
+                    "mode": mode,
+                    "kind": "uniform",
+                    "level": int(100 * (1.0 - alpha_level)),
+                    "B": int(filled),
+                    "estimator": "sdid",
                 }
+
+                se_series = pd.concat([se_series_tau, pd.Series({"post_ATT": post_att_se})])
 
         # ==== Expose event-time series as params indexed by τ ====
         params_tau = att_tau.set_index("tau")["att"].astype(float)
@@ -473,7 +375,7 @@ class SDID:
             "Alpha": float(self.alpha),
             "Cohorts": sorted(cohorts.keys()),
             "Times": times.tolist(),
-            "Bootstrap": "in-space placebo (never-treated reassignment; NOT pairs bootstrap), uniform bands over τ",
+            "Bootstrap": "unit/IFE bootstrap (NOT placebo/pairs bootstrap), uniform bands over τ",
             "NoAnalyticPValues": True,
         }
         # Unified aggregate reporting
@@ -503,7 +405,7 @@ class SDID:
             "att_tau_den": att_tau.set_index("tau")["den"],
             "boot": boot_info,
             "boot_meta": bands_meta if isinstance(bands_meta, dict) else None,
-            "bands_source": ("placebo" if bands is not None else None),
+            "bands_source": ("bootstrap" if bands is not None else None),
             "se_source": "bootstrap",
         }
         att_tau_star_arr = boot_info.get("ATT_tau_draws")
@@ -654,7 +556,7 @@ class SDID:
         res = est.fit(**extra)
         if getattr(est, "_cluster_ids_from_formula", None) is not None:
             res.model_info["ClusterIDsProvided"] = True
-            res.model_info["ClusterIDsUsedInPlacebo"] = False
+            res.model_info["ClusterIDsUsedInBootstrap"] = False
         return res
 
     # -------------------- internals --------------------

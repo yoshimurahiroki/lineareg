@@ -4,7 +4,7 @@
 Scope and policy
 ----------------
 - Single treated unit, never-treated donor pool.
-- Inference uses in-space placebos with uniform sup-t bands (no analytic SE/p-values).
+- Inference uses bootstrap with uniform sup-t bands (no analytic SE/p-values).
 - Provides per-event-time effects with uniform bands and aggregated post-period ATT
     with a studentized bootstrap CI.
 - All matrix ops route through :mod:`lineareg.core.linalg` to maintain consistency
@@ -12,7 +12,7 @@ Scope and policy
 - Bands are attached in `res.bands` under keys:
         * "pre" | "post" | "full": DataFrame(index=tau, columns={'lower','upper'})
         * "post_scalar": DataFrame with a single row {'lower','upper'}
-        * "__meta__": {'origin':'placebo','kind':'uniform','estimator':'synthetic','level':95,'B':J}
+        * "__meta__": {'origin':'bootstrap','kind':'uniform','estimator':'synthetic','level':95,'B':J}
     This aligns with the uniform-only policy shared with ES/SDID.
 
 Notes
@@ -122,7 +122,7 @@ class _Spec:
 
 
 class SyntheticControl:
-    """Synthetic Control with placebo (uniform sup-t) bands and post aggregation.
+    """Synthetic Control with bootstrap (uniform sup-t) bands and post aggregation.
 
     Parameters
     ----------
@@ -236,7 +236,7 @@ class SyntheticControl:
         boot: BootConfig | None = None,
         _boot: object | None = None,
     ) -> EstimationResult:
-        """Estimate ATT path and placebo uniform (sup-t) bands.
+        """Estimate ATT path and bootstrap uniform (sup-t) bands.
 
         Now supports multiple treated units with staggered adoption (cohorts),
         similar to SDID. Results are aggregated in event-time τ = t - g.
@@ -245,7 +245,7 @@ class SyntheticControl:
         and row selection) is used by default when `df` is None. This mirrors the
         formula pipeline used across estimators.
         """
-        # For API parity only: Synthetic Control uses placebo inference; `boot` is accepted but ignored.
+        # For API parity only: Synthetic Control uses bootstrap inference; `boot` is accepted but ignored.
         # allow from_formula() defaulting
         # Accept either `boot` (public) or `_boot` (internal) for compatibility
         if _boot is None and boot is not None:
@@ -373,137 +373,201 @@ class SyntheticControl:
             else float("nan")
         )
 
-        # --------------------- Placebo (in-space) bands ---------------------
-        # For each donor unit, create a placebo by treating it as treated
-        # and using other donors to construct synthetic control. We record
-        # a complete placebo path per (donor, cohort) over the unified τ-grid.
+
         tau_grid = np.array(tau_union_sorted, dtype=int)
-        placebo_cols: list[np.ndarray] = []
-        placebo_rmspe_ratios: list[float] = []
+        n_treated_total = sum(len(m["treated_ids"]) for m in results_g.values())
+        B = 0
+        band_level = round(100.0 * (1.0 - float(self.spec.alpha)))
+        bands = None
+        se_series = None
+        att_tau_star = np.full((tau_grid.size, 0), np.nan, dtype=float)
+        post_ci_df = pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+        boot = self._boot
 
-        for jj in donors:
-            pool = [k for k in donors if k != jj]
-            if len(pool) == 0:
-                continue
+        if boot is not None and int(getattr(boot, "n_boot", 0)) > 1:
+            B = int(boot.n_boot)
+            alpha_level = float(self.spec.alpha)
+            rng = np.random.default_rng(getattr(boot, "seed", None))
+            mode_raw = getattr(boot, "mode", None)
+            if mode_raw is None or str(mode_raw).lower() == "auto":
+                mode = "unit" if n_treated_total >= 2 else "ife_wild"
+            else:
+                mode = str(mode_raw).lower()
+            if mode == "unit" and n_treated_total < 2:
+                raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='ife_wild'.")
 
-            jp = id_to_row[jj]
-            pool_indices = np.array([id_to_row[p] for p in pool], dtype=int)
+            theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
+            att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
+            att_b = np.full(B, np.nan, dtype=float)
+            filled = 0
+            attempts = 0
+            max_attempts = max(10_000, 10 * B)
 
-            for g in results_g:
-                t0_col = t_to_col[g]
-                pre = np.arange(0, t0_col)
-                post = np.arange(t0_col, len(times))
+            if mode == "ife_wild":
+                W_mat = np.zeros((len(ids), len(times)), dtype=int)
+                for g, meta in results_g.items():
+                    t0_c = t_to_col[g]
+                    for tid in meta["treated_ids"]:
+                        W_mat[id_to_row[tid], t0_c:] = 1
+                tau_it = np.zeros_like(Y, dtype=float)
+                for g, meta in results_g.items():
+                    att_path = np.asarray(meta["att_path"], dtype=float)
+                    for tid in meta["treated_ids"]:
+                        tau_it[id_to_row[tid], :] = att_path
+                control_mask = np.all(W_mat == 0, axis=1)
+                dgp = bt.fit_ife_dgp(Y, W_mat, tau_it, control_mask=control_mask)
+                Y0_hat, resid = dgp["Y0_hat"], dgp["resid"]
 
-                if pre.size == 0:
+            while filled < B and attempts < max_attempts:
+                attempts += 1
+                try:
+                    if mode == "unit":
+                        df_b = bt.resample_units_block(df, self.spec.id_name, rng)
+                        Y_b, ids_b, times_b = self._wide_from_long(df_b)
+                        cohorts_b, donors_b = self._treated_info(df_b)
+                    else:
+                        v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
+                        Y_star = Y0_hat + tau_it * W_mat + (v[:, None] * resid)
+                        Y_b, ids_b, times_b = Y_star, ids, times
+                        cohorts_b, donors_b = cohorts, donors
+
+                    id_to_row_b = {i: k for k, i in enumerate(ids_b)}
+                    t_to_col_b = {t: k for k, t in enumerate(times_b)}
+                    j_donors_b = np.array([id_to_row_b[jj] for jj in donors_b if jj in id_to_row_b], dtype=int)
+                    if j_donors_b.size == 0:
+                        continue
+
+                    results_g_b = {}
+                    tau_union_b = set()
+                    for g, treated_units in cohorts_b.items():
+                        t0_col_b = t_to_col_b.get(g)
+                        if t0_col_b is None:
+                            continue
+                        pre_b = np.arange(0, t0_col_b)
+                        if pre_b.size == 0:
+                            continue
+                        att_paths_g_b = []
+                        for tid in treated_units:
+                            if tid not in id_to_row_b:
+                                continue
+                            i_tr_b = id_to_row_b[tid]
+                            y_pre_b = Y_b[i_tr_b, pre_b].astype(np.float64)
+                            X_pre_b = Y_b[j_donors_b][:, pre_b].T.astype(np.float64)
+                            w_b = _frank_wolfe_simplex(X_pre_b, y_pre_b, max_iter=self.max_iter, tol=self.tol)
+                            y_treated_b = Y_b[i_tr_b, :].astype(np.float64)
+                            X_all_b = Y_b[j_donors_b, :].T.astype(np.float64)
+                            y_synth_b = la.dot(X_all_b, w_b)
+                            att_paths_g_b.append(y_treated_b - y_synth_b)
+                        if len(att_paths_g_b) == 0:
+                            continue
+                        att_path_g_b = np.mean(att_paths_g_b, axis=0)
+                        results_g_b[g] = {"att_path": att_path_g_b, "n_treated": len(att_paths_g_b)}
+                        for t_val in times_b:
+                            tau_union_b.add(int(t_val) - int(g))
+
+                    if len(results_g_b) == 0:
+                        continue
+
+                    tau_union_sorted_b = sorted(tau_union_b)
+                    att_tau_num_b = {int(tau): 0.0 for tau in tau_union_sorted_b}
+                    att_tau_den_b = {int(tau): 0.0 for tau in tau_union_sorted_b}
+                    for g, meta_b in results_g_b.items():
+                        att_path_b = meta_b["att_path"]
+                        n_tr_b = meta_b["n_treated"]
+                        for t_idx, t_val in enumerate(times_b):
+                            tau_val = int(t_val) - int(g)
+                            if tau_val in att_tau_num_b:
+                                att_tau_num_b[tau_val] += float(att_path_b[t_idx]) * n_tr_b
+                                att_tau_den_b[tau_val] += n_tr_b
+
+                    vec_b = np.full(tau_grid.size, np.nan, dtype=float)
+                    for j, tau in enumerate(tau_grid):
+                        tau_key = int(tau)
+                        if tau_key in att_tau_den_b and att_tau_den_b[tau_key] > 0:
+                            vec_b[j] = att_tau_num_b[tau_key] / att_tau_den_b[tau_key]
+
+                    mask_post_b = tau_grid >= 0
+                    if np.any(~np.isfinite(vec_b[mask_post_b])):
+                        continue
+                    att_tau_star[:, filled] = vec_b
+                    post_vals_b = [att_tau_num_b.get(t, 0.0) / att_tau_den_b.get(t, 1.0)
+                                   for t in tau_grid[mask_post_b] if att_tau_den_b.get(int(t), 0) > 0]
+                    att_b[filled] = float(np.mean(post_vals_b)) if post_vals_b else np.nan
+                    filled += 1
+                except Exception:
                     continue
 
-                Xp_pre = Y[pool_indices][:, pre].T.astype(np.float64)
-                yp_pre = Y[jp, pre].astype(np.float64)
-                wp = _frank_wolfe_simplex(
-                    Xp_pre, yp_pre, max_iter=self.max_iter, tol=self.tol,
-                )
+            if filled < B:
+                import warnings as _w
+                _w.warn(f"SC bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
+                att_tau_star = att_tau_star[:, :filled]
+                att_b = att_b[:filled]
 
-                Xp_all = Y[pool_indices, :].T.astype(np.float64)
-                yp_all = Y[jp, :].astype(np.float64)
-                yp_synth = la.dot(Xp_all, wp)
-                placebo_path = yp_all - yp_synth
+            if filled > 1:
+                se_vals = bt.bootstrap_se(att_tau_star)
+                se_series = pd.Series(se_vals, index=tau_grid)
+                if center_at in se_series.index:
+                    se_series.loc[center_at] = 0.0
+                post_att_se = float(np.std(att_b, ddof=1))
 
-                rmspe_pre_p = float(np.sqrt(np.mean((yp_pre - la.dot(Xp_pre, wp)) ** 2)))
-                if post.size > 0 and rmspe_pre_p > 0:
-                    rmspe_post_p = float(np.sqrt(np.mean((yp_all[post] - yp_synth[post]) ** 2)))
-                    placebo_rmspe_ratios.append(rmspe_post_p / rmspe_pre_p)
+                def _sup_t_band(mask):
+                    idx = np.flatnonzero(mask)
+                    if idx.size == 0 or filled < 2:
+                        return None
+                    th = theta_hat[idx]
+                    thb = att_tau_star[idx, :]
+                    diffs = thb - th[:, None]
+                    se = np.nanstd(diffs, axis=1, ddof=1)
+                    ok = np.isfinite(se) & (se > 0)
+                    if not np.any(ok):
+                        return None
+                    tdraw = diffs[ok, :] / se[ok, None]
+                    sup_abs = np.nanmax(np.abs(tdraw), axis=0)
+                    c = float(np.nanquantile(sup_abs, 1.0 - alpha_level))
+                    lo = th.copy()
+                    hi = th.copy()
+                    lo[ok] = th[ok] - c * se[ok]
+                    hi[ok] = th[ok] + c * se[ok]
+                    return pd.DataFrame({"lower": pd.Series(lo, index=tau_grid[idx]), "upper": pd.Series(hi, index=tau_grid[idx])}).sort_index()
 
-                col = np.full(tau_grid.size, np.nan, dtype=float)
-                for t_idx, t_val in enumerate(times):
-                    tau_val = int(t_val) - int(g)
-                    try:
-                        j = int(np.where(tau_grid == int(tau_val))[0][0])
-                        col[j] = float(placebo_path[t_idx])
-                    except Exception:  # noqa: BLE001
-                        continue
-                placebo_cols.append(col)
+                mask_full = np.isfinite(theta_hat)
+                mask_pre = mask_full & (tau_grid < center_at)
+                mask_post = mask_full & (tau_grid > center_at)
 
-        # Stack placebo columns into matrix K x B
-        B = len(placebo_cols)
-        band_level = round(100.0 * (1.0 - float(self.spec.alpha)))
-        if B == 0:
-            att_tau_star = np.full((tau_grid.size, 0), np.nan, dtype=float)
+                band_pre = _sup_t_band(mask_pre)
+                band_post = _sup_t_band(mask_post)
+                band_full = _sup_t_band(mask_full)
+
+                from scipy.stats import norm
+                z_crit = float(norm.ppf(1.0 - alpha_level / 2.0))
+                lo_post = post_agg - z_crit * post_att_se
+                hi_post = post_agg + z_crit * post_att_se
+                post_ci_df = pd.DataFrame({"lower": [lo_post], "upper": [hi_post]})
+
+                bands = {
+                    "pre": band_pre,
+                    "post": band_post,
+                    "full": band_full,
+                    "post_scalar": post_ci_df,
+                    "post_ATT": post_ci_df,
+                    "__meta__": {
+                        "origin": "bootstrap",
+                        "mode": mode,
+                        "kind": "uniform",
+                        "level": band_level,
+                        "B": int(filled),
+                        "estimator": "synthetic",
+                    },
+                }
+                se_series = pd.concat([se_series, pd.Series({"post_ATT": post_att_se})])
         else:
-            att_tau_star = np.column_stack(placebo_cols).astype(float)
-
-        # Construct uniform sup-t bands (pre/post/full)
-        pre_mask = tau_array < center_at
-        post_mask = tau_array > center_at
-
-        def _uniform_band(side: str) -> pd.DataFrame:
-            if B == 0:
-                return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-            if side == "pre":
-                mask = pre_mask
-            elif side == "post":
-                mask = post_mask
-            else:
-                mask = tau_array != center_at
-            idx = np.flatnonzero(mask)
-            if idx.size == 0:
-                return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-            theta = att_series.reindex(tau_grid).to_numpy(dtype=float)[idx]
-            theta_star = att_tau_star[idx, :]
-            diffs = theta_star - theta[:, None]
-            se = np.nanstd(diffs, axis=1, ddof=1)
-            ok = np.isfinite(se) & (se > 0)
-            if not np.any(ok):
-                return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-            with np.errstate(all="ignore"):
-                tdraw = diffs[ok, :] / se[ok, None]
-                sup_abs = np.nanmax(np.abs(tdraw), axis=0)
-            c = float(np.nanquantile(sup_abs, 1.0 - self.spec.alpha))
-            lo = theta.copy(); hi = theta.copy()
-            lo[ok] = theta[ok] - c * se[ok]
-            hi[ok] = theta[ok] + c * se[ok]
-            lab = pd.Index(tau_grid[idx])
-            return pd.DataFrame({"lower": pd.Series(lo, index=lab), "upper": pd.Series(hi, index=lab)}).sort_index()
-
-        band_pre = _uniform_band("pre")
-        band_post = _uniform_band("post")
-        band_full = _uniform_band("full")
-
-        # PostATT scalar: studentized from placebo column means over post-period
-        if np.any(post_mask) and B > 0:
-            theta_hat = float(np.nanmean(att_series.reindex(tau_grid)[post_mask].to_numpy()))
-            post_star = np.nanmean(att_tau_star[np.flatnonzero(post_mask), :], axis=0)
-            se_hat = float(np.nanstd(post_star, ddof=1))
-            if np.isfinite(se_hat) and se_hat > 0:
-                with np.errstate(all="ignore"):
-                    t_abs = np.abs((post_star - theta_hat) / se_hat)
-                    c = float(np.nanquantile(t_abs, 1.0 - self.spec.alpha))
-                post_ci_df = pd.DataFrame({
-                    "lower": [theta_hat - c * se_hat],
-                    "upper": [theta_hat + c * se_hat],
-                })
-            else:
-                post_ci_df = pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-        else:
-            post_ci_df = pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-
-        bands = {
-            "pre": band_pre,
-            "post": band_post,
-            "full": band_full,
-            "post_scalar": post_ci_df,
-            "__meta__": {
-                "origin": "placebo",
-                "kind": "uniform",
-                "estimator": "synthetic",
-                "level": band_level,
-                "B": int(B),
-                # Reproducibility/audit: document donor pool and cohort grid
-                "donors": list(donors),
-                "cohorts": sorted(list(cohorts.keys())),
-                # SC FW solver here is deterministic (no RNG); include note for parity
-                "rng": "none (deterministic Frank–Wolfe)",
-            },
-        }
+            bands = {
+                "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                "full": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                "post_scalar": post_ci_df,
+                "__meta__": {"origin": "none", "kind": "none", "estimator": "synthetic", "level": band_level, "B": 0},
+            }
 
         # Basic per-tau output for summaries/exports
         att_df = pd.DataFrame({"tau": att_series.index, "att": att_series.to_numpy()}).set_index("tau")
@@ -553,14 +617,6 @@ class SyntheticControl:
             else float("nan")
         )
 
-        rmspe_ratio_hat = rmspe_post / rmspe_pre if rmspe_pre > 0 else float("nan")
-        if len(placebo_rmspe_ratios) > 0 and np.isfinite(rmspe_ratio_hat):
-            pval_rmspe = float(
-                (1.0 + np.sum(np.array(placebo_rmspe_ratios) >= rmspe_ratio_hat))
-                / (len(placebo_rmspe_ratios) + 1.0)
-            )
-        else:
-            pval_rmspe = float("nan")
 
         n_treated_total = sum(len(meta["treated_ids"]) for meta in results_g.values())
 
@@ -576,8 +632,6 @@ class SyntheticControl:
             "Donors": len(donors),
             "RMSPE_pre": rmspe_pre,
             "RMSPE_post": rmspe_post,
-            "RMSPE_ratio": rmspe_ratio_hat,
-            "p_value_placebo": pval_rmspe,
             "PostATT": post_agg,
         }
         extra = {
@@ -589,24 +643,12 @@ class SyntheticControl:
             "post_scalar": post_ci_df,
             "donors": donors,
             "boot_meta": {
-                "origin": "placebo",
+                "origin": "bootstrap",
                 "kind": "uniform",
                 "level": band_level,
                 "B": int(B),
             },
         }
-
-        if B > 1 and att_tau_star.shape[1] > 1:
-            se_vals = bt.bootstrap_se(att_tau_star)
-            se_series = pd.Series(se_vals, index=tau_grid)
-            if center_at in se_series.index:
-                se_series.loc[center_at] = 0.0
-            if np.any(post_mask):
-                post_star_draws = np.nanmean(att_tau_star[np.flatnonzero(post_mask), :], axis=0)
-                model_info["PostATT_se"] = float(np.std(post_star_draws, ddof=1))
-            extra["se_source"] = "bootstrap"
-        else:
-            se_series = None
 
         res = EstimationResult(
             params=att_series,

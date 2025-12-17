@@ -928,6 +928,12 @@ class SpatialDID:
             if np.any(post_mask):
                 post_draws = np.nanmean(dir_tau_star[post_mask, :], axis=0)
                 info["PostATT_se"] = float(np.std(post_draws, ddof=1))
+        # Compute PostSpill_se from bootstrap draws
+        if bs_tau_star.shape[1] > 1:
+            post_mask_spill = bs_tau["tau"].to_numpy(dtype=int) > self.center_at
+            if np.any(post_mask_spill):
+                post_spill_draws = np.nanmean(bs_tau_star[post_mask_spill, :], axis=0)
+                info["PostSpill_se"] = float(np.std(post_spill_draws, ddof=1))
         # Add diagnostics about exposure matrix W and S among controls
         try:
             row_sums = Wd.sum(axis=1)

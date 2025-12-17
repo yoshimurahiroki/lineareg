@@ -299,17 +299,35 @@ def modelsummary(  # noqa: PLR0913
                                 meta = bands.setdefault("__meta__", {})
                                 meta.setdefault("kind", "uniform")
                                 meta.setdefault("estimator", "eventstudy")
+                            # Derive SE from CI bands (SE ≈ (upper - lower) / (2 * 1.96) for 95% CI)
+                            spill_se = None
+                            try:
+                                full_bands = bands.get("full")
+                                if isinstance(full_bands, pd.DataFrame) and {"lower", "upper"}.issubset(full_bands.columns):
+                                    spill_se = (full_bands["upper"] - full_bands["lower"]) / (2 * 1.96)
+                                    spill_se.index = spill_series.index
+                            except (KeyError, TypeError, ValueError):
+                                spill_se = None
                             info = dict(_res.model_info)
                             info["Estimator"] = f"{info.get('Estimator', '')} (Spill)"
                             if "PostSpill" in info:
                                 info["PostATT"] = info.get("PostSpill")
                                 info.pop("PostSpill", None)
+                            # Copy PostATT_se from PostSpill if available
+                            if "PostSpill_se" in _res.model_info:
+                                info["PostATT_se"] = _res.model_info["PostSpill_se"]
+                            elif "PostATT_se" in info:
+                                # Use same SE for both if only one is stored
+                                pass
+                            spill_extra = dict(_res.extra) if _res.extra else {}
+                            spill_extra["se_source"] = extra.get("se_source", "bootstrap")
                             spill_res = EstimationResult(
                                 params=spill_series,
+                                se=spill_se,
                                 bands=bands if bands else None,
                                 n_obs=_res.n_obs,
                                 model_info=info,
-                                extra=_res.extra,
+                                extra=spill_extra,
                             )
                             out_r.append(spill_res)
                             out_n.append(f"{_nm} (Spill)")
@@ -1058,7 +1076,8 @@ def modelsummary(  # noqa: PLR0913
     for raw_name, disp_name in param_pairs:
         # display name already escaped/truncated above
         row = [disp_name]
-        aux_row = [""]  # exactly one auxiliary row under the coefficient
+        se_row = [""]  # SE row (between coefficient and CI for ES family)
+        ci_row = [""]  # CI row (uniform bands for ES family)
         for res in results:
             key = _resolve_name(res, raw_name)
 
@@ -1068,15 +1087,44 @@ def modelsummary(  # noqa: PLR0913
                 val = res.model_info.get("PostATT", "")
                 if val != "":
                     row.append(f"{float(val):{coef_format}}")
+                    # Try to get SE for PostATT from model_info first
+                    se_val = None
+                    if _is_policy_ci_family(res):
+                        postatt_se = res.model_info.get("PostATT_se") or res.model_info.get("post_att_se")
+                        if postatt_se is not None:
+                            try:
+                                se_val = float(postatt_se)
+                            except (TypeError, ValueError):
+                                se_val = None
+                        if se_val is None:
+                            extra = res.extra or {}
+                            postatt_se = extra.get("PostATT_se") or extra.get("post_att_se")
+                            if postatt_se is not None:
+                                try:
+                                    se_val = float(postatt_se)
+                                except (TypeError, ValueError):
+                                    se_val = None
+                        if se_val is None:
+                            s = getattr(res, "se", None)
+                            if isinstance(s, pd.Series):
+                                for cand in ("PostATT", "ATT post", "PostATT_Diff"):
+                                    if cand in s.index:
+                                        try:
+                                            se_val = float(s[cand])
+                                            break
+                                        except (KeyError, TypeError, ValueError):
+                                            pass
+                    se_row.append(f"({se_val:{se_format}})" if se_val is not None and np.isfinite(se_val) and abs(se_val) > 1e-10 else "")
                     # Try to get aggregated CI
                     if _is_policy_ci_family(res) and _is_es_uniform_band(res):
                         band_text = _agg_band_str(res, "PostATT", coef_format)
-                        aux_row.append(band_text)
+                        ci_row.append(band_text)
                     else:
-                        aux_row.append("")
+                        ci_row.append("")
                 else:
                     row.append("")
-                    aux_row.append("")
+                    se_row.append("")
+                    ci_row.append("")
                 continue
 
             if key is not None:
@@ -1099,6 +1147,10 @@ def modelsummary(  # noqa: PLR0913
                     if not (isinstance(Bv, (int, float)) and Bv > 0):
                         return False
                     extra = r.extra or {}
+                    # Check se_source first (ES/DID/SpatialDID/RCT use this)
+                    se_source = str(extra.get("se_source", "")).lower()
+                    if se_source in {"bootstrap", "wild_bootstrap", "multiplier"}:
+                        return True
                     boot_meta = (
                         extra.get("boot_meta") or extra.get("bootstrap_meta") or {}
                     )
@@ -1106,27 +1158,44 @@ def modelsummary(  # noqa: PLR0913
                         origin = str(boot_meta.get("origin", "")).lower()
                         if origin in {"pairs", "pair", "analytic", "analytical"}:
                             return False
+                        # Include 'multiplier' for RCT/FWER bootstrap
                         if origin and (
                             origin
-                            not in {"bootstrap", "wild", "rademacher", "mammen", "webb"}
+                            not in {"bootstrap", "wild", "rademacher", "mammen", "webb", "multiplier"}
                         ):
                             return False
                     return True
 
-                # Decide between CI (policy family) vs SE (core linear)
-                cell_text = ""
+                # For ES/DID/Synth/SDID/RCT families: build both SE row and CI row
+                ci_cell = ""
+                se_cell = ""
                 if _is_policy_ci_family(res):
-                    # Try event-study uniform bands first
-                    cell_text = _uniform_band_str(res, raw_name, coef_format)
+                    # Get SE for ES family
+                    se_val = None
+                    s = getattr(res, "se", None)
+                    if isinstance(s, pd.Series) and _se_allowed(res):
+                        try:
+                            if key is not None and key in s.index:
+                                se_val = float(s[key])
+                            elif raw_name in s.index:
+                                se_val = float(s[raw_name])
+                        except (KeyError, TypeError, ValueError):
+                            se_val = None
+                    # Only show SE if non-zero and finite (skip baseline period)
+                    if se_val is not None and np.isfinite(se_val) and abs(se_val) > 1e-10:
+                        se_cell = f"({se_val:{se_format}})"
+                    
+                    # Get CI (uniform bands) for ES family
+                    ci_cell = _uniform_band_str(res, raw_name, coef_format)
                     # Aggregated post-period effects when requested as parameters
                     if (
-                        (not cell_text)
+                        (not ci_cell)
                         and _is_es_uniform_band(res)
                         and str(raw_name) in {"PostATT", "PostATT_Diff"}
                     ):
-                        cell_text = _agg_band_str(res, str(raw_name), coef_format)
+                        ci_cell = _agg_band_str(res, str(raw_name), coef_format)
                     # RCT uniform per-parameter
-                    if (not cell_text) and _is_rct_uniform_band(res):
+                    if (not ci_cell) and _is_rct_uniform_band(res):
                         try:
                             bands = getattr(res, "bands", None)
                             if isinstance(bands, dict):
@@ -1135,18 +1204,16 @@ def modelsummary(  # noqa: PLR0913
                                     idx = list(res.params.index).index(raw_name)
                                     lo = np.asarray(u.get("lower")).reshape(-1)[idx]
                                     hi = np.asarray(u.get("upper")).reshape(-1)[idx]
-                                    cell_text = f"[{float(lo):{coef_format}}, {float(hi):{coef_format}}]"
+                                    ci_cell = f"[{float(lo):{coef_format}}, {float(hi):{coef_format}}]"
                         except (ValueError, KeyError, IndexError, TypeError):
-                            cell_text = ""
+                            ci_cell = ""
                     # SC/SDID: percentile bands fallback（pointwise）
-                    if not cell_text:
+                    if not ci_cell:
                         est_name = str(res.model_info.get("Estimator", "")).lower()
                         if any(k in est_name for k in ["synthetic", "sdid"]):
                             try:
                                 bands = getattr(res, "bands", None)
                                 if isinstance(bands, dict):
-                                    # SC/SDID store bands in 'full', 'pre', 'post' DataFrames
-                                    # Try 'full' first, which contains all tau values
                                     p = (
                                         bands.get("full")
                                         or bands.get("percentile")
@@ -1163,36 +1230,29 @@ def modelsummary(  # noqa: PLR0913
                                             lo_v = float(p.loc[param_label, "lower"])
                                             hi_v = float(p.loc[param_label, "upper"])
                                             if np.isfinite(lo_v) and np.isfinite(hi_v):
-                                                cell_text = f"[{lo_v:{coef_format}}, {hi_v:{coef_format}}]"
+                                                ci_cell = f"[{lo_v:{coef_format}}, {hi_v:{coef_format}}]"
                                         except (KeyError, IndexError, TypeError, ValueError):
-                                            cell_text = ""
-                                            # Attempt numeric coercion when labels are strings of integers
+                                            ci_cell = ""
                                             try:
                                                 tau_lab = int(param_label)
                                                 lo_v = float(p.loc[tau_lab, "lower"])
                                                 hi_v = float(p.loc[tau_lab, "upper"])
-                                                if np.isfinite(lo_v) and np.isfinite(
-                                                    hi_v,
-                                                ):
-                                                    cell_text = f"[{lo_v:{coef_format}}, {hi_v:{coef_format}}]"
+                                                if np.isfinite(lo_v) and np.isfinite(hi_v):
+                                                    ci_cell = f"[{lo_v:{coef_format}}, {hi_v:{coef_format}}]"
                                             except (KeyError, TypeError, ValueError):
-                                                cell_text = ""
-                                    elif isinstance(p, dict) and (
-                                        idx is not None and idx >= 0
-                                    ):
+                                                ci_cell = ""
+                                    elif isinstance(p, dict) and (idx is not None and idx >= 0):
                                         lo_arr = np.asarray(p.get("lower"))
                                         hi_arr = np.asarray(p.get("upper"))
                                         if lo_arr.size > idx and hi_arr.size > idx:
-                                            lo_v = float(
-                                                np.asarray(lo_arr).reshape(-1)[idx],
-                                            )
-                                            hi_v = float(
-                                                np.asarray(hi_arr).reshape(-1)[idx],
-                                            )
+                                            lo_v = float(np.asarray(lo_arr).reshape(-1)[idx])
+                                            hi_v = float(np.asarray(hi_arr).reshape(-1)[idx])
                                             if np.isfinite(lo_v) and np.isfinite(hi_v):
-                                                cell_text = f"[{lo_v:{coef_format}}, {hi_v:{coef_format}}]"
+                                                ci_cell = f"[{lo_v:{coef_format}}, {hi_v:{coef_format}}]"
                             except (ValueError, KeyError, IndexError, TypeError):
-                                cell_text = ""
+                                ci_cell = ""
+                    se_row.append(se_cell)
+                    ci_row.append(ci_cell)
                 else:
                     # Bootstrap SE policy for non-ES families (core linear, SAR, etc.)
                     se_val = None
@@ -1200,7 +1260,6 @@ def modelsummary(  # noqa: PLR0913
                     if bse is not None:
                         if isinstance(bse, pd.Series):
                             try:
-                                # try exact key, then synonyms
                                 if key is not None and key in bse.index:
                                     se_val = float(bse[key])
                                 elif raw_name in bse.index:
@@ -1221,7 +1280,6 @@ def modelsummary(  # noqa: PLR0913
                         s = getattr(res, "se", None)
                         if isinstance(s, pd.Series) and _se_allowed(res):
                             try:
-                                # try exact key, then synonyms
                                 if key is not None and key in s.index:
                                     se_val = float(s[key])
                                 elif raw_name in s.index:
@@ -1229,15 +1287,19 @@ def modelsummary(  # noqa: PLR0913
                             except (KeyError, TypeError, ValueError):
                                 se_val = None
                     if (se_val is not None) and _se_allowed(res):
-                        cell_text = f"({se_val:{se_format}})"
-
-                aux_row.append(cell_text or "")
+                        se_row.append(f"({se_val:{se_format}})")
+                    else:
+                        se_row.append("")
+                    ci_row.append("")
             else:
                 row.append("")
-                aux_row.append("")
+                se_row.append("")
+                ci_row.append("")
         table_data.append(row)
-        if any(aux_row[1:]):
-            table_data.append(aux_row)
+        if any(se_row[1:]):
+            table_data.append(se_row)
+        if any(ci_row[1:]):
+            table_data.append(ci_row)
 
     # Before building the footer, ensure ES-family aggregated PostATT is visible
     # in the main coefficient table even when params lacks 'PostATT'.
@@ -1248,7 +1310,7 @@ def modelsummary(  # noqa: PLR0913
             not any(_is_es_uniform_band(r) for r in results)
         ):
             return
-        # Build a row for PostATT value and its aggregated CI (if available)
+        # Build a row for PostATT value, SE, and aggregated CI
         row = ["PostATT"]
         se_row = [""]
         ci_row = [""]
@@ -1264,11 +1326,39 @@ def modelsummary(  # noqa: PLR0913
                     except (KeyError, TypeError, ValueError):
                         val = ""
             row.append("" if val == "" else f"{float(val):{coef_format}}")
+            # Try to get SE for PostATT from model_info first, then extra
+            se_val = None
+            postatt_se = res.model_info.get("PostATT_se") or res.model_info.get("post_att_se")
+            if postatt_se is not None:
+                try:
+                    se_val = float(postatt_se)
+                except (TypeError, ValueError):
+                    se_val = None
+            if se_val is None:
+                extra = res.extra or {}
+                postatt_se = extra.get("PostATT_se") or extra.get("post_att_se")
+                if postatt_se is not None:
+                    try:
+                        se_val = float(postatt_se)
+                    except (TypeError, ValueError):
+                        se_val = None
+            if se_val is None:
+                s = getattr(res, "se", None)
+                if isinstance(s, pd.Series):
+                    for cand in ("PostATT", "ATT post", "PostATT_Diff", "post_ATT"):
+                        if cand in s.index:
+                            try:
+                                se_val = float(s[cand])
+                                break
+                            except (KeyError, TypeError, ValueError):
+                                pass
+            se_row.append(f"({se_val:{se_format}})" if se_val is not None and np.isfinite(se_val) and abs(se_val) > 1e-10 else "")
             # Aggregated CI (from model_info bands)
             band_text = _agg_band_str(res, "PostATT", coef_format)
             ci_row.append(band_text)
-            se_row.append("")
         table_data.append(row)
+        if any(se_row[1:]):
+            table_data.append(se_row)
         if any(ci_row[1:]):
             table_data.append(ci_row)
 

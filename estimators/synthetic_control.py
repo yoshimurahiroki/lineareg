@@ -382,7 +382,6 @@ class SyntheticControl:
         se_series = None
         att_tau_star = np.full((tau_grid.size, 0), np.nan, dtype=float)
         post_ci_df = pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-        boot = self._boot
 
         if boot is not None and int(getattr(boot, "n_boot", 0)) > 1:
             B = int(boot.n_boot)
@@ -559,7 +558,6 @@ class SyntheticControl:
                         "estimator": "synthetic",
                     },
                 }
-                se_series = pd.concat([se_series, pd.Series({"post_ATT": post_att_se})])
         else:
             bands = {
                 "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
@@ -648,7 +646,11 @@ class SyntheticControl:
                 "level": band_level,
                 "B": int(B),
             },
+            "se_source": "bootstrap" if se_series is not None else None,
         }
+        # Add PostATT_se if bootstrap was successful
+        if post_att_se is not None:
+            model_info["PostATT_se"] = post_att_se
 
         res = EstimationResult(
             params=att_series,

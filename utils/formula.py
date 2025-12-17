@@ -471,22 +471,25 @@ class FormulaParser:
                 msg = f"gmm weight key '{gkey}' not found in parser W_dict."
                 raise KeyError(msg)
             gmm_W_obj = self.W_dict[gkey]
-            # Strict, sparse-safe shape validation (GMM weight must be 2-D square)
             _validate_w_meta(gmm_W_obj)
+
+        include_intercept = not bool(
+            re.search(r"(?<!\d)\s*-\s*1\b|\+\s*0\b", rhs_raw)
+        )
 
         return {
             "X": X,
             "y": y,
             "var_names": var_names,
-            # Only return the canonical list of FE codes; legacy single-dimension alias removed
             "fe_codes_list": fe_codes_list,
             "iv_endog": iv_endog,
             "iv_instr_user": iv_instr_user,
             "iv_instr_full": iv_instr_full,
-            "row_mask_valid": mask_final,  # original-data-length boolean (final adopted rows)
-            "row_index_used": row_index_labels.to_numpy(),  # original index labels (order matches X/y)
+            "row_mask_valid": mask_final,
+            "row_index_used": row_index_labels.to_numpy(),
             "cluster_ids_used": cluster_ids_used,
             "gmm_W": gmm_W_obj,
+            "include_intercept": include_intercept,
             **opt,
         }
 

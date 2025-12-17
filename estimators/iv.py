@@ -852,7 +852,7 @@ class IV2SLS(BaseEstimator):
             Z_full,
             endog_idx=endog_idx,
             z_excluded_idx=z_excluded_idx,
-            add_const=True,
+            add_const=bool(parsed.get("include_intercept", True)),
             var_names=parsed["var_names"],
             instr_names=z_names,
         )

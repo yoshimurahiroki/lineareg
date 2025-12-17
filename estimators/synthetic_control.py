@@ -378,7 +378,8 @@ class SyntheticControl:
         # and using other donors to construct synthetic control. We record
         # a complete placebo path per (donor, cohort) over the unified τ-grid.
         tau_grid = np.array(tau_union_sorted, dtype=int)
-        placebo_cols: list[np.ndarray] = []  # each element is shape (K,), K=len(tau_grid)
+        placebo_cols: list[np.ndarray] = []
+        placebo_rmspe_ratios: list[float] = []
 
         for jj in donors:
             pool = [k for k in donors if k != jj]
@@ -388,15 +389,14 @@ class SyntheticControl:
             jp = id_to_row[jj]
             pool_indices = np.array([id_to_row[p] for p in pool], dtype=int)
 
-            # For each cohort, compute placebo effect
             for g in results_g:
                 t0_col = t_to_col[g]
                 pre = np.arange(0, t0_col)
+                post = np.arange(t0_col, len(times))
 
                 if pre.size == 0:
                     continue
 
-                # Fit synthetic control for this placebo unit
                 Xp_pre = Y[pool_indices][:, pre].T.astype(np.float64)
                 yp_pre = Y[jp, pre].astype(np.float64)
                 wp = _frank_wolfe_simplex(
@@ -408,7 +408,11 @@ class SyntheticControl:
                 yp_synth = la.dot(Xp_all, wp)
                 placebo_path = yp_all - yp_synth
 
-                # Map to event-time vector on unified grid
+                rmspe_pre_p = float(np.sqrt(np.mean((yp_pre - la.dot(Xp_pre, wp)) ** 2)))
+                if post.size > 0 and rmspe_pre_p > 0:
+                    rmspe_post_p = float(np.sqrt(np.mean((yp_all[post] - yp_synth[post]) ** 2)))
+                    placebo_rmspe_ratios.append(rmspe_post_p / rmspe_pre_p)
+
                 col = np.full(tau_grid.size, np.nan, dtype=float)
                 for t_idx, t_val in enumerate(times):
                     tau_val = int(t_val) - int(g)
@@ -549,7 +553,15 @@ class SyntheticControl:
             else float("nan")
         )
 
-        # Count total treated units across all cohorts
+        rmspe_ratio_hat = rmspe_post / rmspe_pre if rmspe_pre > 0 else float("nan")
+        if len(placebo_rmspe_ratios) > 0 and np.isfinite(rmspe_ratio_hat):
+            pval_rmspe = float(
+                (1.0 + np.sum(np.array(placebo_rmspe_ratios) >= rmspe_ratio_hat))
+                / (len(placebo_rmspe_ratios) + 1.0)
+            )
+        else:
+            pval_rmspe = float("nan")
+
         n_treated_total = sum(len(meta["treated_ids"]) for meta in results_g.values())
 
         model_info = {
@@ -557,13 +569,15 @@ class SyntheticControl:
             "BandType": "uniform",
             "BandLevel": band_level,
             "Alpha": float(self.spec.alpha),
-            "B": int(B),  # placebo paths used
+            "B": int(B),
             "CenterAt": center_at,
             "Cohorts": list(cohorts.keys()),
             "TreatedUnits": n_treated_total,
             "Donors": len(donors),
             "RMSPE_pre": rmspe_pre,
             "RMSPE_post": rmspe_post,
+            "RMSPE_ratio": rmspe_ratio_hat,
+            "p_value_placebo": pval_rmspe,
             "PostATT": post_agg,
         }
         extra = {

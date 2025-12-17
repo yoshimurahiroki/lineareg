@@ -242,7 +242,7 @@ class OLS(BaseEstimator):
         model = cls(
             parsed["y"],
             parsed["X"],
-            add_const=True,
+            add_const=bool(parsed.get("include_intercept", True)),
             var_names=parsed["var_names"],
         )
 

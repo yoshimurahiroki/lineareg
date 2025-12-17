@@ -119,7 +119,7 @@ class GLS(BaseEstimator):
         if boot_eff is not None:
             meta.attrs.setdefault("_boot_from_formula", boot_eff)
         model = cls(
-            parsed["y"], parsed["X"], add_const=True, var_names=parsed["var_names"],
+            parsed["y"], parsed["X"], add_const=bool(parsed.get("include_intercept", True)), var_names=parsed["var_names"],
         )
         attach_formula_metadata(model, meta)
         return model

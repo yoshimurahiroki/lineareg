@@ -313,22 +313,20 @@ class SDID:
                         att_tau_star[pos[int(t)], b] = float(v)
 
             if B > 0 and att_tau_star is not None and att_tau_grid is not None:
-                # R synthdid parity: placebo matrix column-centering then unit-variance scaling
-                # Center each bootstrap column to mean zero over the available τ rows, then scale to unit variance.
-                # Rows with NaN are ignored in the per-column mean/std.
                 with np.errstate(all="ignore"):
                     col_means = np.nanmean(att_tau_star, axis=0, keepdims=True)
                     att_tau_star = att_tau_star - col_means
                     col_std = np.nanstd(att_tau_star, axis=0, ddof=1, keepdims=True)
-                    # Avoid division by zero; leave columns with zero std unscaled
                     safe_std = np.where(col_std > 0, col_std, 1.0)
                     att_tau_star = att_tau_star / safe_std
-                q_lo = float(self.alpha / 2)
-                q_hi = float(1 - self.alpha / 2)
-                lo, hi = np.quantile(att_b, [q_lo, q_hi])
+                placebo_se = float(np.nanstd(att_b, ddof=1) * np.sqrt((B - 1) / B))
+                from scipy.stats import norm
+                z_crit = float(norm.ppf(1.0 - self.alpha / 2.0))
+                lo_center = float(att_post) - z_crit * placebo_se
+                hi_center = float(att_post) + z_crit * placebo_se
                 bands = {
                     "post_ATT": pd.DataFrame(
-                        {"lower": [float(lo)], "upper": [float(hi)]},
+                        {"lower": [float(lo_center)], "upper": [float(hi_center)]},
                     ),
                 }
                 bands.setdefault("__meta__", {})

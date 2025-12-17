@@ -243,10 +243,8 @@ class GLS(BaseEstimator):
                 raise RuntimeError(
                     "Provided Omega is not positive-definite after masking.",
                 )
-            # Strict whitening: apply L^{-1} once (Ω^{-1/2}), not Ω^{-1}.
-            # Use explicit triangular solve to avoid accidental double application.
-            X_t = la.chol_solve(L, X)
-            y_t = la.chol_solve(L, y)
+            X_t = la.triangular_solve(L, X)
+            y_t = la.triangular_solve(L, y)
             transform = ("full", None)
 
         # 2) AR(1) Prais-Winsten (single-pass estimate of rho)
@@ -429,9 +427,8 @@ class GLS(BaseEstimator):
                         raise RuntimeError(
                             "Σ not PD for AR1+weights; check data/weights.",
                         )
-                    # Apply Σ^{-1/2} = L^{-1} once
-                    Xpw = la.chol_solve(L, Xs)
-                    ypw = la.chol_solve(L, ys)
+                    Xpw = la.triangular_solve(L, Xs)
+                    ypw = la.triangular_solve(L, ys)
                     inv = np.empty_like(order)
                     inv[order] = np.arange(order.size)
                     X_t = Xpw[inv]
@@ -524,8 +521,8 @@ class GLS(BaseEstimator):
                         L = la.safe_cholesky(Sigma)
                         if L is None:
                             raise RuntimeError("Sigma not PD during PW iteration.")
-                        X_tmp_sorted = la.chol_solve(L, Xs)
-                        y_tmp_sorted = la.chol_solve(L, ys)
+                        X_tmp_sorted = la.triangular_solve(L, Xs)
+                        y_tmp_sorted = la.triangular_solve(L, ys)
                         inv = np.empty_like(order)
                         inv[order] = np.arange(order.size)
                         X_tmp = X_tmp_sorted[inv]
@@ -632,8 +629,8 @@ class GLS(BaseEstimator):
                     L = la.safe_cholesky(Sigma)
                     if L is None:
                         raise RuntimeError("Σ not PD at convergence.")
-                    Xp = la.chol_solve(L, Xs)
-                    yp = la.chol_solve(L, ys)
+                    Xp = la.triangular_solve(L, Xs)
+                    yp = la.triangular_solve(L, ys)
                 elif psar1:
                     Xp, yp = self._prais_winsten_psar1(
                         Xs, ys, ss, seg_id, rho_old, transform=ar1_transform,
@@ -1242,7 +1239,6 @@ class GLS(BaseEstimator):
             eps = 1e-8
             min_lb = -1.0 / max(1.0, (m - 1.0))
             rho_safe = float(np.clip(rho, min_lb + eps, 1.0 - eps))
-            # R_g = (1-ρ) I_m + ρ 11'
             Rg = (1.0 - rho_safe) * np.eye(m, dtype=np.float64) + rho_safe * np.ones(
                 (m, m), dtype=np.float64,
             )
@@ -1254,9 +1250,8 @@ class GLS(BaseEstimator):
             L = la.safe_cholesky(Sig)
             if L is None:
                 raise RuntimeError("Exchangeable Σ block is not PD; check rho/weights.")
-            # Apply blockwise Σ_g^{-1/2} = L_g^{-1} once
-            X_out[idx, :] = la.chol_solve(L, X[idx, :])
-            y_out[idx, :] = la.chol_solve(L, y[idx, :])
+            X_out[idx, :] = la.triangular_solve(L, X[idx, :])
+            y_out[idx, :] = la.triangular_solve(L, y[idx, :])
         return X_out, y_out
 
     def _pw_reestimate_transform(  # noqa: PLR0913

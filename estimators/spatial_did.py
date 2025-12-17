@@ -912,11 +912,9 @@ class SpatialDID:
             "SelfLoops": self_loops,
             "SpillInterpretation": spill_interp,
             "B": int(B),
-            # Unified aggregated values for summary
             "PostATT": post_direct,
             "PostSpill": post_spill,
             "PostBetaS": post_beta_s,
-            # Back-compat legacy container
             "PostAggregates": {
                 "direct": {"value": post_direct, "band95": post_direct_band},
                 "spill": {"value": post_spill, "band95": post_spill_band},
@@ -925,6 +923,11 @@ class SpatialDID:
             "TauWeight": self.tau_weight,
             "GroupSizeMap": group_size,
         }
+        if dir_tau_star.shape[1] > 1:
+            post_mask = dir_tau["tau"].to_numpy(dtype=int) > self.center_at
+            if np.any(post_mask):
+                post_draws = np.nanmean(dir_tau_star[post_mask, :], axis=0)
+                info["PostATT_se"] = float(np.std(post_draws, ddof=1))
         # Add diagnostics about exposure matrix W and S among controls
         try:
             row_sums = Wd.sum(axis=1)
@@ -1066,9 +1069,21 @@ class SpatialDID:
             "__meta__": _bands_meta,
         }
 
+        tau_idx = dir_tau_out.set_index("tau").index.to_numpy(dtype=int)
+        se_source_val = None
+        if dir_tau_star.shape[1] > 1:
+            se_vals = bt.bootstrap_se(dir_tau_star)
+            se_series = pd.Series(se_vals, index=tau_idx)
+            if int(self.center_at) in se_series.index:
+                se_series.loc[int(self.center_at)] = 0.0
+            se_source_val = "bootstrap"
+        else:
+            se_series = None
+
         # Primary return: EstimationResult for direct effects (standard format)
         return EstimationResult(
             params=dir_tau_out.set_index("tau")["params"],
+            se=se_series,
             bands={
                 **standard_bands_direct,
                 "post_scalar": pd.DataFrame(
@@ -1111,6 +1126,7 @@ class SpatialDID:
                 "beta_s_tau": bs_tau_out,
                 "W_multipliers_inference": W_used,
                 "bands_source": "bootstrap",
+                "se_source": se_source_val,
                 "bands_spill_standard": standard_bands_spill,
                 "bands_beta_s_standard": standard_bands_beta_s,
                 "post_scalar_direct": pd.DataFrame(

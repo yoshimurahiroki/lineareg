@@ -21,6 +21,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+try:
+    import scipy.linalg as sla
+except ImportError:
+    sla = None
+
 from lineareg.core import bootstrap as bt
 from lineareg.core import fe as fe_core
 from lineareg.core import linalg as la
@@ -1416,60 +1421,37 @@ class GMM(BaseEstimator):
         weights: NDArray[np.float64] | None = None,
         constraints: np.ndarray | None = None,
         constraint_vals: np.ndarray | None = None,
-        # method is intentionally omitted: GMM enforces QR-only solves
         rank_policy: str = "stata",
     ) -> NDArray[np.float64]:
         """Solve GMM beta = (X' Z W Z' X)^{-1} X' Z W Z' y, with optional constraints."""
-        # === STRICT GMM ===
-        # Right-prewhiten instruments by W^{1/2} (W is SPD). Use Cholesky: W = L L'.
-        Zd = la.to_dense(Z)
+        if weights is not None:
+            sw = np.sqrt(weights).reshape(-1, 1)
+            Xw = la.hadamard(X, sw)
+            Zw = la.hadamard(Z, sw)
+            yw = la.hadamard(y, sw)
+        else:
+            Xw = X
+            Zw = Z
+            yw = y
+
+        A = la.crossprod(Zw, Xw)
+        b = la.crossprod(Zw, yw)
+
         if W is None:
-            Z_right = Zd
+            A_star = A
+            b_star = b
         else:
             Wd = la.to_dense(W)
-            # W = L L' (L lower-triangular). Use L as W^{1/2} (right-prewhitening).
             Lw = la.safe_cholesky(Wd)
-            Z_right = la.dot(Zd, Lw)
-
-        # Left (observation) weighting by sqrt(weights) if provided
-        if weights is not None:
-            sw = np.sqrt(weights).reshape(-1)
-            Z_for_qr = la.hadamard(Z_right, sw)
-            X_left = la.hadamard(X, sw)
-            y_left = la.hadamard(y, sw)
-        else:
-            Z_for_qr = Z_right
-            X_left = X
-            y_left = y
-
-        # QR on the (left-weighted) instrument matrix to get orthonormal basis Qz
-        Qz_res = la.qr(Z_for_qr, mode="economic", pivoting=True)
-        if len(Qz_res) == 3:
-            Qz, Rz, _p = Qz_res
-        else:
-            Qz, Rz = Qz_res
-        # Trim Q to rank r using R diagonal (R/Stata-style tol)
-        diagR = np.abs(np.diag(la.to_dense(Rz))) if Rz.size else np.array([])
-        if diagR.size:
-            r = la.rank_from_diag(diagR, Z_for_qr.shape[1], mode=rank_policy)
-        else:
-            r = 0
-        if r == 0:
-            msg = "Instrument matrix is rank-deficient (rank=0) after weighting."
-            raise RuntimeError(msg)
-        Qz = Qz[:, :r]
-
-        # Project X and y onto the instrument-space basis
-        X_t = la.dot(Qz.T, X_left)
-        y_t = la.dot(Qz.T, y_left)
+            A_star = la.dot(Lw.T, A)
+            b_star = la.dot(Lw.T, b)
 
         if constraints is not None and constraint_vals is not None:
-            # Solve constrained least squares on transformed system
             return la.to_dense(
-                solve_constrained(X_t, y_t, constraints, constraint_vals),
+                solve_constrained(A_star, b_star, constraints, constraint_vals),
             )
-        # Unconstrained: solve OLS on transformed system via la.solve using QR-only
-        return la.solve(X_t, y_t, method="qr", rank_policy=rank_policy)
+
+        return la.solve(A_star, b_star, method="qr", rank_policy=rank_policy)
 
     @staticmethod
     def _solve_kkt(

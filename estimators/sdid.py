@@ -506,10 +506,29 @@ class SDID:
             "boot": boot_info,
             "boot_meta": bands_meta if isinstance(bands_meta, dict) else None,
             "bands_source": ("placebo" if bands is not None else None),
+            "se_source": "bootstrap",
         }
+        att_tau_star_arr = boot_info.get("ATT_tau_draws")
+        tau_idx = att_tau.set_index("tau").index.to_numpy(dtype=int)
+        if (
+            att_tau_star_arr is not None
+            and isinstance(att_tau_star_arr, np.ndarray)
+            and att_tau_star_arr.ndim == 2
+            and att_tau_star_arr.shape[1] > 1
+        ):
+            se_vals = bt.bootstrap_se(att_tau_star_arr)
+            se_series_tau = pd.Series(se_vals, index=tau_idx)
+            if int(base_tau) in se_series_tau.index:
+                se_series_tau.loc[int(base_tau)] = 0.0
+            post_att_draws = boot_info.get("post_ATT_draws", [])
+            post_att_se = float(np.std(post_att_draws, ddof=1)) if len(post_att_draws) > 1 else np.nan
+            info["PostATT_se"] = post_att_se
+            se_series = pd.concat([se_series_tau, pd.Series({"post_ATT": post_att_se})])
+        else:
+            se_series = None
         return EstimationResult(
             params=params,
-            se=None,
+            se=se_series,
             bands=bands,
             n_obs=int(Y.size),
             model_info=info,

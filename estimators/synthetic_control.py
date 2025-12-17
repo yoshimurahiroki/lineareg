@@ -34,6 +34,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from lineareg.core import bootstrap as bt
 from lineareg.core import linalg as la
 from lineareg.estimators.base import (
     BootConfig,
@@ -573,7 +574,6 @@ class SyntheticControl:
             "att_tau": att_df.reset_index(),
             "post_scalar": post_ci_df,
             "donors": donors,
-            # provenance for summary helpers
             "boot_meta": {
                 "origin": "placebo",
                 "kind": "uniform",
@@ -582,9 +582,21 @@ class SyntheticControl:
             },
         }
 
+        if B > 1 and att_tau_star.shape[1] > 1:
+            se_vals = bt.bootstrap_se(att_tau_star)
+            se_series = pd.Series(se_vals, index=tau_grid)
+            if center_at in se_series.index:
+                se_series.loc[center_at] = 0.0
+            if np.any(post_mask):
+                post_star_draws = np.nanmean(att_tau_star[np.flatnonzero(post_mask), :], axis=0)
+                model_info["PostATT_se"] = float(np.std(post_star_draws, ddof=1))
+            extra["se_source"] = "bootstrap"
+        else:
+            se_series = None
+
         res = EstimationResult(
             params=att_series,
-            se=None,
+            se=se_series,
             bands=bands,
             n_obs=int(df.shape[0]),
             model_info=model_info,

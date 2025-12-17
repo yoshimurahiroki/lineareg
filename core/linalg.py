@@ -1719,6 +1719,24 @@ def chol_solve(
     return np.asarray(X, dtype=np.float64)
 
 
+def triangular_solve(
+    L: NDArray[np.float64], B: Matrix, *, lower: bool = True,
+) -> NDArray[np.float64]:
+    """Solve L X = B for triangular L (single triangular solve, not full SPD solve).
+
+    This is for whitening: given Omega = L L', compute L^{-1} B (not Omega^{-1} B).
+    Use chol_solve for Omega^{-1} B when you need the full inverse.
+    """
+    Bd = to_dense(B)
+    if Bd.ndim == 1:
+        Bd = Bd.reshape(-1, 1)
+    if sla is not None:
+        X = sla.solve_triangular(L, Bd, lower=lower, check_finite=False)
+    else:
+        X = np.linalg.solve(L, Bd)
+    return np.asarray(X, dtype=np.float64)
+
+
 def block_solve_posdef(
     A: Matrix, B_list: Sequence[Matrix],
 ) -> list[NDArray[np.float64]]:

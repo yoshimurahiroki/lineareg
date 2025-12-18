@@ -2256,11 +2256,12 @@ def _score_recentering(
 
         minimize ||u*_g - u_g||^2  subject to  X_g' W_g u*_g = 0
 
-    The solution is a projection:
+    The solution is a projection using **cluster-specific** (X_g' W_g X_g)^{-1}:
 
-        u*_g = (I - P_g) u_g  where  P_g = W_g^{1/2} X_g (X_g' W_g X_g)^{-1} X_g' W_g^{1/2}
+        u*_g = (I - H_g) u_g  where  H_g = X_g (X_g' W_g X_g)^{-1} X_g' W_g
 
-    For numerical stability, we solve this via QR factorization of W_g^{1/2} X_g.
+    For numerical stability, we compute the cluster-specific inverse via
+    pseudoinverse when the cluster design matrix is rank-deficient.
 
     Parameters
     ----------
@@ -2287,38 +2288,33 @@ def _score_recentering(
     Xd = to_dense(X)
     n, _k = Xd.shape
 
-    # Validate weights
     if weights is not None:
         w = _validate_weights(weights, n)
     else:
         w = np.ones(n, dtype=np.float64)
 
-    # Compute global inverse (X' W X)^{-1} using robust QR-based routine
-    inv_XtWX = la.xtwx_inv_via_qr(Xd, w)
-
-    # Prepare output
     u = np.asarray(u, dtype=np.float64).reshape(-1, 1)
     u_adj = u.copy()
 
-    # For each cluster g, compute Hg using global inv_XtWX and recenter via M_g = I - H_g
     for cl in np.unique(clusters_arr):
         mask = clusters_arr == cl
         if not np.any(mask):
             continue
         Xg = Xd[mask, :]
         wg = w[mask].reshape(-1, 1)
-        # Weighted design block: Xgw = W_g^{1/2} X_g
-        sqrt_wg = np.sqrt(wg)
-        Xgw = Xg * sqrt_wg
-        # H_g = Xgw @ inv_XtWX @ Xgw.T
-        Hg = la.dot(la.dot(Xgw, inv_XtWX), Xgw.T)
-        # Ensure symmetry and form projection complement
+        ug = u[mask, :]
+        ng = Xg.shape[0]
+        XgTWg = Xg.T * wg.T
+        XgTWgXg = la.dot(XgTWg, Xg)
+        try:
+            inv_XgTWgXg = np.linalg.pinv(XgTWgXg)
+        except np.linalg.LinAlgError:
+            inv_XgTWgXg = np.linalg.pinv(XgTWgXg + 1e-12 * np.eye(XgTWgXg.shape[0]))
+        Hg = la.dot(la.dot(Xg, inv_XgTWgXg), XgTWg)
         Hg = 0.5 * (Hg + Hg.T)
-        Mg = np.eye(Hg.shape[0], dtype=np.float64) - Hg
-        # Apply to cluster residuals using core dot for consistency
-        u_adj[mask, :] = la.dot(Mg, u[mask, :])
+        Mg = np.eye(ng, dtype=np.float64) - Hg
+        u_adj[mask, :] = la.dot(Mg, ug)
 
-    # Numeric verification: ensure cluster-level score orthogonality X_g' W_g u*_g ~= 0
     for cl in np.unique(clusters_arr):
         mask = clusters_arr == cl
         Xg = Xd[mask, :]
@@ -2329,7 +2325,7 @@ def _score_recentering(
         tol = 1e-8 * scale
         if not np.all(np.isfinite(check_vec)) or la.norm(check_vec) > tol:
             raise RuntimeError(
-                f"Score recentering (global Hg) failed for cluster {cl}; check numerical stability.",
+                f"Score recentering failed for cluster {cl}; check numerical stability.",
             )
 
     return u_adj.reshape(-1)
@@ -2987,8 +2983,7 @@ def sparse_bootstrap_meat(
     return meat
 
 
-def resample_units_block(df, id_name: str, rng):
-    import pandas as pd
+def resample_units_block(df: pd.DataFrame, id_name: str, rng: np.random.Generator) -> pd.DataFrame:
     ids = pd.Index(df[id_name].unique())
     n = int(ids.size)
     draw = rng.choice(ids.to_numpy(), size=n, replace=True)
@@ -3000,7 +2995,7 @@ def resample_units_block(df, id_name: str, rng):
     return pd.concat(parts, ignore_index=True)
 
 
-def two_way_demean(M):
+def two_way_demean(M: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     mu_i = np.mean(M, axis=1, keepdims=True)
     mu_t = np.mean(M, axis=0, keepdims=True)
     mu = float(np.mean(M))
@@ -3008,7 +3003,7 @@ def two_way_demean(M):
     return Md, mu_i, mu_t, mu
 
 
-def pca_low_rank(Md, r: int):
+def pca_low_rank(Md: np.ndarray, r: int) -> np.ndarray:
     if r <= 0:
         return np.zeros_like(Md)
     U, s, Vt = np.linalg.svd(Md, full_matrices=False)
@@ -3016,7 +3011,7 @@ def pca_low_rank(Md, r: int):
     return (U[:, :r] * s[:r]) @ Vt[:r, :]
 
 
-def select_r_ic1(Md, rmax: int = 8) -> int:
+def select_r_ic1(Md: np.ndarray, rmax: int = 8) -> int:
     N, T = Md.shape
     rmax = int(min(rmax, min(N, T) - 1))
     if rmax <= 0:
@@ -3034,7 +3029,103 @@ def select_r_ic1(Md, rmax: int = 8) -> int:
     return int(best_r)
 
 
-def fit_ife_dgp(Y, W, tau_it, *, control_mask, r=None, rmax: int = 8, ridge: float = 1e-8) -> dict:
+def fit_ife_dgp(
+    Y: np.ndarray,
+    W: np.ndarray,
+    tau_it: np.ndarray,
+    *,
+    control_mask: np.ndarray,
+    r: int | None = None,
+    rmax: int = 8,
+    ridge: float = 1e-8,
+) -> dict:
+    Yc = Y[control_mask, :].astype(float)
+    Md, _, _, _ = two_way_demean(Yc)
+    r_sel = select_r_ic1(Md, rmax=rmax) if r is None else int(r)
+
+    if r_sel > 0:
+        U, s, Vt = np.linalg.svd(Md, full_matrices=False)
+        F = Vt[:r_sel, :].T
+        X_full = np.column_stack([np.ones(Y.shape[1]), F])
+    else:
+        X_full = np.ones((Y.shape[1], 1))
+
+    delta_t = np.mean(Yc - np.mean(Yc, axis=1, keepdims=True), axis=0)
+
+    Y0_hat = np.zeros_like(Y, dtype=float)
+    for i in range(Y.shape[0]):
+        untreated = (W[i, :] == 0)
+        if not np.any(untreated):
+            Y0_hat[i, :] = float(np.mean(Y[i, :]))
+            continue
+        y_tilde = Y[i, :] - delta_t
+        X = X_full[untreated, :]
+        y_u = y_tilde[untreated]
+        XtX = X.T @ X + ridge * np.eye(X.shape[1])
+        beta = np.linalg.solve(XtX, X.T @ y_u)
+        Y0_hat[i, :] = (X_full @ beta) + delta_t
+
+    resid = Y - (Y0_hat + tau_it * W)
+    return {"Y0_hat": Y0_hat, "resid": resid, "r": r_sel}
+
+
+def wild_unit_multiplier(rng: np.random.Generator, n: int, dist: str = "rademacher") -> np.ndarray:
+    dist = (dist or "rademacher").lower()
+    if dist in {"rademacher", "r"}:
+        return rng.choice(np.array([-1.0, 1.0]), size=n, replace=True)
+    if dist in {"normal", "gaussian"}:
+        return rng.standard_normal(size=n)
+    raise ValueError(f"Unknown dist: {dist}")
+
+
+def resample_units_block(df, id_name: str, rng: np.random.Generator):
+    import pandas as pd
+    ids = pd.Index(df[id_name].unique())
+    n = int(ids.size)
+    draw = rng.choice(ids.to_numpy(), size=n, replace=True)
+    parts = []
+    for j, orig in enumerate(draw):
+        tmp = df.loc[df[id_name] == orig].copy()
+        tmp[id_name] = j
+        parts.append(tmp)
+    return pd.concat(parts, ignore_index=True)
+
+
+def two_way_demean(M: np.ndarray):
+    mu_i = np.mean(M, axis=1, keepdims=True)
+    mu_t = np.mean(M, axis=0, keepdims=True)
+    mu = float(np.mean(M))
+    Md = M - mu_i - mu_t + mu
+    return Md, mu_i, mu_t, mu
+
+
+def pca_low_rank(Md: np.ndarray, r: int) -> np.ndarray:
+    if r <= 0:
+        return np.zeros_like(Md)
+    U, s, Vt = np.linalg.svd(Md, full_matrices=False)
+    r = int(min(r, s.size))
+    return (U[:, :r] * s[:r]) @ Vt[:r, :]
+
+
+def select_r_ic1(Md: np.ndarray, rmax: int = 8) -> int:
+    N, T = Md.shape
+    rmax = int(min(rmax, min(N, T) - 1))
+    if rmax <= 0:
+        return 0
+    NT = N * T
+    pen = (N + T) / NT * np.log(NT / (N + T))
+    best_r, best = 0, np.inf
+    for r in range(0, rmax + 1):
+        Lr = pca_low_rank(Md, r)
+        sigma2 = float(np.mean((Md - Lr) ** 2))
+        ic = np.log(max(sigma2, 1e-12)) + r * pen
+        if ic < best:
+            best = ic
+            best_r = r
+    return int(best_r)
+
+
+def fit_ife_dgp(Y: np.ndarray, W: np.ndarray, tau_it: np.ndarray, *, control_mask: np.ndarray, r: int | None = None, rmax: int = 8, ridge: float = 1e-8):
     Yc = Y[control_mask, :].astype(float)
     Md, _, _, _ = two_way_demean(Yc)
     r_sel = select_r_ic1(Md, rmax=rmax) if r is None else int(r)
@@ -3061,7 +3152,111 @@ def fit_ife_dgp(Y, W, tau_it, *, control_mask, r=None, rmax: int = 8, ridge: flo
     return {"Y0_hat": Y0_hat, "resid": resid, "r": r_sel}
 
 
-def wild_unit_multiplier(rng, n: int, dist: str = "rademacher"):
+def wild_unit_multiplier(rng: np.random.Generator, n: int, dist: str = "rademacher") -> np.ndarray:
+    dist = (dist or "rademacher").lower()
+    if dist in {"rademacher", "r"}:
+        return rng.choice(np.array([-1.0, 1.0]), size=n, replace=True)
+    if dist in {"normal", "gaussian"}:
+        return rng.standard_normal(size=n)
+    raise ValueError(f"Unknown dist: {dist}")
+
+
+def resample_units_block(
+    df,
+    id_name: str,
+    rng: np.random.Generator,
+):
+    """Block bootstrap by unit: resample full trajectories with replacement.
+
+    Duplicated draws are treated as distinct units by reassigning ids to 0..N-1.
+    """
+    import pandas as pd
+    ids = pd.Index(df[id_name].unique())
+    n = int(ids.size)
+    draw = rng.choice(ids.to_numpy(), size=n, replace=True)
+    parts = []
+    for j, orig in enumerate(draw):
+        tmp = df.loc[df[id_name] == orig].copy()
+        tmp[id_name] = j
+        parts.append(tmp)
+    return pd.concat(parts, ignore_index=True)
+
+
+def two_way_demean(M: np.ndarray):
+    mu_i = np.mean(M, axis=1, keepdims=True)
+    mu_t = np.mean(M, axis=0, keepdims=True)
+    mu = float(np.mean(M))
+    Md = M - mu_i - mu_t + mu
+    return Md, mu_i, mu_t, mu
+
+
+def pca_low_rank(Md: np.ndarray, r: int) -> np.ndarray:
+    if r <= 0:
+        return np.zeros_like(Md)
+    U, s, Vt = np.linalg.svd(Md, full_matrices=False)
+    r = int(min(r, s.size))
+    return (U[:, :r] * s[:r]) @ Vt[:r, :]
+
+
+def select_r_ic1(Md: np.ndarray, rmax: int = 8) -> int:
+    N, T = Md.shape
+    rmax = int(min(rmax, min(N, T) - 1))
+    if rmax <= 0:
+        return 0
+    NT = N * T
+    pen = (N + T) / NT * np.log(NT / (N + T))
+    best_r, best = 0, np.inf
+    for r in range(0, rmax + 1):
+        Lr = pca_low_rank(Md, r)
+        sigma2 = float(np.mean((Md - Lr) ** 2))
+        ic = np.log(max(sigma2, 1e-12)) + r * pen
+        if ic < best:
+            best = ic
+            best_r = r
+    return int(best_r)
+
+
+def fit_ife_dgp(
+    Y: np.ndarray,
+    W: np.ndarray,
+    tau_it: np.ndarray,
+    *,
+    control_mask: np.ndarray,
+    r: int | None = None,
+    rmax: int = 8,
+    ridge: float = 1e-8,
+):
+    Yc = Y[control_mask, :].astype(float)
+    Md, _, _, _ = two_way_demean(Yc)
+    r_sel = select_r_ic1(Md, rmax=rmax) if r is None else int(r)
+
+    if r_sel > 0:
+        U, s, Vt = np.linalg.svd(Md, full_matrices=False)
+        F = Vt[:r_sel, :].T
+        X_full = np.column_stack([np.ones(Y.shape[1]), F])
+    else:
+        X_full = np.ones((Y.shape[1], 1))
+
+    delta_t = np.mean(Yc - np.mean(Yc, axis=1, keepdims=True), axis=0)
+
+    Y0_hat = np.zeros_like(Y, dtype=float)
+    for i in range(Y.shape[0]):
+        untreated = (W[i, :] == 0)
+        if not np.any(untreated):
+            Y0_hat[i, :] = float(np.mean(Y[i, :]))
+            continue
+        y_tilde = Y[i, :] - delta_t
+        X = X_full[untreated, :]
+        y_u = y_tilde[untreated]
+        XtX = X.T @ X + ridge * np.eye(X.shape[1])
+        beta = np.linalg.solve(XtX, X.T @ y_u)
+        Y0_hat[i, :] = (X_full @ beta) + delta_t
+
+    resid = Y - (Y0_hat + tau_it * W)
+    return {"Y0_hat": Y0_hat, "resid": resid, "r": r_sel}
+
+
+def wild_unit_multiplier(rng: np.random.Generator, n: int, dist: str = "rademacher") -> np.ndarray:
     dist = (dist or "rademacher").lower()
     if dist in {"rademacher", "r"}:
         return rng.choice(np.array([-1.0, 1.0]), size=n, replace=True)

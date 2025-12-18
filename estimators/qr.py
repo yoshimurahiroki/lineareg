@@ -243,12 +243,20 @@ def _prepare_qr_lp(
 def _solve_qr_lp_prepared(
     prep: dict[str, Any],
     multipliers: NDArray[np.float64] | None = None,
+    *,
+    raise_on_failure: bool = True,
 ) -> tuple[NDArray[np.float64], float, NDArray[np.float64] | None, dict[str, Any]]:
     """Solve the prepared QR LP for given (optional) positive multipliers.
 
     This reuses the constraint matrices and bounds across draws and only
     updates the objective c per call, reducing Python overhead. Numerical
     results are identical to `_solve_qr_lp`.
+    
+    Parameters
+    ----------
+    raise_on_failure : bool, default True
+        If True, raise RuntimeError on solver failure.
+        If False, return NaN coefficients on failure (useful for bootstrap).
     """
     n = int(prep["n"])
     k = int(prep["k"])
@@ -258,12 +266,14 @@ def _solve_qr_lp_prepared(
     b_eq = prep["b_eq"]
     bounds = prep["bounds"]
     options = prep["options"]
+    options_relaxed = {**options, "presolve": False, "dual_feasibility_tolerance": 1e-7, "primal_feasibility_tolerance": 1e-7}
 
     w = (
         np.ones((n, 1))
         if multipliers is None
         else np.asarray(multipliers, dtype=float).reshape(n, 1)
     )
+    w = np.clip(w, 1e-10, None)
     c = np.concatenate([tie, tau * w.ravel(), (1.0 - tau) * w.ravel()])
 
     res = linprog(
@@ -282,8 +292,20 @@ def _solve_qr_lp_prepared(
         "success": bool(res.success) if hasattr(res, "success") else False,
     }
     if not res.success:
-        msg = f"LP solver failed: {res.message}"
-        raise RuntimeError(msg)
+        res = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs-ipm", options=options)
+        solver_info = {"solver": "highs-ipm", "status": int(getattr(res, "status", -1)), "message": str(getattr(res, "message", "")), "nit": int(getattr(res, "nit", -1)), "success": bool(getattr(res, "success", False))}
+        if not res.success:
+            res = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs-ds", options=options_relaxed)
+            solver_info = {"solver": "highs-ds-relaxed", "status": int(getattr(res, "status", -1)), "message": str(getattr(res, "message", "")), "nit": int(getattr(res, "nit", -1)), "success": bool(getattr(res, "success", False))}
+            if not res.success:
+                res = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs-ipm", options=options_relaxed)
+                solver_info = {"solver": "highs-ipm-relaxed", "status": int(getattr(res, "status", -1)), "message": str(getattr(res, "message", "")), "nit": int(getattr(res, "nit", -1)), "success": bool(getattr(res, "success", False))}
+    if not res.success:
+        if raise_on_failure:
+            msg = f"LP solver failed: {res.message}"
+            raise RuntimeError(msg)
+        else:
+            return np.full((k, 1), np.nan), np.nan, None, solver_info
 
     beta = res.x[:k].reshape(-1, 1)
     dual_eq = getattr(getattr(res, "eqlin", None), "marginals", None)
@@ -1195,11 +1217,11 @@ class QR(BaseEstimator):
         else:
             Wpos, boot_log = self._bootstrap_multipliers(n_eff, boot=boot)
 
-            # Weighted LP per draw (weights in objective, not preprocessing)
             boot_betas = np.empty((self.n_features, B), dtype=np.float64)
+            boot_betas.fill(np.nan)
             Wpos_arr = Wpos.to_numpy()
-            # Optional threaded parallelism controlled via env var
             n_workers = max(1, int(os.getenv("LINEAREG_QR_BOOTSTRAP_WORKERS", "1")))
+            failed_draws = 0
             if n_workers > 1 and B > 1:
                 with ThreadPoolExecutor(max_workers=n_workers) as ex:
                     futures = [
@@ -1207,19 +1229,40 @@ class QR(BaseEstimator):
                             _solve_qr_lp_prepared,
                             prep,
                             Wpos_arr[:, b : b + 1],
+                            raise_on_failure=False,
                         )
                         for b in range(B)
                     ]
                     for b, fut in enumerate(futures):
-                        boot_beta, _, _, _ = fut.result()
-                        boot_betas[:, b] = boot_beta.reshape(-1)
+                        try:
+                            boot_beta, _, _, info = fut.result()
+                            if np.any(np.isnan(boot_beta)):
+                                failed_draws += 1
+                            else:
+                                boot_betas[:, b] = boot_beta.reshape(-1)
+                        except Exception:
+                            failed_draws += 1
             else:
                 for b in range(B):
                     wb = Wpos_arr[:, b : b + 1]
-                    boot_beta, _, _, _ = _solve_qr_lp_prepared(prep, wb)
-                    boot_betas[:, b] = boot_beta.reshape(-1)
+                    try:
+                        boot_beta, _, _, info = _solve_qr_lp_prepared(prep, wb, raise_on_failure=False)
+                        if np.any(np.isnan(boot_beta)):
+                            failed_draws += 1
+                        else:
+                            boot_betas[:, b] = boot_beta.reshape(-1)
+                    except Exception:
+                        failed_draws += 1
 
-            se_hat = bt.bootstrap_se(boot_betas)
+            if failed_draws > 0:
+                warnings.warn(f"QR bootstrap: {failed_draws}/{B} draws failed to solve; using {B - failed_draws} valid draws.", RuntimeWarning, stacklevel=2)
+
+            valid_mask = ~np.isnan(boot_betas[0, :])
+            if valid_mask.sum() < 2:
+                warnings.warn("QR bootstrap: fewer than 2 valid draws; SE will be NaN.", RuntimeWarning, stacklevel=2)
+                se_hat = np.full(self.n_features, np.nan)
+            else:
+                se_hat = bt.bootstrap_se(boot_betas[:, valid_mask])
 
         params = pd.Series(beta_hat.reshape(-1), index=self._var_names, name="coef")
         se = pd.Series(se_hat.reshape(-1), index=self._var_names, name="se")

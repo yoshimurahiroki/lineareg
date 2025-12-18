@@ -4,13 +4,10 @@ R `synthdid` / Stata `sdid` / Arkhangelsky et al. (2021, AER) reproducing
 implementation. Provides collapsed-form construction, Frank-Wolfe solver for
 weights (omega, lambda) with regularization defaults, staggered aggregation in
 event time (tau = t - g), and bootstrap-only uniform sup-t confidence bands.
-Analytical SEs and p-values remain intentionally unavailable (project policy).
 
-PATCH (event-time grid & post shrinkage):
-- Build the union τ-grid implied by all treated cohorts x observed calendar times.
-- Preserve τ with zero treated denominator; keep the row and mark ``NaN``.
-- Align bootstrap draws to the full τ-grid so summaries and plots retain
-  every event time (mirrors R/stata behavior).
+Inference uses unit (block) bootstrap (when treated>=2) or IFE parametric wild
+bootstrap (when treated=1) following gsynth/fect design. No placebo/permutation
+or pairs bootstrap.
 """
 
 from __future__ import annotations
@@ -48,7 +45,7 @@ class SDID:
     cohort_name: optional cohort column name (adoption time) if present
     control_group: 'notyet' (default) or 'never'
     eta_omega, eta_lambda: regularization defaults (None -> formula for eta_omega)
-    boot: BootConfig for unit/IFE bootstrap (default None -> no bootstrap)
+    boot: BootConfig for placebo bootstrap (default None -> no bootstrap)
     alpha: confidence level for bootstrap bands
     fw_max_iter, fw_tol: Frank-Wolfe solver controls
     omega_intercept/lambda_intercept: whether to demean rows/cols before solving
@@ -91,7 +88,7 @@ class SDID:
     def fit(self, df: pd.DataFrame | None = None) -> EstimationResult:
         """Fit SDID on a long balanced panel DataFrame.
 
-        Returns an EstimationResult with params (event-time series indexed by τ), bands (bootstrap CI and uniform sup-t),
+        Returns an EstimationResult with params (event-time series indexed by τ), bands (placebo CI and uniform sup-t),
         model_info and extra fields including per-cohort weights and time series.
         """
         if df is None:
@@ -235,18 +232,18 @@ class SDID:
         n_treated_total = sum(int(idx_tr.sum()) for idx_tr in cohorts.values())
 
         bands = None
-        boot_info: dict[str, object] = {"B": 0, "post_ATT_draws": np.empty(0, float), "ATT_tau_draws": np.full((0, 0), np.nan, dtype=float)}
+        boot_info: dict[str, object] = {"B": 0}
         se_series = None
+        att_tau_star = np.full((tau_grid.size, 0), np.nan, dtype=float)
 
-        if self.boot is not None and getattr(self.boot, "n_boot", 0) > 0:
+        if self.boot is not None and getattr(self.boot, "n_boot", 0) > 1:
             B = int(self.boot.n_boot)
             alpha_level = float(self.alpha)
             rng = np.random.default_rng(getattr(self.boot, "seed", None))
-            mode_raw = getattr(self.boot, "mode", None)
-            if mode_raw is None or str(mode_raw).lower() == "auto":
+
+            mode = (getattr(self.boot, "mode", None) or "auto").lower()
+            if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "ife_wild"
-            else:
-                mode = str(mode_raw).lower()
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='ife_wild'.")
 
@@ -254,6 +251,8 @@ class SDID:
             att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
             att_b = np.full(B, np.nan, dtype=float)
             filled = 0
+            attempts = 0
+            max_attempts = max(10_000, 10 * B)
 
             if mode == "ife_wild":
                 tau_it = np.zeros_like(Y, dtype=float)
@@ -264,17 +263,20 @@ class SDID:
                         tau_it[i, :] = delta_gt
                 control_mask = W.sum(axis=1) == 0
                 dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask)
-                Y0_hat, resid = dgp["Y0_hat"], dgp["resid"]
+                Y0_hat = dgp["Y0_hat"]
+                resid = dgp["resid"]
 
-            for b in range(B):
+            while filled < B and attempts < max_attempts:
+                attempts += 1
                 try:
                     if mode == "unit":
                         df_b = bt.resample_units_block(df, self.id_name, rng)
-                        Y_b, W_b, _, times_b = self._panel_matrices(df_b)
+                        Y_b, W_b, units_b, times_b = self._panel_matrices(df_b)
                     else:
                         v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
                         Y_b = Y0_hat + tau_it * W + (v[:, None] * resid)
-                        W_b, times_b = W, times
+                        W_b = W
+                        units_b, times_b = _units, times
 
                     att_post_b, att_tau_b = self._att_path_from_w(
                         Y_b, W_b, times_b,
@@ -289,9 +291,11 @@ class SDID:
                     for j, tau in enumerate(tau_grid):
                         if int(tau) in att_tau_b:
                             vec_b[j] = att_tau_b[int(tau)]
+
                     mask_post_b = tau_grid >= 0
                     if np.any(~np.isfinite(vec_b[mask_post_b])):
                         continue
+
                     att_tau_star[:, filled] = vec_b
                     att_b[filled] = float(att_post_b)
                     filled += 1
@@ -328,9 +332,11 @@ class SDID:
                         return None
                     tdraw = diffs[ok, :] / se[ok, None]
                     sup_abs = np.nanmax(np.abs(tdraw), axis=0)
-                    c = float(np.nanquantile(sup_abs, 1.0 - alpha_level))
-                    lo = th.copy()
-                    hi = th.copy()
+                    sup_abs_valid = sup_abs[np.isfinite(sup_abs)]
+                    if sup_abs_valid.size == 0:
+                        return None
+                    c = float(bt.finite_sample_quantile(sup_abs_valid, 1.0 - alpha_level))
+                    lo = th.copy(); hi = th.copy()
                     lo[ok] = th[ok] - c * se[ok]
                     hi[ok] = th[ok] + c * se[ok]
                     return pd.DataFrame({"lower": pd.Series(lo, index=tau_grid[idx]), "upper": pd.Series(hi, index=tau_grid[idx])}).sort_index()
@@ -345,10 +351,21 @@ class SDID:
                     "post": _sup_t_band(mask_post),
                 }
 
-                from scipy.stats import norm
-                z_crit = float(norm.ppf(1.0 - alpha_level / 2.0))
-                lo_post = att_post - z_crit * post_att_se
-                hi_post = att_post + z_crit * post_att_se
+                mask_post_draws = tau_grid > base_tau
+                if np.any(mask_post_draws) and filled > 1:
+                    post_star = np.nanmean(att_tau_star[np.flatnonzero(mask_post_draws), :], axis=0)
+                    post_star_valid = post_star[np.isfinite(post_star)]
+                    if post_star_valid.size > 1 and post_att_se > 0:
+                        tdraw_post = (post_star_valid - att_post) / post_att_se
+                        c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
+                        lo_post = att_post - c_post * post_att_se
+                        hi_post = att_post + c_post * post_att_se
+                    else:
+                        lo_post = np.nan
+                        hi_post = np.nan
+                else:
+                    lo_post = np.nan
+                    hi_post = np.nan
                 bands["post_ATT"] = pd.DataFrame({"lower": [lo_post], "upper": [hi_post]})
                 bands["post_scalar"] = bands["post_ATT"]
                 bands["__meta__"] = {
@@ -361,12 +378,13 @@ class SDID:
                 }
 
                 se_series = pd.concat([se_series_tau, pd.Series({"post_ATT": post_att_se})])
+        else:
+            boot_info = {"B": 0, "post_ATT_draws": np.empty(0, float), "ATT_tau_draws": np.full((0, 0), np.nan, dtype=float)}
 
-        # ==== Expose event-time series as params indexed by τ ====
         params_tau = att_tau.set_index("tau")["att"].astype(float)
         params = params_tau.copy()
         params.loc["post_ATT"] = float(att_post) if np.isfinite(att_post) else att_post
-        # ---- R/Stata 準拠: 基準点は τ = -1 （最後のプレ期）----
+
         info: dict[str, object] = {
             "Estimator": "EventStudy: SDID",
             "ControlGroup": self.control_group,
@@ -375,19 +393,15 @@ class SDID:
             "Alpha": float(self.alpha),
             "Cohorts": sorted(cohorts.keys()),
             "Times": times.tolist(),
-            "Bootstrap": "unit/IFE bootstrap (NOT placebo/pairs bootstrap), uniform bands over τ",
+            "Bootstrap": "unit/IFE bootstrap (NOT placebo/pairs bootstrap), uniform sup-t bands over τ",
             "NoAnalyticPValues": True,
         }
-        # Unified aggregate reporting
         info["PostATT"] = float(att_post) if np.isfinite(att_post) else att_post
-        # ---- 重要: CenterAt = -1（R/Stata と同じ）----
         info["CenterAt"] = int(base_tau)
-        # bootstrap 実行回数を明示（summary の厳格ゲートを通す）
         if isinstance(bands, dict):
             info["B"] = int(bands.get("__meta__", {}).get("B", 0))
         else:
             info["B"] = 0
-        # uniform を出すことを明示（あれば）
         if isinstance(bands, dict) and any(k in bands for k in ("pre", "post", "full")):
             info["BandType"] = "uniform"
         bands_meta = bands.get("__meta__") if isinstance(bands, dict) else None
@@ -397,7 +411,6 @@ class SDID:
                 info["BandType"] = kind
         if "BandType" not in info:
             info["BandType"] = "none"
-        # No legacy percentile metadata or aggregation rule attached.
 
         extra = {
             "per_cohort": results_g,
@@ -406,26 +419,14 @@ class SDID:
             "boot": boot_info,
             "boot_meta": bands_meta if isinstance(bands_meta, dict) else None,
             "bands_source": ("bootstrap" if bands is not None else None),
-            "se_source": "bootstrap",
+            "se_source": "bootstrap" if se_series is not None else None,
         }
-        att_tau_star_arr = boot_info.get("ATT_tau_draws")
-        tau_idx = att_tau.set_index("tau").index.to_numpy(dtype=int)
-        if (
-            att_tau_star_arr is not None
-            and isinstance(att_tau_star_arr, np.ndarray)
-            and att_tau_star_arr.ndim == 2
-            and att_tau_star_arr.shape[1] > 1
-        ):
-            se_vals = bt.bootstrap_se(att_tau_star_arr)
-            se_series_tau = pd.Series(se_vals, index=tau_idx)
-            if int(base_tau) in se_series_tau.index:
-                se_series_tau.loc[int(base_tau)] = 0.0
+
+        if se_series is not None:
             post_att_draws = boot_info.get("post_ATT_draws", [])
-            post_att_se = float(np.std(post_att_draws, ddof=1)) if len(post_att_draws) > 1 else np.nan
-            info["PostATT_se"] = post_att_se
-            se_series = pd.concat([se_series_tau, pd.Series({"post_ATT": post_att_se})])
-        else:
-            se_series = None
+            if len(post_att_draws) > 1:
+                info["PostATT_se"] = float(np.std(post_att_draws, ddof=1))
+
         return EstimationResult(
             params=params,
             se=se_series,
@@ -556,7 +557,7 @@ class SDID:
         res = est.fit(**extra)
         if getattr(est, "_cluster_ids_from_formula", None) is not None:
             res.model_info["ClusterIDsProvided"] = True
-            res.model_info["ClusterIDsUsedInBootstrap"] = False
+            res.model_info["ClusterIDsUsedInPlacebo"] = False
         return res
 
     # -------------------- internals --------------------

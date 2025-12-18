@@ -803,8 +803,11 @@ class SDID:
         max_iter: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Frank-Wolfe on the simplex with exact line-search.
-        Stop when the dual gap g(x)=<grad, x - e_j> <= min_dec, where j = argmin(grad).
-        Objective trace records f(x) = eta*||x||^2 + ||A x - b||^2 (for monitoring only).
+
+        Stopping condition (R parity): stop when objective decrease is ≤ min_dec^2.
+        This matches R synthdid's sc.weight.fw which checks:
+            vals[t-1] - vals[t] > min.decrease^2
+        Objective trace records f(x) = eta*||x||^2 + ||A x - b||^2.
         """
         # Incremental implementation: maintain Ax and avoid repeated A@x multiplies.
         # Also precompute A' and A'b so grad = A'Ax - A'b + eta x.
@@ -816,17 +819,20 @@ class SDID:
         Atb = la.dot(At, b.reshape(-1, 1)).reshape(-1)
         Ax = la.dot(A, x.reshape(-1, 1)).reshape(-1)
         vals: list[float] = []
-        for _ in range(max_iter):
+        # R parity: threshold is min_dec^2
+        min_dec_sq = float(min_dec) ** 2
+        prev_val = float("inf")
+        for t in range(max_iter):
             # grad = A'(Ax - b) + eta x = (A'Ax) - (A'b) + eta x
             grad = la.dot(At, Ax.reshape(-1, 1)).reshape(-1) - Atb + eta * x
             j = int(np.argmin(grad))
-            # dual gap on the simplex: g(x) = <grad, x - e_j> = grad·x - grad_j
-            gap = float(la.dot(grad, x) - grad[j])
             # objective (scaled consistently): eta*||x||^2 + ||A x - b||^2
             val = float(eta * la.dot(x, x) + la.dot((Ax - b), (Ax - b)))
             vals.append(val)
-            if gap <= float(min_dec):
+            # R parity: stop when objective decrease is too small (t >= 2 in R indexing)
+            if t >= 1 and (prev_val - val) <= min_dec_sq:
                 break
+            prev_val = val
             # FW step with exact line-search; use d_err = A[:, j] - Ax to avoid A@d
             d = -x.copy()
             d[j] += 1.0

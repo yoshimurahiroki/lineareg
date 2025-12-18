@@ -413,7 +413,18 @@ class SpatialDID:
                 # Event-study spillover: use COHORT membership for S in ALL periods
                 unit_indices = sub["_i"].to_numpy(dtype=int)
                 cohort_all = (int(g) == G).astype(np.float64)
-                Svec = la.dot(Wd[unit_indices, :], cohort_all.reshape(-1, 1))
+                Svec_raw = la.dot(Wd[unit_indices, :], cohort_all.reshape(-1, 1))
+                exposed_controls = (Svec_raw.reshape(-1) > 0.0) & (Z.reshape(-1) == 0.0)
+                mean_S_exposed = (
+                    float(la.col_mean(Svec_raw.reshape(-1)[exposed_controls].reshape(-1, 1))[0])
+                    if np.any(exposed_controls)
+                    else 1.0
+                )
+                Svec = np.zeros_like(Svec_raw)
+                if np.any(exposed_controls) and mean_S_exposed > 0:
+                    Svec[exposed_controls.reshape(-1, 1)] = (
+                        Svec_raw[exposed_controls.reshape(-1, 1)] / mean_S_exposed
+                    )
                 X = la.hstack([np.ones((y.shape[0], 1), dtype=np.float64), Z, Svec])
                 # optional: flag degenerate columns (variance ~ 0) for audit trail
                 _deg = {
@@ -433,34 +444,13 @@ class SpatialDID:
                     )
                     continue
                 beta_D = float(beta[1, 0]) if beta.shape[0] > 1 else np.nan
-                # Extract beta_S: when S column dropped by rank policy, use NaN (not 0)
-                # to indicate non-identification rather than masking with zero.
                 beta_S = float(beta[2, 0]) if beta.shape[0] > 2 else np.nan
-                beta_Sc = beta_S
                 tau = int(t - g)
-                exposed_controls = (Svec.reshape(-1) > 0.0) & (Z.reshape(-1) == 0.0)
-                mean_S_exposed = (
-                    float(
-                        la.col_mean(Svec.reshape(-1)[exposed_controls].reshape(-1, 1))[
-                            0
-                        ],
-                    )
-                    if np.any(exposed_controls)
-                    else 0.0
-                )
-                # PRE: use raw β_S for ATT and inference (parallel trends on spill channel)
-                # POST: report β_S × mean(S | exposed controls); inference stays on β_S
-                spill_val = (
-                    beta_S if (tau < int(self.center_at)) else beta_S * mean_S_exposed
-                )
                 n_treat = float(np.sum(Z))
-                atts_direct.append((int(g), int(t), tau, beta_D, n_treat))
-                # Record spillover for ALL (g,t) cells regardless of n_exposed.
-                # When n_exposed == 0, spill_val == 0 but we still need the cell
-                # for proper event-study inference (parallel trends testing).
                 n_exposed = float(np.sum(exposed_controls))
-                atts_spill.append((int(g), int(t), tau, spill_val, max(n_exposed, 1.0)))
-                atts_beta_s.append((int(g), int(t), tau, beta_Sc, max(n_exposed, 1.0)))
+                atts_direct.append((int(g), int(t), tau, beta_D, n_treat))
+                atts_spill.append((int(g), int(t), tau, beta_S, max(n_exposed, 1.0)))
+                atts_beta_s.append((int(g), int(t), tau, beta_S, max(n_exposed, 1.0)))
 
                 # Bootstrap draws for the cell (observation-level multipliers prebuilt)
                 W_cell = W_obs[sub.index.to_numpy(dtype=int), :]
@@ -519,28 +509,19 @@ class SpatialDID:
                         exc,
                     )
                     continue
-                # Handle rank deficiency: when S has zero variance, beta_star has only 2 rows
                 betaD_star = (
                     beta_star_D[1:2, :]
                     if beta_star_D.shape[0] > 1
                     else np.full((1, beta_star_D.shape[1]), np.nan)
                 )
-                # For beta_S: if dropped (shape[0] <= 2), fill with zeros (no spillover identified)
-                if beta_star_S.shape[0] > 2:
-                    betaS_star = beta_star_S[2:3, :] * mean_S_exposed
-                    bs_star_raw = beta_star_S[2:3, :]
-                else:
-                    # S was dropped; spillover coefficient is 0
-                    betaS_star = np.zeros((1, beta_star_S.shape[1]), dtype=np.float64)
-                    bs_star_raw = np.zeros((1, beta_star_S.shape[1]), dtype=np.float64)
+                betaS_star = (
+                    beta_star_S[2:3, :]
+                    if beta_star_S.shape[0] > 2
+                    else np.zeros((1, beta_star_S.shape[1]), dtype=np.float64)
+                )
                 direct_boot.append((int(g), int(t), betaD_star.reshape(-1), n_treat))
-                # Record spillover bootstrap for ALL cells (even n_exposed == 0)
-                spill_boot.append(
-                    (int(g), int(t), betaS_star.reshape(-1), max(n_exposed, 1.0)),
-                )
-                bs_boot.append(
-                    (int(g), int(t), bs_star_raw.reshape(-1), max(n_exposed, 1.0)),
-                )
+                spill_boot.append((int(g), int(t), betaS_star.reshape(-1), max(n_exposed, 1.0)))
+                bs_boot.append((int(g), int(t), betaS_star.reshape(-1), max(n_exposed, 1.0)))
 
         if not atts_direct:
             raise RuntimeError("No valid (g,t) cells for Spatial DID.")
@@ -768,11 +749,7 @@ class SpatialDID:
             return pre_pair, post_pair, full_pair
 
         bands_direct = _bands(dir_tau, dir_tau_star)
-        # Spillover inference: use unscaled beta_S coefficient (bs_tau) with
-        # its bootstrap distribution (bs_tau_star) for valid inference even when
-        # n_exposed = 0. This tests H0: beta_S = 0 (no spillover channel), which
-        # is the relevant parallel trends test for spillover effects.
-        bands_spill = _bands(bs_tau, bs_tau_star)  # Use beta_S for spillover inference
+        bands_spill = _bands(spi_tau, spi_tau_star)
         bands_beta_s = _bands(bs_tau, bs_tau_star)
 
         # --- post-period aggregated ATE (tau >= center_at) with bootstrap bands (no p-values) ---

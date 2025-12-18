@@ -224,9 +224,9 @@ class SDID:
         )
         att_tau.loc[att_tau["den"] <= 0.0, "att"] = np.nan
         valid_post = att_tau[(att_tau["den"] > 0) & (att_tau["tau"] >= 0)]
-        att_post = (
-            float(valid_post["att"].mean()) if not valid_post.empty else float("nan")
-        )
+        post_num = sum(att_tau_num.get(int(tau), 0.0) for tau in valid_post["tau"])
+        post_den = sum(att_tau_den.get(int(tau), 0.0) for tau in valid_post["tau"])
+        att_post = float(post_num / post_den) if post_den > 0 else float("nan")
 
         tau_grid = np.array(tau_union_sorted, dtype=int)
         n_treated_total = sum(int(idx_tr.sum()) for idx_tr in cohorts.values())
@@ -947,6 +947,7 @@ class SDID:
             den = float(att_tau_den.get(tau_val, 0.0))
             att_tau[int(tau_val)] = num / den if den > 0 else float("nan")
 
-        post_vals = [v for tau, v in att_tau.items() if tau >= 0 and np.isfinite(v)]
-        att_post = float(np.mean(post_vals)) if post_vals else float("nan")
+        post_num = sum(att_tau_num.get(tau, 0.0) for tau in att_tau_num if tau >= 0)
+        post_den = sum(att_tau_den.get(tau, 0.0) for tau in att_tau_den if tau >= 0)
+        att_post = float(post_num / post_den) if post_den > 0 else float("nan")
         return att_post, att_tau

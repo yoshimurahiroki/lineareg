@@ -458,7 +458,6 @@ class GMM(BaseEstimator):
             else:
                 Wh = la.hadamard(Wl, e)
                 M = la.crossprod(Wh, Wh)
-            M = M / scale
 
             V = la.to_dense(la.dot(la.dot(XtX_inv, M), XtX_inv))
             q = X0.shape[1]
@@ -466,13 +465,13 @@ class GMM(BaseEstimator):
             Sigma = V[q:, q:]
 
             try:
-                Z_scaled = Z2l / float(np.sqrt(scale))
-                return float(la.effective_f_from_first_stage(pi, Sigma, Z_scaled))
+                return float(la.effective_f_from_first_stage(pi, Sigma, Z2l))
             except (np.linalg.LinAlgError, ValueError):
-                Qzz = la.crossprod(Z2l, Z2l) / scale
+                Qzz = la.crossprod(Z2l, Z2l)
                 num = float(la.dot(pi.T, la.dot(Qzz, pi)))
                 den = float(np.trace(la.to_dense(la.dot(Sigma, Qzz))))
-                return num / den if den > 0 else float("nan")
+                k = pi.shape[0]
+                return (num / den / k) if den > 0 else float("nan")
         except (np.linalg.LinAlgError, ValueError, ZeroDivisionError, IndexError):
             return float("nan")
 

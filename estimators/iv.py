@@ -121,7 +121,10 @@ def _cd_kp_stats(  # noqa: PLR0913
         lam_cd = float("nan")
     if np.isfinite(lam_cd):
         out["cd_min_eig"] = float(lam_cd)
-        out["cd_wald_F"] = float(lam_cd / K) if K > 0 else float("nan")
+        L2_eff = Z2_t.shape[1]
+        df_num = max(1, L2_eff - K + 1)
+        df_denom = max(1, n - L2_eff - X0.shape[1] if 'X0' in dir() else n - L2_eff)
+        out["cd_wald_F"] = float(lam_cd * df_denom / df_num) if df_num > 0 else float("nan")
 
     # ---- Kleibergen-Paap rk statistic (heterosked/cluster robust) ----
     if u is None or Z2_t.shape[1] == 0:
@@ -140,9 +143,10 @@ def _cd_kp_stats(  # noqa: PLR0913
                 S += la.dot(mg, mg.T)
         else:
             Zu = la.hadamard(Z2_t, u_vec.reshape(-1, 1))
-            S = la.crossprod(Zu, Z2_t)
+            S = la.crossprod(Zu, Zu)
 
         S_dense = la.to_dense(S).astype(np.float64)
+        S_dense = 0.5 * (S_dense + S_dense.T)
         S_plus = np.linalg.pinv(S_dense)
         G = S_plus @ Qxz  # (L2 x K)
         M = Qxz.T @ G  # (K x K)
@@ -1434,19 +1438,20 @@ class IV2SLS(BaseEstimator):
                     # Here pi_hat are coefficients on Z2 only (X0 already partialled out),
                     # therefore the entire vector constitutes π.
                     pi_vec = pi_hat.reshape(-1, 1)
-                    Qzz = la.crossprod(Z2l, Z2l) / scale
-                    Qzz_inv = la.pinv(Qzz)
-                    Sig_pipi = la.dot(Qzz_inv, la.dot(M_loc, Qzz_inv))
+                    Qzz_raw = la.crossprod(Z2l, Z2l)
+                    Qzz_raw_inv = la.pinv(Qzz_raw)
+                    M_raw = M_loc * scale
+                    Sig_pipi = la.dot(Qzz_raw_inv, la.dot(M_raw, Qzz_raw_inv))
                     try:
-                        Z_scaled = (Z2l / float(np.sqrt(scale))) if scale > 0 else Z2l
                         cd_stats["MOP_effective_F"] = float(
-                            la.effective_f_from_first_stage(pi_vec, Sig_pipi, Z_scaled),
+                            la.effective_f_from_first_stage(pi_vec, Sig_pipi, Z2l),
                         )
                     except Exception:  # noqa: BLE001
+                        Qzz = Qzz_raw / scale
                         num = float(la.dot(pi_vec.T, la.dot(Qzz, pi_vec)))
                         den = float(np.trace(la.to_dense(la.dot(Sig_pipi, Qzz))))
                         if den > 0:
-                            cd_stats["MOP_effective_F"] = num / den
+                            cd_stats["MOP_effective_F"] = num / den * scale
             except Exception:  # noqa: BLE001
                 cd_stats["MOP_effective_F"] = float("nan")
 

@@ -244,91 +244,149 @@ class SDID:
             mode = (getattr(self.boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "ife_wild"
-            if mode not in {"unit", "ife_wild", "placebo"}:
-                raise ValueError("SDID boot mode must be one of {'unit', 'ife_wild', 'placebo'}.")
+            if mode not in {"unit", "ife_wild", "placebo", "jackknife"}:
+                raise ValueError("SDID boot mode must be one of {'unit', 'ife_wild', 'placebo', 'jackknife'}.")
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='ife_wild' or mode='placebo'.")
 
             theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
-            att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
-            att_b = np.full(B, np.nan, dtype=float)
-            filled = 0
-            attempts = 0
-            max_attempts = max(10_000, 10 * B)
 
-            if mode == "ife_wild":
-                tau_it = np.zeros_like(Y, dtype=float)
-                for g, meta in results_g.items():
-                    delta_gt = np.asarray(meta["delta_t"], dtype=float)
-                    idx_tr = cohorts[g]
-                    for i in np.where(idx_tr)[0]:
-                        tau_it[i, :] = delta_gt
-                control_mask = W.sum(axis=1) == 0
-                dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask)
-                Y0_hat = dgp["Y0_hat"]
-                resid = dgp["resid"]
+            # ----- Jackknife variance estimation (synthdid-style) -----
+            if mode == "jackknife":
+                N = Y.shape[0]
+                att_jack = []
+                for drop_i in range(N):
+                    keep = np.arange(N) != drop_i
+                    Y_i = Y[keep, :]
+                    W_i = W[keep, :]
+                    try:
+                        att_post_i, att_tau_i = self._att_path_from_w(
+                            Y_i, W_i, times,
+                            zeta_omega=None, zeta_lambda=None,
+                            omega_intercept=self.omega_intercept,
+                            lambda_intercept=self.lambda_intercept,
+                            max_iter=self.fw_max_iter,
+                            tol=self.fw_tol,
+                        )
+                        att_jack.append(float(att_post_i))
+                    except Exception:
+                        continue
+                att_jack = np.array(att_jack, dtype=float)
+                n_jack = len(att_jack)
+                if n_jack > 1:
+                    jack_mean = float(np.mean(att_jack))
+                    post_att_se = float(np.sqrt((n_jack - 1) / n_jack * np.sum((att_jack - jack_mean) ** 2)))
+                    # Jackknife only computes SE for aggregate post_ATT, not per-tau.
+                    # Since se_series must match params exactly and cannot have NaN,
+                    # we leave se_series = None and store jackknife SE in boot_info.
+                    # Compute simple symmetric CI
+                    alpha_level = float(self.alpha)
+                    z = 1.96 if alpha_level == 0.05 else bt.finite_sample_quantile(np.abs(np.random.randn(10000)), 1.0 - alpha_level)
+                    lo_post = float(att_post) - z * post_att_se
+                    hi_post = float(att_post) + z * post_att_se
+                    bands = {
+                        "full": None,
+                        "pre": None,
+                        "post": None,
+                        "post_ATT": pd.DataFrame({"lower": [lo_post], "upper": [hi_post]}),
+                        "post_scalar": pd.DataFrame({"lower": [lo_post], "upper": [hi_post]}),
+                        "__meta__": {
+                            "origin": "jackknife",
+                            "mode": mode,
+                            "kind": "jackknife",
+                            "level": int(100 * (1.0 - alpha_level)),
+                            "B": n_jack,
+                            "estimator": "sdid",
+                        },
+                    }
+                else:
+                    post_att_se = np.nan
+                boot_info["B"] = n_jack
+                boot_info["post_ATT_draws"] = att_jack
+                boot_info["ATT_tau_draws"] = np.full((tau_grid.size, n_jack), np.nan)
+                boot_info["method"] = "jackknife"
+                boot_info["post_ATT_se"] = float(post_att_se) if np.isfinite(post_att_se) else np.nan
+            else:
+                # ----- Bootstrap variance estimation -----
+                att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
+                att_b = np.full(B, np.nan, dtype=float)
+                filled = 0
+                attempts = 0
+                max_attempts = max(10_000, 10 * B)
 
-            control_unit_mask = W.sum(axis=1) == 0
-            control_units = np.flatnonzero(control_unit_mask)
-            n_control = control_units.size
+                if mode == "ife_wild":
+                    tau_it = np.zeros_like(Y, dtype=float)
+                    for g, meta in results_g.items():
+                        delta_gt = np.asarray(meta["delta_t"], dtype=float)
+                        idx_tr = cohorts[g]
+                        for i in np.where(idx_tr)[0]:
+                            tau_it[i, :] = delta_gt
+                    control_mask = W.sum(axis=1) == 0
+                    dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask)
+                    Y0_hat = dgp["Y0_hat"]
+                    resid = dgp["resid"]
 
-            while filled < B and attempts < max_attempts:
-                attempts += 1
-                try:
-                    if mode == "unit":
-                        df_b = bt.resample_units_block(df, self.id_name, rng)
-                        Y_b, W_b, units_b, times_b = self._panel_matrices(df_b)
-                    elif mode == "placebo":
-                        if n_control < n_treated_total:
-                            raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
-                        placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)
-                        W_b = W.copy()
-                        for i, pu in enumerate(placebo_units):
-                            treated_pattern = W[np.flatnonzero(~control_unit_mask)[i % n_treated_total], :]
-                            W_b[pu, :] = treated_pattern
-                        Y_b = Y.copy()
-                        units_b, times_b = _units, times
-                    else:
-                        v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
-                        Y_b = Y0_hat + tau_it * W + (v[:, None] * resid)
-                        W_b = W
-                        units_b, times_b = _units, times
+                control_unit_mask = W.sum(axis=1) == 0
+                control_units = np.flatnonzero(control_unit_mask)
+                n_control = control_units.size
 
-                    att_post_b, att_tau_b = self._att_path_from_w(
-                        Y_b, W_b, times_b,
-                        zeta_omega=None, zeta_lambda=None,
-                        omega_intercept=self.omega_intercept,
-                        lambda_intercept=self.lambda_intercept,
-                        max_iter=self.fw_max_iter,
-                        tol=self.fw_tol,
-                    )
+                while filled < B and attempts < max_attempts:
+                    attempts += 1
+                    try:
+                        if mode == "unit":
+                            df_b = bt.resample_units_block(df, self.id_name, rng)
+                            Y_b, W_b, units_b, times_b = self._panel_matrices(df_b)
+                        elif mode == "placebo":
+                            if n_control < n_treated_total:
+                                raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
+                            placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)
+                            W_b = W.copy()
+                            for i, pu in enumerate(placebo_units):
+                                treated_pattern = W[np.flatnonzero(~control_unit_mask)[i % n_treated_total], :]
+                                W_b[pu, :] = treated_pattern
+                            Y_b = Y.copy()
+                            units_b, times_b = _units, times
+                        else:
+                            v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
+                            Y_b = Y0_hat + tau_it * W + (v[:, None] * resid)
+                            W_b = W
+                            units_b, times_b = _units, times
 
-                    vec_b = np.full(tau_grid.size, np.nan, dtype=float)
-                    for j, tau in enumerate(tau_grid):
-                        if int(tau) in att_tau_b:
-                            vec_b[j] = att_tau_b[int(tau)]
+                        att_post_b, att_tau_b = self._att_path_from_w(
+                            Y_b, W_b, times_b,
+                            zeta_omega=None, zeta_lambda=None,
+                            omega_intercept=self.omega_intercept,
+                            lambda_intercept=self.lambda_intercept,
+                            max_iter=self.fw_max_iter,
+                            tol=self.fw_tol,
+                        )
 
-                    mask_post_b = tau_grid >= 0
-                    if np.any(~np.isfinite(vec_b[mask_post_b])):
+                        vec_b = np.full(tau_grid.size, np.nan, dtype=float)
+                        for j, tau in enumerate(tau_grid):
+                            if int(tau) in att_tau_b:
+                                vec_b[j] = att_tau_b[int(tau)]
+
+                        mask_post_b = tau_grid >= 0
+                        if np.any(~np.isfinite(vec_b[mask_post_b])):
+                            continue
+
+                        att_tau_star[:, filled] = vec_b
+                        att_b[filled] = float(att_post_b)
+                        filled += 1
+                    except Exception:
                         continue
 
-                    att_tau_star[:, filled] = vec_b
-                    att_b[filled] = float(att_post_b)
-                    filled += 1
-                except Exception:
-                    continue
+                if filled < B:
+                    import warnings as _w
+                    _w.warn(f"SDID bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
+                    att_tau_star = att_tau_star[:, :filled]
+                    att_b = att_b[:filled]
 
-            if filled < B:
-                import warnings as _w
-                _w.warn(f"SDID bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
-                att_tau_star = att_tau_star[:, :filled]
-                att_b = att_b[:filled]
+                boot_info["B"] = filled
+                boot_info["post_ATT_draws"] = att_b
+                boot_info["ATT_tau_draws"] = att_tau_star
 
-            boot_info["B"] = filled
-            boot_info["post_ATT_draws"] = att_b
-            boot_info["ATT_tau_draws"] = att_tau_star
-
-            if filled > 1:
+            if mode != "jackknife" and filled > 1:
                 se_vals = bt.bootstrap_se(att_tau_star)
                 se_series_tau = pd.Series(se_vals, index=tau_grid)
                 if base_tau in se_series_tau.index:
@@ -442,6 +500,10 @@ class SDID:
             post_att_draws = boot_info.get("post_ATT_draws", [])
             if len(post_att_draws) > 1:
                 info["PostATT_se"] = float(np.std(post_att_draws, ddof=1))
+        elif boot_info.get("method") == "jackknife":
+            jack_se = boot_info.get("post_ATT_se")
+            if jack_se is not None and np.isfinite(jack_se):
+                info["PostATT_se"] = float(jack_se)
 
         return EstimationResult(
             params=params,

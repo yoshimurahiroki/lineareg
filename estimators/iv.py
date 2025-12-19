@@ -1002,8 +1002,12 @@ class IV2SLS(BaseEstimator):
         self._hac_lags = None if hac_lags is None else int(hac_lags)
 
         # Remove zero-variance columns using a scale-aware tolerance from core.linalg
-        # IMPORTANT: Protect the constant column from removal (it has zero variance by design)
-        # Compute column variances via cross-products to avoid direct numpy.var calls.
+        # IMPORTANT: Protect constant columns from removal (they have zero variance by design)
+        # Detect constant columns directly: max(col) - min(col) < tol
+        def _is_constant_col(col: np.ndarray, tol: float = 1e-10) -> bool:
+            col_arr = np.asarray(col).ravel()
+            return float(np.max(col_arr) - np.min(col_arr)) < tol
+
         const_col_X = None
         if self._const_name is not None and self._const_name in self._var_names:
             const_col_X = self._var_names.index(self._const_name)
@@ -1028,17 +1032,19 @@ class IV2SLS(BaseEstimator):
         tolX = la.eig_tol(np.diag(varX)) if varX.size else np.finfo(float).eps
         tolZ = la.eig_tol(np.diag(varZ)) if varZ.size else np.finfo(float).eps
 
-        # Remove zero-variance columns, but KEEP the constant column
-        # Create keep masks that protect the constant column
+        # Remove zero-variance columns, but KEEP any constant column (user-supplied or added)
+        # Create keep masks that protect constant columns
         keepX = np.array([True] * Xw.shape[1])
         for i in range(Xw.shape[1]):
-            if i != const_col_X and varX[i] < tolX:
+            is_const = (i == const_col_X) or _is_constant_col(Xw[:, i])
+            if not is_const and varX[i] < tolX:
                 keepX[i] = False
         Xw = Xw[:, keepX] if not np.all(keepX) else Xw
 
         keepZ = np.array([True] * Zw.shape[1])
         for i in range(Zw.shape[1]):
-            if i != const_col_Z and varZ[i] < tolZ:
+            is_const_z = (i == const_col_Z) or _is_constant_col(Zw[:, i])
+            if not is_const_z and varZ[i] < tolZ:
                 keepZ[i] = False
         Zw = Zw[:, keepZ] if not np.all(keepZ) else Zw
         var_names_work = [name for name, keep in zip(self._var_names, keepX) if keep]

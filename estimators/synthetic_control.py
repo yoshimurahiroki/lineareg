@@ -383,175 +383,245 @@ class SyntheticControl:
             mode = (getattr(boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "ife_wild"
-            if mode not in {"unit", "ife_wild", "placebo"}:
-                raise ValueError("SC boot mode must be one of {'unit', 'ife_wild', 'placebo'}.")
+            if mode not in {"unit", "ife_wild", "placebo", "jackknife"}:
+                raise ValueError("SC boot mode must be one of {'unit', 'ife_wild', 'placebo', 'jackknife'}.")
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='ife_wild' or mode='placebo'.")
 
             theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
-            att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
-            filled = 0
-            attempts = 0
-            max_attempts = max(10_000, 10 * B)
 
-            W = np.zeros((len(ids), len(times)), dtype=int)
-            for g, meta in results_g.items():
-                t0_col = t_to_col[g]
-                for tid in meta["treated_ids"]:
-                    i_tr = id_to_row[tid]
-                    W[i_tr, t0_col:] = 1
-            control_mask_boot = np.all(W == 0, axis=1)
-
-            if mode == "ife_wild":
-                tau_it = np.zeros_like(Y, dtype=float)
-                for g, meta in results_g.items():
-                    att_path = np.asarray(meta["att_path"], dtype=float)
-                    for tid in meta["treated_ids"]:
-                        tau_it[id_to_row[tid], :] = att_path
-                dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask_boot)
-                Y0_hat = dgp["Y0_hat"]
-                resid = dgp["resid"]
-
-            while filled < B and attempts < max_attempts:
-                attempts += 1
-                try:
-                    if mode == "unit":
-                        df_b = bt.resample_units_block(df, self.spec.id_name, rng)
-                        Y_b, ids_b, times_b = self._wide_from_long(df_b)
-                        cohorts_b, donors_b = self._treated_info(df_b)
-                    elif mode == "placebo":
-                        control_units = np.flatnonzero(control_mask_boot)
-                        n_control = control_units.size
-                        if n_control < n_treated_total:
-                            raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
-                        placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)
-                        cohorts_b = {list(results_g.keys())[i % len(results_g)]: [ids[pu]] for i, pu in enumerate(placebo_units)}
-                        donors_b = [ids[i] for i in control_units if i not in placebo_units]
-                        if len(donors_b) == 0:
-                            continue
-                        Y_b = Y.copy()
-                        ids_b, times_b = ids, times
-                    else:
-                        v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
-                        Y_star = Y0_hat + tau_it * W + (v[:, None] * resid)
-                        Y_b = Y_star
-                        ids_b, times_b = ids, times
-                        cohorts_b, donors_b = cohorts, donors
-
-                    id_to_row_b = {i: k for k, i in enumerate(ids_b)}
-                    t_to_col_b = {t: k for k, t in enumerate(times_b)}
-                    j_donors_b = np.array([id_to_row_b[j] for j in donors_b], dtype=int)
-
-                    results_g_b = {}
-                    tau_union_b = set()
-                    for g, treated_units in cohorts_b.items():
-                        t0_col_b = t_to_col_b.get(g)
-                        if t0_col_b is None:
-                            continue
-                        pre_b = np.arange(0, t0_col_b)
-                        if pre_b.size == 0:
-                            continue
-                        att_paths_g_b = []
-                        for tid in treated_units:
-                            i_tr_b = id_to_row_b[tid]
-                            y_pre_b = Y_b[i_tr_b, pre_b].astype(np.float64)
-                            X_pre_b = Y_b[j_donors_b][:, pre_b].T.astype(np.float64)
-                            w_b = _frank_wolfe_simplex(X_pre_b, y_pre_b, max_iter=self.max_iter, tol=self.tol)
-                            y_treated_b = Y_b[i_tr_b, :].astype(np.float64)
-                            X_all_b = Y_b[j_donors_b, :].T.astype(np.float64)
-                            y_synth_b = la.dot(X_all_b, w_b)
-                            att_paths_g_b.append(y_treated_b - y_synth_b)
-                        att_path_g_b = np.mean(att_paths_g_b, axis=0)
-                        results_g_b[g] = {"att_path": att_path_g_b, "n_treated": len(treated_units)}
-                        for t_val in times_b:
-                            tau_union_b.add(int(t_val) - int(g))
-
-                    tau_union_sorted_b = sorted(tau_union_b)
-                    att_tau_num_b = {int(tau): 0.0 for tau in tau_union_sorted_b}
-                    att_tau_den_b = {int(tau): 0.0 for tau in tau_union_sorted_b}
-                    for g, meta_b in results_g_b.items():
-                        att_path_b = meta_b["att_path"]
-                        n_tr_b = meta_b["n_treated"]
-                        for t_idx, t_val in enumerate(times_b):
-                            tau_val = int(t_val) - int(g)
-                            att_tau_num_b[tau_val] += n_tr_b * float(att_path_b[t_idx])
-                            att_tau_den_b[tau_val] += n_tr_b
-
-                    vec_b = np.full(tau_grid.size, np.nan, dtype=float)
-                    for j, tau in enumerate(tau_grid):
-                        if att_tau_den_b.get(int(tau), 0) > 0:
-                            vec_b[j] = att_tau_num_b[int(tau)] / att_tau_den_b[int(tau)]
-
-                    if np.any(~np.isfinite(vec_b[mask_post])):
+            # ----- Jackknife variance estimation (synthdid-style) -----
+            if mode == "jackknife":
+                N = Y.shape[0]
+                j_donors = np.array([id_to_row[j] for j in donors], dtype=int)
+                att_jack = []
+                for drop_i in range(N):
+                    keep_mask = np.arange(N) != drop_i
+                    Y_i = Y[keep_mask, :]
+                    j_donors_i = j_donors[j_donors != drop_i]
+                    if drop_i < j_donors.shape[0]:
+                        j_donors_i = np.where(j_donors_i > drop_i, j_donors_i - 1, j_donors_i)
+                    if j_donors_i.size == 0:
                         continue
-                    att_tau_star[:, filled] = vec_b
-                    filled += 1
-                except Exception:
-                    continue
+                    try:
+                        att_paths = []
+                        for g, meta in results_g.items():
+                            t0_col = t_to_col[g]
+                            pre = np.arange(0, t0_col)
+                            if pre.size == 0:
+                                continue
+                            for tid in meta["treated_ids"]:
+                                orig_row = id_to_row[tid]
+                                if orig_row == drop_i:
+                                    continue
+                                new_row = orig_row - 1 if orig_row > drop_i else orig_row
+                                y_pre = Y_i[new_row, pre].astype(np.float64)
+                                X_pre = Y_i[j_donors_i][:, pre].T.astype(np.float64)
+                                w = _frank_wolfe_simplex(X_pre, y_pre, max_iter=self.max_iter, tol=self.tol)
+                                y_treated = Y_i[new_row, :].astype(np.float64)
+                                X_all = Y_i[j_donors_i, :].T.astype(np.float64)
+                                y_synth = la.dot(X_all, w)
+                                att_paths.append(y_treated - y_synth)
+                        if att_paths:
+                            att_path_mean = np.mean(att_paths, axis=0)
+                            post_vals = att_path_mean[mask_post]
+                            att_jack.append(float(np.mean(post_vals)))
+                    except Exception:
+                        continue
+                att_jack = np.array(att_jack, dtype=float)
+                n_jack = len(att_jack)
+                if n_jack > 1:
+                    jack_mean = float(np.mean(att_jack))
+                    post_att_se = float(np.sqrt((n_jack - 1) / n_jack * np.sum((att_jack - jack_mean) ** 2)))
+                    # Jackknife only computes SE for aggregate post_ATT, not per-tau.
+                    # Leave se_series = None (initialized at start of bootstrap block).
+                    z = 1.96 if alpha_level == 0.05 else bt.finite_sample_quantile(np.abs(np.random.randn(10000)), 1.0 - alpha_level)
+                    lo_post = float(post_agg) - z * post_att_se
+                    hi_post = float(post_agg) + z * post_att_se
+                    post_ci_df = pd.DataFrame({"lower": [lo_post], "upper": [hi_post]})
+                    bands = {
+                        "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                        "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                        "full": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                        "post_ATT": post_ci_df,
+                        "__meta__": {
+                            "origin": "jackknife",
+                            "mode": mode,
+                            "kind": "jackknife",
+                            "level": int(100 * (1.0 - alpha_level)),
+                            "B": n_jack,
+                            "estimator": "sc",
+                        },
+                    }
+                else:
+                    post_att_se = np.nan
+                boot_info = {"B": n_jack, "post_ATT_draws": att_jack, "ATT_tau_draws": np.full((tau_grid.size, n_jack), np.nan), "method": "jackknife", "post_ATT_se": float(post_att_se) if np.isfinite(post_att_se) else np.nan}
+            else:
+                # ----- Bootstrap variance estimation -----
+                att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
+                filled = 0
+                attempts = 0
+                max_attempts = max(10_000, 10 * B)
 
-            if filled < B:
-                import warnings as _w
-                _w.warn(f"SC bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
-                att_tau_star = att_tau_star[:, :filled]
+                W = np.zeros((len(ids), len(times)), dtype=int)
+                for g, meta in results_g.items():
+                    t0_col = t_to_col[g]
+                    for tid in meta["treated_ids"]:
+                        i_tr = id_to_row[tid]
+                        W[i_tr, t0_col:] = 1
+                control_mask_boot = np.all(W == 0, axis=1)
 
-            if filled > 1:
-                se_vals = bt.bootstrap_se(att_tau_star)
-                se_series = pd.Series(se_vals, index=tau_grid)
-                if center_at in se_series.index:
-                    se_series.loc[center_at] = 0.0
+                if mode == "ife_wild":
+                    tau_it = np.zeros_like(Y, dtype=float)
+                    for g, meta in results_g.items():
+                        att_path = np.asarray(meta["att_path"], dtype=float)
+                        for tid in meta["treated_ids"]:
+                            tau_it[id_to_row[tid], :] = att_path
+                    dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask_boot)
+                    Y0_hat = dgp["Y0_hat"]
+                    resid = dgp["resid"]
 
-                def _sup_t_band(mask):
-                    idx = np.flatnonzero(mask)
-                    if idx.size == 0 or filled < 2:
-                        return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-                    th = theta_hat[idx]
-                    thb = att_tau_star[idx, :]
-                    diffs = thb - th[:, None]
-                    se = np.nanstd(diffs, axis=1, ddof=1)
-                    ok = np.isfinite(se) & (se > 0)
-                    if not np.any(ok):
-                        return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-                    tdraw = diffs[ok, :] / se[ok, None]
-                    sup_abs = np.nanmax(np.abs(tdraw), axis=0)
-                    sup_abs_valid = sup_abs[np.isfinite(sup_abs)]
-                    if sup_abs_valid.size == 0:
-                        return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-                    c = float(bt.finite_sample_quantile(sup_abs_valid, 1.0 - alpha_level))
-                    lo = th.copy(); hi = th.copy()
-                    lo[ok] = th[ok] - c * se[ok]
-                    hi[ok] = th[ok] + c * se[ok]
-                    return pd.DataFrame({"lower": pd.Series(lo, index=tau_grid[idx]), "upper": pd.Series(hi, index=tau_grid[idx])}).sort_index()
+                while filled < B and attempts < max_attempts:
+                    attempts += 1
+                    try:
+                        if mode == "unit":
+                            df_b = bt.resample_units_block(df, self.spec.id_name, rng)
+                            Y_b, ids_b, times_b = self._wide_from_long(df_b)
+                            cohorts_b, donors_b = self._treated_info(df_b)
+                        elif mode == "placebo":
+                            control_units = np.flatnonzero(control_mask_boot)
+                            n_control = control_units.size
+                            if n_control < n_treated_total:
+                                raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
+                            placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)
+                            cohorts_b = {list(results_g.keys())[i % len(results_g)]: [ids[pu]] for i, pu in enumerate(placebo_units)}
+                            donors_b = [ids[i] for i in control_units if i not in placebo_units]
+                            if len(donors_b) == 0:
+                                continue
+                            Y_b = Y.copy()
+                            ids_b, times_b = ids, times
+                        else:
+                            v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
+                            Y_star = Y0_hat + tau_it * W + (v[:, None] * resid)
+                            Y_b = Y_star
+                            ids_b, times_b = ids, times
+                            cohorts_b, donors_b = cohorts, donors
 
-                pre_mask = tau_array < center_at
-                band_pre = _sup_t_band(pre_mask)
-                band_post = _sup_t_band(mask_post)
-                band_full = _sup_t_band(tau_array != center_at)
+                        id_to_row_b = {i: k for k, i in enumerate(ids_b)}
+                        t_to_col_b = {t: k for k, t in enumerate(times_b)}
+                        j_donors_b = np.array([id_to_row_b[j] for j in donors_b], dtype=int)
 
-                if np.any(mask_post):
-                    post_star = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
-                    post_star_valid = post_star[np.isfinite(post_star)]
-                    se_hat = float(np.nanstd(post_star_valid, ddof=1)) if post_star_valid.size > 1 else 0.0
-                    if np.isfinite(se_hat) and se_hat > 0 and post_star_valid.size > 1:
-                        tdraw_post = (post_star_valid - post_agg) / se_hat
-                        c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
-                        post_ci_df = pd.DataFrame({"lower": [post_agg - c_post * se_hat], "upper": [post_agg + c_post * se_hat]})
+                        results_g_b = {}
+                        tau_union_b = set()
+                        for g, treated_units in cohorts_b.items():
+                            t0_col_b = t_to_col_b.get(g)
+                            if t0_col_b is None:
+                                continue
+                            pre_b = np.arange(0, t0_col_b)
+                            if pre_b.size == 0:
+                                continue
+                            att_paths_g_b = []
+                            for tid in treated_units:
+                                i_tr_b = id_to_row_b[tid]
+                                y_pre_b = Y_b[i_tr_b, pre_b].astype(np.float64)
+                                X_pre_b = Y_b[j_donors_b][:, pre_b].T.astype(np.float64)
+                                w_b = _frank_wolfe_simplex(X_pre_b, y_pre_b, max_iter=self.max_iter, tol=self.tol)
+                                y_treated_b = Y_b[i_tr_b, :].astype(np.float64)
+                                X_all_b = Y_b[j_donors_b, :].T.astype(np.float64)
+                                y_synth_b = la.dot(X_all_b, w_b)
+                                att_paths_g_b.append(y_treated_b - y_synth_b)
+                            att_path_g_b = np.mean(att_paths_g_b, axis=0)
+                            results_g_b[g] = {"att_path": att_path_g_b, "n_treated": len(treated_units)}
+                            for t_val in times_b:
+                                tau_union_b.add(int(t_val) - int(g))
 
-                bands = {
-                    "pre": band_pre,
-                    "post": band_post,
-                    "full": band_full,
-                    "post_scalar": post_ci_df,
-                    "__meta__": {
-                        "origin": "bootstrap",
-                        "mode": mode,
-                        "kind": "uniform",
-                        "estimator": "synthetic",
-                        "level": band_level,
-                        "B": int(filled),
-                        "donors": list(donors),
-                        "cohorts": sorted(list(cohorts.keys())),
-                    },
-                }
+                        tau_union_sorted_b = sorted(tau_union_b)
+                        att_tau_num_b = {int(tau): 0.0 for tau in tau_union_sorted_b}
+                        att_tau_den_b = {int(tau): 0.0 for tau in tau_union_sorted_b}
+                        for g, meta_b in results_g_b.items():
+                            att_path_b = meta_b["att_path"]
+                            n_tr_b = meta_b["n_treated"]
+                            for t_idx, t_val in enumerate(times_b):
+                                tau_val = int(t_val) - int(g)
+                                att_tau_num_b[tau_val] += n_tr_b * float(att_path_b[t_idx])
+                                att_tau_den_b[tau_val] += n_tr_b
+
+                        vec_b = np.full(tau_grid.size, np.nan, dtype=float)
+                        for j, tau in enumerate(tau_grid):
+                            if att_tau_den_b.get(int(tau), 0) > 0:
+                                vec_b[j] = att_tau_num_b[int(tau)] / att_tau_den_b[int(tau)]
+
+                        if np.any(~np.isfinite(vec_b[mask_post])):
+                            continue
+                        att_tau_star[:, filled] = vec_b
+                        filled += 1
+                    except Exception:
+                        continue
+
+                if filled < B:
+                    import warnings as _w
+                    _w.warn(f"SC bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
+                    att_tau_star = att_tau_star[:, :filled]
+
+                if filled > 1:
+                    se_vals = bt.bootstrap_se(att_tau_star)
+                    se_series = pd.Series(se_vals, index=tau_grid)
+                    if center_at in se_series.index:
+                        se_series.loc[center_at] = 0.0
+
+                    def _sup_t_band(mask):
+                        idx = np.flatnonzero(mask)
+                        if idx.size == 0 or filled < 2:
+                            return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                        th = theta_hat[idx]
+                        thb = att_tau_star[idx, :]
+                        diffs = thb - th[:, None]
+                        se = np.nanstd(diffs, axis=1, ddof=1)
+                        ok = np.isfinite(se) & (se > 0)
+                        if not np.any(ok):
+                            return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                        tdraw = diffs[ok, :] / se[ok, None]
+                        sup_abs = np.nanmax(np.abs(tdraw), axis=0)
+                        sup_abs_valid = sup_abs[np.isfinite(sup_abs)]
+                        if sup_abs_valid.size == 0:
+                            return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                        c = float(bt.finite_sample_quantile(sup_abs_valid, 1.0 - alpha_level))
+                        lo = th.copy(); hi = th.copy()
+                        lo[ok] = th[ok] - c * se[ok]
+                        hi[ok] = th[ok] + c * se[ok]
+                        return pd.DataFrame({"lower": pd.Series(lo, index=tau_grid[idx]), "upper": pd.Series(hi, index=tau_grid[idx])}).sort_index()
+
+                    pre_mask = tau_array < center_at
+                    band_pre = _sup_t_band(pre_mask)
+                    band_post = _sup_t_band(mask_post)
+                    band_full = _sup_t_band(tau_array != center_at)
+
+                    if np.any(mask_post):
+                        post_star = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
+                        post_star_valid = post_star[np.isfinite(post_star)]
+                        se_hat = float(np.nanstd(post_star_valid, ddof=1)) if post_star_valid.size > 1 else 0.0
+                        if np.isfinite(se_hat) and se_hat > 0 and post_star_valid.size > 1:
+                            tdraw_post = (post_star_valid - post_agg) / se_hat
+                            c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
+                            post_ci_df = pd.DataFrame({"lower": [post_agg - c_post * se_hat], "upper": [post_agg + c_post * se_hat]})
+
+                    bands = {
+                        "pre": band_pre,
+                        "post": band_post,
+                        "full": band_full,
+                        "post_scalar": post_ci_df,
+                        "__meta__": {
+                            "origin": "bootstrap",
+                            "mode": mode,
+                            "kind": "uniform",
+                            "estimator": "synthetic",
+                            "level": band_level,
+                            "B": int(filled),
+                            "donors": list(donors),
+                            "cohorts": sorted(list(cohorts.keys())),
+                        },
+                    }
+                boot_info = {"B": filled, "post_ATT_draws": np.full(filled, np.nan), "ATT_tau_draws": att_tau_star}
 
         att_df = pd.DataFrame({"tau": att_series.index, "att": att_series.to_numpy()}).set_index("tau")
 
@@ -594,6 +664,10 @@ class SyntheticControl:
         if se_series is not None and np.any(mask_post):
             post_star_draws = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
             model_info["PostATT_se"] = float(np.std(post_star_draws, ddof=1))
+        elif boot_info.get("method") == "jackknife":
+            jack_se = boot_info.get("post_ATT_se")
+            if jack_se is not None and np.isfinite(jack_se):
+                model_info["PostATT_se"] = float(jack_se)
         extra = {
             "cohorts": cohorts,
             "results_by_cohort": results_g,
@@ -603,12 +677,9 @@ class SyntheticControl:
             "post_scalar": post_ci_df,
             "donors": donors,
             "boot_meta": bands.get("__meta__") if bands else None,
-            "se_source": "bootstrap" if se_series is not None else None,
+            "boot": boot_info,
+            "se_source": "bootstrap" if se_series is not None else ("jackknife" if boot_info.get("method") == "jackknife" else None),
         }
-
-        if se_series is not None and np.any(mask_post):
-            post_star_draws = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
-            model_info["PostATT_se"] = float(np.std(post_star_draws, ddof=1))
 
         res = EstimationResult(
             params=att_series,

@@ -243,11 +243,11 @@ class SDID:
 
             mode = (getattr(self.boot, "mode", None) or "auto").lower()
             if mode == "auto":
-                mode = "unit" if n_treated_total >= 2 else "ife_wild"
-            if mode not in {"unit", "ife_wild", "placebo", "jackknife"}:
-                raise ValueError("SDID boot mode must be one of {'unit', 'ife_wild', 'placebo', 'jackknife'}.")
+                mode = "unit" if n_treated_total >= 2 else "placebo"
+            if mode not in {"unit", "placebo", "jackknife"}:
+                raise ValueError("SDID boot mode must be one of {'unit', 'placebo', 'jackknife'}.")
             if mode == "unit" and n_treated_total < 2:
-                raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='ife_wild' or mode='placebo'.")
+                raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='jackknife'.")
 
             theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
 
@@ -314,18 +314,6 @@ class SDID:
                 attempts = 0
                 max_attempts = max(10_000, 10 * B)
 
-                if mode == "ife_wild":
-                    tau_it = np.zeros_like(Y, dtype=float)
-                    for g, meta in results_g.items():
-                        delta_gt = np.asarray(meta["delta_t"], dtype=float)
-                        idx_tr = cohorts[g]
-                        for i in np.where(idx_tr)[0]:
-                            tau_it[i, :] = delta_gt
-                    control_mask = W.sum(axis=1) == 0
-                    dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask)
-                    Y0_hat = dgp["Y0_hat"]
-                    resid = dgp["resid"]
-
                 control_unit_mask = W.sum(axis=1) == 0
                 control_units = np.flatnonzero(control_unit_mask)
                 n_control = control_units.size
@@ -336,20 +324,19 @@ class SDID:
                         if mode == "unit":
                             df_b = bt.resample_units_block(df, self.id_name, rng)
                             Y_b, W_b, units_b, times_b = self._panel_matrices(df_b)
-                        elif mode == "placebo":
+                        else:  # mode == "placebo"
                             if n_control < n_treated_total:
                                 raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
                             placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)
-                            W_b = W.copy()
+                            # CRITICAL: Zero out treatment matrix first, then assign treatment
+                            # to placebo units only. This is a proper permutation-style placebo
+                            # where treated units are REPLACED, not ADDED.
+                            W_b = np.zeros_like(W)
+                            treated_unit_indices = np.flatnonzero(~control_unit_mask)
                             for i, pu in enumerate(placebo_units):
-                                treated_pattern = W[np.flatnonzero(~control_unit_mask)[i % n_treated_total], :]
+                                treated_pattern = W[treated_unit_indices[i % n_treated_total], :]
                                 W_b[pu, :] = treated_pattern
                             Y_b = Y.copy()
-                            units_b, times_b = _units, times
-                        else:
-                            v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
-                            Y_b = Y0_hat + tau_it * W + (v[:, None] * resid)
-                            W_b = W
                             units_b, times_b = _units, times
 
                         att_post_b, att_tau_b = self._att_path_from_w(

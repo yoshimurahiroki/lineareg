@@ -693,26 +693,10 @@ def solve_constrained(  # noqa: PLR0911, PLR0913
             try:
                 beta = la.solve(XtWX_sym, Xty, sym_pos=True)
             except (np.linalg.LinAlgError, RuntimeError, ValueError, TypeError):
-                # attempt PSD stabilization using project-wide tol
-                # XtWX_sym already computed above
-                try:
-                    eigs = la.eigvalsh(XtWX_sym)
-                    lam_min = float(np.min(eigs)) if eigs.size else 0.0
-                except (np.linalg.LinAlgError, RuntimeError, ValueError, TypeError):
-                    lam_min = float("nan")
-                # Only apply explicit ridge when user requested ridge>0.0.
-                if ridge > 0.0:
-                    warnings.warn(
-                        f"XtWX not SPD (min eigenvalue={lam_min:.3e}); applying ridge {ridge:.1e}.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    XtWX = XtWX + ridge * la.eye(XtWX.shape[0])
-                    spd_added_ridge = True
-                    XtWX_sym = 0.5 * (XtWX + XtWX.T)
-                    beta = la.solve(XtWX_sym, Xty, sym_pos=True)
-                # Prefer QR with Stata rank-policy for W=None or vector W; else force KKT fallback
-                elif (W_eff is None) or (hasattr(W_eff, "ndim") and W_eff.ndim == 1):
+                # XtWX not SPD: prefer QR with Stata rank-policy for W=None or
+                # vector W; force KKT fallback for full matrix W. Never apply
+                # ridge regularization as that would change the estimator.
+                if (W_eff is None) or (hasattr(W_eff, "ndim") and W_eff.ndim == 1):
                     if W_eff is None:
                         Xw = X
                         yw = y
@@ -750,24 +734,11 @@ def solve_constrained(  # noqa: PLR0911, PLR0913
                 la.solve(XtWX_sym, la.eye(XtWX_sym.shape[0]), sym_pos=True)
                 S = la.solve(XtWX_sym, RHS, sym_pos=True)
             except (np.linalg.LinAlgError, RuntimeError, ValueError, TypeError):
-                try:
-                    eigs = la.eigvalsh(XtWX_sym)
-                    lam_min = float(np.min(eigs)) if eigs.size else 0.0
-                except (np.linalg.LinAlgError, RuntimeError, ValueError, TypeError):
-                    lam_min = float("nan")
-                if ridge > 0.0:
-                    warnings.warn(
-                        f"XtWX not SPD (min eigenvalue={lam_min:.3e}); applying ridge {ridge:.1e}.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    XtWX = XtWX + ridge * la.eye(XtWX.shape[0])
-                    spd_added_ridge = True
-                    XtWX_sym = 0.5 * (XtWX + XtWX.T)
-                    S = la.solve(XtWX_sym, RHS, sym_pos=True)
-                else:
-                    msg = "KKT_fallback_enforced"
-                    raise RuntimeError(msg) from None
+                # XtWX not SPD in constrained case: force KKT fallback.
+                # Never apply ridge regularization as that would change
+                # the estimator from constrained OLS/GLS to ridge.
+                msg = "KKT_fallback_enforced"
+                raise RuntimeError(msg) from None
 
         V = S[:, :m]
         Y = S[:, m:]

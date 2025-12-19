@@ -382,11 +382,11 @@ class SyntheticControl:
 
             mode = (getattr(boot, "mode", None) or "auto").lower()
             if mode == "auto":
-                mode = "unit" if n_treated_total >= 2 else "ife_wild"
-            if mode not in {"unit", "ife_wild", "placebo", "jackknife"}:
-                raise ValueError("SC boot mode must be one of {'unit', 'ife_wild', 'placebo', 'jackknife'}.")
+                mode = "unit" if n_treated_total >= 2 else "placebo"
+            if mode not in {"unit", "placebo", "jackknife"}:
+                raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'jackknife'}.")
             if mode == "unit" and n_treated_total < 2:
-                raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='ife_wild' or mode='placebo'.")
+                raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='jackknife'.")
 
             theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
 
@@ -471,16 +471,6 @@ class SyntheticControl:
                         W[i_tr, t0_col:] = 1
                 control_mask_boot = np.all(W == 0, axis=1)
 
-                if mode == "ife_wild":
-                    tau_it = np.zeros_like(Y, dtype=float)
-                    for g, meta in results_g.items():
-                        att_path = np.asarray(meta["att_path"], dtype=float)
-                        for tid in meta["treated_ids"]:
-                            tau_it[id_to_row[tid], :] = att_path
-                    dgp = bt.fit_ife_dgp(Y, W, tau_it, control_mask=control_mask_boot)
-                    Y0_hat = dgp["Y0_hat"]
-                    resid = dgp["resid"]
-
                 while filled < B and attempts < max_attempts:
                     attempts += 1
                     try:
@@ -488,7 +478,7 @@ class SyntheticControl:
                             df_b = bt.resample_units_block(df, self.spec.id_name, rng)
                             Y_b, ids_b, times_b = self._wide_from_long(df_b)
                             cohorts_b, donors_b = self._treated_info(df_b)
-                        elif mode == "placebo":
+                        else:  # mode == "placebo"
                             control_units = np.flatnonzero(control_mask_boot)
                             n_control = control_units.size
                             if n_control < n_treated_total:
@@ -500,12 +490,6 @@ class SyntheticControl:
                                 continue
                             Y_b = Y.copy()
                             ids_b, times_b = ids, times
-                        else:
-                            v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
-                            Y_star = Y0_hat + tau_it * W + (v[:, None] * resid)
-                            Y_b = Y_star
-                            ids_b, times_b = ids, times
-                            cohorts_b, donors_b = cohorts, donors
 
                         id_to_row_b = {i: k for k, i in enumerate(ids_b)}
                         t_to_col_b = {t: k for k, t in enumerate(times_b)}

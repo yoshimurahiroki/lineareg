@@ -112,6 +112,8 @@ class SpatialDID:
         cluster_ids: Sequence | None = None,
         space_ids: Sequence | None = None,
         time_ids: Sequence | None = None,
+        spatial_coords: np.ndarray | None = None,
+        spatial_radius: float | None = None,
         residual_type: str = "restricted",
         # ---- NEW: tau aggregation weight (R/Stata did/csdid convention: default 'group') ----
         tau_weight: str = "group",
@@ -134,6 +136,8 @@ class SpatialDID:
         self.cluster_ids = cluster_ids
         self.space_ids = space_ids
         self.time_ids = time_ids
+        self.spatial_coords = spatial_coords
+        self.spatial_radius = spatial_radius
         if residual_type not in {"restricted", "unrestricted"}:
             msg = 'residual_type must be "restricted" or "unrestricted".'
             raise ValueError(msg)
@@ -275,8 +279,32 @@ class SpatialDID:
         df["_i"] = df[self.id_name].map(id_map).astype(int)
         df["_tt"] = df[self.t_name].map(t_map).astype(int)
 
-        # Prepare bootstrap multipliers (observation-level by default). Build BootConfig if not supplied.
-        if self.boot is None:
+        # Prepare bootstrap multipliers with spatial block bootstrap if spatial_coords provided.
+        # For spatial DID, proper spatial inference requires spatial block bootstrap.
+        if self.spatial_coords is not None:
+            spatial_coords_arr = np.asarray(self.spatial_coords, dtype=np.float64)
+            if spatial_coords_arr.ndim != 2 or spatial_coords_arr.shape[0] != len(df):
+                raise ValueError(
+                    f"spatial_coords must be (n x 2) array; got shape {spatial_coords_arr.shape}, expected ({len(df)}, 2)."
+                )
+            if self.spatial_radius is None:
+                raise ValueError(
+                    "spatial_radius is required when spatial_coords is provided."
+                )
+            # Use spatial block bootstrap: form spatial clusters and generate multipliers
+            n_boot = getattr(self.boot, "n_boot", bt.DEFAULT_BOOTSTRAP_ITERATIONS) if self.boot else bt.DEFAULT_BOOTSTRAP_ITERATIONS
+            seed = getattr(self.boot, "seed", None) if self.boot else None
+            policy = getattr(self.boot, "policy", "boottest") if self.boot else "boottest"
+
+            W_mult, log_mult, spatial_clusters = bt.spatial_distance_multipliers(
+                spatial_coords_arr,
+                radius=self.spatial_radius,
+                n_boot=n_boot,
+                seed=seed,
+                policy=policy,
+            )
+            W_obs = W_mult  # Already (n_obs, B) format
+        elif self.boot is None:
             # Do not force policy/enumeration here; inject only aligned ID arrays
             # If both space_ids and time_ids are provided (space×time multiway),
             # disable enumeration by default to match boottest parity for multiway.
@@ -294,6 +322,13 @@ class SpatialDID:
                     space_ids=self.space_ids,
                     time_ids=self.time_ids,
                 )
+            # BootConfig.make_multipliers returns (DataFrame, log)
+            W_obs_df, _log = boot_cfg.make_multipliers(n_obs=len(df))
+            # accept either DataFrame or ndarray
+            try:
+                W_obs = W_obs_df.to_numpy(dtype=np.float64)
+            except (AttributeError, TypeError, ValueError):
+                W_obs = np.asarray(W_obs_df, dtype=np.float64)
         else:
             # Respect user BootConfig: replace only IDs with aligned versions
             # Build kwargs from existing BootConfig dataclass fields
@@ -313,13 +348,14 @@ class SpatialDID:
                 bkw["use_enumeration"] = False
                 bkw["enumeration_mode"] = "disabled"
             boot_cfg = BootConfig(**bkw)
-        # BootConfig.make_multipliers returns (DataFrame, log)
-        W_obs_df, _log = boot_cfg.make_multipliers(n_obs=len(df))
-        # accept either DataFrame or ndarray
-        try:
-            W_obs = W_obs_df.to_numpy(dtype=np.float64)
-        except (AttributeError, TypeError, ValueError):
-            W_obs = np.asarray(W_obs_df, dtype=np.float64)
+            # BootConfig.make_multipliers returns (DataFrame, log)
+            W_obs_df, _log = boot_cfg.make_multipliers(n_obs=len(df))
+            # accept either DataFrame or ndarray
+            try:
+                W_obs = W_obs_df.to_numpy(dtype=np.float64)
+            except (AttributeError, TypeError, ValueError):
+                W_obs = np.asarray(W_obs_df, dtype=np.float64)
+
         # centralize columns (global recenter). Per-cell recentering applied below.
         W_obs = W_obs - W_obs.mean(axis=0, keepdims=True)
         # Enforce multiplier variance per-column: scale to unit-variance for

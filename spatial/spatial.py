@@ -452,16 +452,26 @@ class SAR2SLS(BaseEstimator):
         cluster_ids: Sequence | None = None,
         space_ids: Sequence | None = None,
         time_ids: Sequence | None = None,
-        spatial_inference: str
-        | None = None,  # Reserved for future: {"wild","conley","block"}
+        spatial_coords: np.ndarray | None = None,
+        spatial_radius: float | None = None,
     ) -> EstimationResult:
-        """Estimate SAR via 2SLS; return EstimationResult with bootstrap SE."""
-        if spatial_inference is not None:
-            # Deliberately excluded by project policy: analytical spatial HAC/block
-            # inference is out of scope for this estimator; use wild bootstrap only.
-            raise ValueError(
-                "`spatial_inference` options are deliberately excluded; use wild bootstrap SE only.",
-            )
+        """Estimate SAR via 2SLS; return EstimationResult with bootstrap SE.
+
+        Parameters
+        ----------
+        boot : BootConfig | None
+            Bootstrap configuration. If None, default spatial block bootstrap
+            is used when spatial_coords is provided.
+        spatial_coords : np.ndarray | None
+            Spatial coordinates (n x 2) for each observation. Required for
+            proper spatial inference via spatial block bootstrap.
+        spatial_radius : float | None
+            Radius for spatial clustering in coordinate units. Required when
+            spatial_coords is provided. Observations within this distance
+            form spatial clusters for block bootstrap.
+        """
+        # Import spatial bootstrap utility
+        from lineareg.core import bootstrap as bt
 
         # PATCH: Strict W validation at fit() entry (R spatialreg::lagsarlm compatibility)
         # Enforce squareness, dimension matching, and optional row-normalization checks
@@ -738,9 +748,42 @@ class SAR2SLS(BaseEstimator):
         # Store rank_policy for internal use in weak IV diagnostics
         iv._rank_policy = self._rank_policy  # noqa: SLF001
 
-        # Build/normalize BootConfig for spatial inference and enforce boottest policy
-        if boot is None:
-            # Defer bootcluster/enumeration policy to central defaults (BootConfig); keep IDs masked here.
+        # Build/normalize BootConfig for spatial inference with spatial block bootstrap
+        # For spatial estimators, we REQUIRE spatial_coords for proper spatial inference.
+        # When provided, use spatial_distance_multipliers to build spatially-clustered
+        # bootstrap multipliers. This is the correct approach for spatial correlation.
+        if spatial_coords is not None:
+            spatial_coords = np.asarray(spatial_coords, dtype=np.float64)
+            if spatial_coords.ndim != 2 or spatial_coords.shape[0] != n:
+                raise ValueError(
+                    f"spatial_coords must be (n x 2) array; got shape {spatial_coords.shape}, expected ({n}, 2)."
+                )
+            if spatial_radius is None:
+                raise ValueError(
+                    "spatial_radius is required when spatial_coords is provided."
+                )
+            # Use spatial block bootstrap: form spatial clusters and generate multipliers
+            n_boot = getattr(boot, "n_boot", bt.DEFAULT_BOOTSTRAP_ITERATIONS) if boot else bt.DEFAULT_BOOTSTRAP_ITERATIONS
+            seed = getattr(boot, "seed", None) if boot else None
+            policy = getattr(boot, "policy", "boottest") if boot else "boottest"
+
+            W_mult, log_mult, spatial_clusters = bt.spatial_distance_multipliers(
+                spatial_coords,
+                radius=spatial_radius,
+                n_boot=n_boot,
+                seed=seed,
+                policy=policy,
+            )
+            # Convert multipliers to BootConfig format: create BootConfig with cluster_ids
+            # set to the spatial clusters so that IV2SLS uses spatially-clustered inference
+            boot = BootConfig(
+                n_boot=W_mult.shape[1],
+                cluster_ids=spatial_clusters,
+                policy=policy,
+                seed=seed,
+            )
+        elif boot is None:
+            # No spatial coords provided: use simple clustering if available
             boot = BootConfig(
                 cluster_ids=None if cluster_ids is None else np.asarray(cluster_ids),
                 space_ids=None if space_ids is None else np.asarray(space_ids),

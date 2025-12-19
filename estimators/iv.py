@@ -147,21 +147,35 @@ def _cd_kp_stats(  # noqa: PLR0913
 
         S_dense = la.to_dense(S).astype(np.float64)
         S_dense = 0.5 * (S_dense + S_dense.T)
-        S_plus = np.linalg.pinv(S_dense)
+
+        eig_tol = la.eig_tol(S_dense) if hasattr(la, "eig_tol") else 1e-10
+        eigvals_S, eigvecs_S = np.linalg.eigh(S_dense)
+        keep_S = eigvals_S > eig_tol
+        if not np.any(keep_S):
+            return out
+        eigvals_S_inv = np.zeros_like(eigvals_S)
+        eigvals_S_inv[keep_S] = 1.0 / eigvals_S[keep_S]
+        S_plus = eigvecs_S @ np.diag(eigvals_S_inv) @ eigvecs_S.T
+
         G = S_plus @ Qxz  # (L2 x K)
         M = Qxz.T @ G  # (K x K)
 
-        # Solve Qxx^{-1} M via Cholesky when possible, else pinv
         Qxx_dense = la.to_dense(Qxx).astype(np.float64)
-        try:
-            L = la.safe_cholesky(Qxx_dense, lower=True)
-            Qxx_inv = la.chol_solve(L, la.eye(Qxx_dense.shape[0]))
-        except (np.linalg.LinAlgError, RuntimeError, ValueError):
-            Qxx_inv = np.linalg.pinv(Qxx_dense)
+        Qxx_dense = 0.5 * (Qxx_dense + Qxx_dense.T)
+
+        eig_tol_qxx = la.eig_tol(Qxx_dense) if hasattr(la, "eig_tol") else 1e-10
+        eigvals_qxx, eigvecs_qxx = np.linalg.eigh(Qxx_dense)
+        keep_qxx = eigvals_qxx > eig_tol_qxx
+        if not np.any(keep_qxx):
+            return out
+        eigvals_qxx_inv = np.zeros_like(eigvals_qxx)
+        eigvals_qxx_inv[keep_qxx] = 1.0 / eigvals_qxx[keep_qxx]
+        Qxx_inv = eigvecs_qxx @ np.diag(eigvals_qxx_inv) @ eigvecs_qxx.T
+
         kp_mat = Qxx_inv @ M
         kp_mat = 0.5 * (kp_mat + kp_mat.T)
         lam_kp = float(np.min(np.linalg.eigvalsh(kp_mat)))
-        if np.isfinite(lam_kp):
+        if np.isfinite(lam_kp) and lam_kp > 0:
             out["kp_min_eig"] = lam_kp
             out["kp_rk_LM"] = float(n * lam_kp) if n > 0 else float("nan")
     except (np.linalg.LinAlgError, RuntimeError, ValueError):

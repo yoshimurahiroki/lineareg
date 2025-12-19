@@ -59,12 +59,12 @@ def __getattr__(name: str) -> Any:
         try:
             module = import_module(module_name)
         except ImportError:  # pragma: no cover - dev path fallback
-            # Preserve development-time fallback for SAR2SLS when the package
-            # layout differs (e.g., running from source without installation).
             if name == "SAR2SLS":
-                from importlib import import_module as _fallback_import
-
-                module = _fallback_import("spatial.spatial")
+                try:
+                    module = import_module("lineareg.spatial.spatial")
+                except ImportError:
+                    root = __package__.split(".")[0] if __package__ else "lineareg"
+                    module = import_module(f"{root}.spatial.spatial")
             else:
                 raise
         attr = getattr(module, attr_name)

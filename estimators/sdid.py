@@ -244,8 +244,10 @@ class SDID:
             mode = (getattr(self.boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "ife_wild"
+            if mode not in {"unit", "ife_wild", "placebo"}:
+                raise ValueError("SDID boot mode must be one of {'unit', 'ife_wild', 'placebo'}.")
             if mode == "unit" and n_treated_total < 2:
-                raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='ife_wild'.")
+                raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='ife_wild' or mode='placebo'.")
 
             theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
             att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
@@ -266,12 +268,26 @@ class SDID:
                 Y0_hat = dgp["Y0_hat"]
                 resid = dgp["resid"]
 
+            control_unit_mask = W.sum(axis=1) == 0
+            control_units = np.flatnonzero(control_unit_mask)
+            n_control = control_units.size
+
             while filled < B and attempts < max_attempts:
                 attempts += 1
                 try:
                     if mode == "unit":
                         df_b = bt.resample_units_block(df, self.id_name, rng)
                         Y_b, W_b, units_b, times_b = self._panel_matrices(df_b)
+                    elif mode == "placebo":
+                        if n_control < n_treated_total:
+                            raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
+                        placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)
+                        W_b = W.copy()
+                        for i, pu in enumerate(placebo_units):
+                            treated_pattern = W[np.flatnonzero(~control_unit_mask)[i % n_treated_total], :]
+                            W_b[pu, :] = treated_pattern
+                        Y_b = Y.copy()
+                        units_b, times_b = _units, times
                     else:
                         v = bt.wild_unit_multiplier(rng, Y.shape[0], dist="rademacher")
                         Y_b = Y0_hat + tau_it * W + (v[:, None] * resid)

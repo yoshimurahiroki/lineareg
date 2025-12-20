@@ -892,11 +892,9 @@ class QR(BaseEstimator):
         self.Z_orig = None
 
         if add_const:
-            # Use R dialect for intercept-first ordering (matches quantreg)
             X_aug, names, const_name = add_constant(
                 X_arr,
                 var_names,
-                dialect="r",
             )
             self._const_name = const_name
         else:

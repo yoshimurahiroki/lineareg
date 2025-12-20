@@ -60,7 +60,7 @@ class SDID:
         treat_name: str,
         y_name: str,
         cohort_name: str = "g",
-        control_group: str = "notyet",
+        control_group: str = "never",
         eta_omega: float | None = None,
         eta_lambda: float = 1e-6,
         boot: BootConfig | None = None,
@@ -124,6 +124,19 @@ class SDID:
             N0 = int(donors.sum())
             if N0 == 0:
                 continue
+
+            cg = self.control_group.lower().replace("_", "")
+            if cg == "notyet":
+                first = (W > 0).argmax(axis=1)
+                ever = W.sum(axis=1) > 0
+                g_first = np.full(W.shape[0], np.inf)
+                g_first[ever] = times[first[ever]]
+                cutoff = np.min(g_first[donors])
+                if np.isfinite(cutoff):
+                    post_mask = (times >= g) & (times < cutoff)
+                    if post_mask.sum() == 0:
+                        continue
+
             N1 = int(idx_tr.sum())
             T0 = int(pre_mask.sum())
             T1 = int(post_mask.sum())
@@ -253,63 +266,8 @@ class SDID:
 
             theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
 
-            # ----- Jackknife variance estimation (synthdid-style) -----
-            if mode == "jackknife":
-                N = Y.shape[0]
-                att_jack = []
-                for drop_i in range(N):
-                    keep = np.arange(N) != drop_i
-                    Y_i = Y[keep, :]
-                    W_i = W[keep, :]
-                    try:
-                        att_post_i, att_tau_i = self._att_path_from_w(
-                            Y_i, W_i, times,
-                            zeta_omega=None, zeta_lambda=None,
-                            omega_intercept=self.omega_intercept,
-                            lambda_intercept=self.lambda_intercept,
-                            max_iter=self.fw_max_iter,
-                            tol=self.fw_tol,
-                        )
-                        att_jack.append(float(att_post_i))
-                    except Exception:
-                        continue
-                att_jack = np.array(att_jack, dtype=float)
-                n_jack = len(att_jack)
-                if n_jack > 1:
-                    jack_mean = float(np.mean(att_jack))
-                    post_att_se = float(np.sqrt((n_jack - 1) / n_jack * np.sum((att_jack - jack_mean) ** 2)))
-                    # Jackknife only computes SE for aggregate post_ATT, not per-tau.
-                    # Since se_series must match params exactly and cannot have NaN,
-                    # we leave se_series = None and store jackknife SE in boot_info.
-                    # Compute simple symmetric CI
-                    alpha_level = float(self.alpha)
-                    z = 1.96 if alpha_level == 0.05 else bt.finite_sample_quantile(np.abs(np.random.randn(10000)), 1.0 - alpha_level)
-                    lo_post = float(att_post) - z * post_att_se
-                    hi_post = float(att_post) + z * post_att_se
-                    bands = {
-                        "full": None,
-                        "pre": None,
-                        "post": None,
-                        "post_ATT": pd.DataFrame({"lower": [lo_post], "upper": [hi_post]}),
-                        "post_scalar": pd.DataFrame({"lower": [lo_post], "upper": [hi_post]}),
-                        "__meta__": {
-                            "origin": "jackknife",
-                            "mode": mode,
-                            "kind": "jackknife",
-                            "level": int(100 * (1.0 - alpha_level)),
-                            "B": n_jack,
-                            "estimator": "sdid",
-                        },
-                    }
-                else:
-                    post_att_se = np.nan
-                boot_info["B"] = n_jack
-                boot_info["post_ATT_draws"] = att_jack
-                boot_info["ATT_tau_draws"] = np.full((tau_grid.size, n_jack), np.nan)
-                boot_info["method"] = "jackknife"
-                boot_info["post_ATT_se"] = float(post_att_se) if np.isfinite(post_att_se) else np.nan
-            else:
-                # ----- Bootstrap variance estimation -----
+            # ----- Bootstrap variance estimation -----
+            if True:
                 att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
                 att_b = np.full(B, np.nan, dtype=float)
                 filled = 0
@@ -378,7 +336,7 @@ class SDID:
                 boot_info["post_ATT_draws"] = att_b
                 boot_info["ATT_tau_draws"] = att_tau_star
 
-            if mode != "jackknife" and filled > 1:
+            if filled > 1:
                 se_vals = bt.bootstrap_se(att_tau_star)
                 se_series_tau = pd.Series(se_vals, index=tau_grid)
                 if base_tau in se_series_tau.index:
@@ -976,6 +934,19 @@ class SDID:
             N0 = int(donors.sum())
             if N0 == 0:
                 continue
+
+            cg = self.control_group.lower().replace("_", "")
+            if cg == "notyet":
+                first = (W > 0).argmax(axis=1)
+                ever = W.sum(axis=1) > 0
+                g_first = np.full(W.shape[0], np.inf)
+                g_first[ever] = times[first[ever]]
+                cutoff = np.min(g_first[donors])
+                if np.isfinite(cutoff):
+                    post = (times >= g) & (times < cutoff)
+                    if post.sum() == 0:
+                        continue
+
             donors_idx = np.where(donors)[0]
             treated_idx = np.where(idx_tr)[0]
             Yg = Y[np.r_[donors_idx, treated_idx], :]

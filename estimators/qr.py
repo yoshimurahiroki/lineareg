@@ -49,6 +49,8 @@ MatrixLike = Union[pd.DataFrame, np.ndarray]
 
 __all__ = ["IVQR", "QR"]
 
+_WARNED_TIEBREAK = False
+
 
 def _solve_qr_lp(
     X: NDArray[np.float64],
@@ -180,13 +182,15 @@ def _solve_qr_lp(
         obj_unperturbed - float(active.fun - la.dot(tie, active.x[:k])),
     )
     if perturbation_effect > tol_obj:
-        # Issue warning instead of raising, matching R quantreg behavior (no strict check)
-        warnings.warn(
-            f"Lexicographic tie-breaking perturbed QR objective by {perturbation_effect:.2e} "
-            f"(tolerance {tol_obj:.2e}). This is within R/Stata quantreg tolerances.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        global _WARNED_TIEBREAK
+        if not _WARNED_TIEBREAK:
+            _WARNED_TIEBREAK = True
+            warnings.warn(
+                f"Lexicographic tie-breaking perturbed QR objective by {perturbation_effect:.2e} "
+                f"(tolerance {tol_obj:.2e}). This is within R/Stata quantreg tolerances.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     # reshape into column vector (n,1)
     dual_arr = (
         np.asarray(dual_eq, dtype=float).reshape(-1, 1) if dual_eq is not None else None
@@ -345,12 +349,15 @@ def _solve_qr_lp_prepared(
         obj_unperturbed - float(active.fun - la.dot(tie, active.x[:k])),
     )
     if perturbation_effect > tol_obj:
-        warnings.warn(
-            f"Lexicographic tie-breaking perturbed QR objective by {perturbation_effect:.2e} "
-            f"(tolerance {tol_obj:.2e}). This is within R/Stata quantreg tolerances.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        global _WARNED_TIEBREAK
+        if not _WARNED_TIEBREAK:
+            _WARNED_TIEBREAK = True
+            warnings.warn(
+                f"Lexicographic tie-breaking perturbed QR objective by {perturbation_effect:.2e} "
+                f"(tolerance {tol_obj:.2e}). This is within R/Stata quantreg tolerances.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     dual_arr = (
         np.asarray(dual_eq, dtype=float).reshape(-1, 1) if dual_eq is not None else None

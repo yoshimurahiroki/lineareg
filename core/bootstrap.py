@@ -3019,6 +3019,32 @@ def resample_units_block(df, id_name: str, rng: np.random.Generator):
     return pd.concat(parts, ignore_index=True)
 
 
+def unit_multipliers(
+    df,
+    id_name: str,
+    rng: np.random.Generator,
+    dist: str = "rademacher",
+) -> np.ndarray:
+    import pandas as pd
+    ids = pd.Index(df[id_name].to_numpy())
+    uniq = ids.unique()
+    n_units = len(uniq)
+    dist_lower = dist.lower()
+    if dist_lower in {"rademacher", "sign"}:
+        draws = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+    elif dist_lower in {"standard_normal", "normal", "gaussian"}:
+        draws = rng.standard_normal(size=n_units)
+    elif dist_lower in {"mammen"}:
+        s5 = np.sqrt(5.0)
+        w1, w2 = -(s5 - 1.0) / 2.0, (s5 + 1.0) / 2.0
+        p1, p2 = (s5 + 1.0) / (2.0 * s5), (s5 - 1.0) / (2.0 * s5)
+        draws = rng.choice(np.array([w1, w2]), size=n_units, p=np.array([p1, p2]))
+    else:
+        raise ValueError(f"dist must be 'rademacher', 'standard_normal', or 'mammen', got '{dist}'")
+    mp = dict(zip(uniq.to_numpy(), draws))
+    return ids.map(mp).to_numpy(dtype=float)
+
+
 def two_way_demean(M: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     mu_i = np.mean(M, axis=1, keepdims=True)
     mu_t = np.mean(M, axis=0, keepdims=True)

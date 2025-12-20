@@ -50,6 +50,14 @@ else:
 __all__ = ["DREventStudy"]
 
 
+def _time_to_pos(times) -> dict:
+    return {t: i for i, t in enumerate(times)}
+
+
+def _event_tau(t, g, t2pos: dict) -> int:
+    return t2pos[t] - t2pos[g]
+
+
 class DREventStudy:
     """Doubly-robust DR-DID event-study with cross-fitting and IF multiplier bootstrap.
 
@@ -242,6 +250,7 @@ class DREventStudy:
         # Precompute base-period level mappings for constructing long-differences
         df_sorted = df_aug.sort_values([self.id_name, self.t_name])
         times_all = np.sort(df_sorted[self.t_name].astype(int).unique())
+        t2pos = _time_to_pos(times_all)
         base_map = {
             int(tt): df_sorted.loc[
                 df_sorted[self.t_name].astype(int).to_numpy() == int(tt), :,
@@ -496,7 +505,7 @@ class DREventStudy:
 
             # No additional first-stage IF contributions beyond cross-fitting in strict mode
 
-            tau_val = int(t) - int(g)
+            tau_val = _event_tau(t, g, t2pos)
             records.append((int(g), int(t), tau_val, float(att), float(n_treat)))
             phi_store[(int(g), int(t))] = psi.reshape(-1)
             # Store row labels that actually entered psi after trimming

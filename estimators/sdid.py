@@ -36,6 +36,14 @@ _EPS = 1e-12
 LOGGER = logging.getLogger(__name__)
 
 
+def _time_to_pos(times: np.ndarray) -> dict:
+    return {t: i for i, t in enumerate(times)}
+
+
+def _event_tau(t, g, t2pos: dict) -> int:
+    return t2pos[t] - t2pos[g]
+
+
 class SDID:
     """Synthetic Difference-in-Differences estimator.
 
@@ -102,6 +110,7 @@ class SDID:
 
         # Build matrices and validate panel
         Y, W, _units, times = self._panel_matrices(df)
+        t2pos = _time_to_pos(times)
 
         # Identify cohorts (adoption times) and treated indexes per cohort
         cohorts = self._cohorts_from_w(W, times)
@@ -206,7 +215,7 @@ class SDID:
         tau_union: set[int] = set()
         for g in results_g:
             for t_val in times:
-                tau_union.add(int(t_val) - int(g))
+                tau_union.add(_event_tau(t_val, g, t2pos))
         tau_union_sorted = sorted(tau_union)
 
         att_tau_num: dict[int, float] = {int(tau): 0.0 for tau in tau_union_sorted}
@@ -215,12 +224,11 @@ class SDID:
             delta_gt = np.asarray(meta["delta_t"], dtype=float)
             ntr_g = float(meta["n_tr"])
             for t_idx, t_val in enumerate(times):
-                tau_val = int(t_val) - int(g)
+                tau_val = _event_tau(t_val, g, t2pos)
                 att_tau_num[int(tau_val)] += ntr_g * float(delta_gt[t_idx])
                 att_tau_den[int(tau_val)] += ntr_g
-            # Store per-cohort event-time path for diagnostics
             meta["delta_tau"] = {
-                int(times[t_idx]) - int(g): float(delta_gt[t_idx])
+                _event_tau(times[t_idx], g, t2pos): float(delta_gt[t_idx])
                 for t_idx in range(times.size)
             }
 
@@ -284,8 +292,12 @@ class SDID:
                     attempts += 1
                     try:
                         if mode == "unit":
-                            df_b = bt.resample_units_block(df, self.id_name, rng)
-                            Y_b, W_b, units_b, times_b = self._panel_matrices(df_b)
+                            n_units = Y.shape[0]
+                            mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                            Y_centered = Y - Y.mean(axis=0, keepdims=True)
+                            Y_b = Y.mean(axis=0, keepdims=True) + Y_centered * mult[:, None]
+                            W_b = W.copy()
+                            units_b, times_b = _units, times
                         else:  # mode == "placebo"
                             if n_control < n_treated_total:
                                 raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
@@ -919,6 +931,7 @@ class SDID:
         tol: float = 1e-8,
     ) -> tuple[float, dict[int, float]]:
         """Compute event-time ATT path and scalar post-treatment ATT for a given adoption matrix."""
+        t2pos = _time_to_pos(times)
         first_treat = (W > 0).argmax(axis=1)
         ever = W.sum(axis=1) > 0
         N = Y.shape[0]
@@ -991,7 +1004,7 @@ class SDID:
             delta = diff - bias
             ntr = float(idx_tr.sum())
             for t_idx, t_val in enumerate(times):
-                tau_val = int(t_val) - int(g)
+                tau_val = _event_tau(t_val, g, t2pos)
                 att_tau_num[tau_val] = att_tau_num.get(tau_val, 0.0) + ntr * float(
                     delta[t_idx],
                 )

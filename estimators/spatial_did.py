@@ -43,6 +43,10 @@ __all__ = ["SpatialDID", "SpatialDIDResult"]
 LOGGER = logging.getLogger(__name__)
 
 
+def _event_tau(t, g, t_map: dict) -> int:
+    return t_map[t] - t_map[g]
+
+
 @dataclass
 class SpatialDIDResult:
     """Container for spatial DID estimates.
@@ -438,7 +442,7 @@ class SpatialDID:
                 for rid in sub.index.to_numpy(dtype=int):
                     used_rows.add(int(rid))
                 y = (Yi_now[ok] - Yi_base[ok]).reshape(-1, 1)
-                tau_val = int(t) - int(g)
+                tau_val = _event_tau(t, g, t_map)
                 treat_now = (
                     sub[self.treat_name].to_numpy(dtype=np.float64).reshape(-1, 1)
                 )

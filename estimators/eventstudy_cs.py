@@ -46,6 +46,14 @@ else:
 # exactly for deterministic reproducibility (no approximations).
 
 
+def _time_to_pos(times) -> dict:
+    return {t: i for i, t in enumerate(times)}
+
+
+def _event_tau(t, g, t2pos: dict) -> int:
+    return t2pos[t] - t2pos[g]
+
+
 @dataclass
 class ESCellSpec:
     id_name: str
@@ -452,6 +460,7 @@ class CallawaySantAnnaES:
         base_map: dict[int, pd.Series] = {}
         cov_base_map: dict[int, pd.DataFrame] = {}
         times_all = np.sort(df_aug[self.t_name].unique())
+        t2pos = _time_to_pos(times_all)
         for t0 in times_all:
             at_t0 = df_aug.loc[
                 df_aug[self.t_name] == int(t0), [self.id_name, self.y_name],
@@ -664,7 +673,7 @@ class CallawaySantAnnaES:
             att_star = att + (psi.reshape(-1, 1) * W[used_idx, :]).sum(axis=0, keepdims=False)
             att_star = att_star.reshape(1, -1)
 
-            tau = int(t) - int(g)
+            tau = _event_tau(t, g, t2pos)
             att_rows.append((int(g), int(t), int(tau), float(att), int(n1)))
             att_star_cells.append(att_star)
             used_index.append(used_idx)

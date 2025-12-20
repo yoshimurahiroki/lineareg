@@ -47,6 +47,14 @@ __all__ = ["SyntheticControl"]
 LOGGER = logging.getLogger(__name__)
 
 
+def _time_to_pos(times: np.ndarray) -> dict:
+    return {t: i for i, t in enumerate(times)}
+
+
+def _event_tau(t, g, t2pos: dict) -> int:
+    return t2pos[t] - t2pos[g]
+
+
 def _frank_wolfe_simplex(
     X: np.ndarray,
     y: np.ndarray,
@@ -321,6 +329,8 @@ class SyntheticControl:
 
         # --- build wide Y (ids x times) ---
         Y, ids, times = self._wide_from_long(df)
+        times_arr = np.array(times)
+        t2pos = _time_to_pos(times_arr)
         id_to_row = {i: k for k, i in enumerate(ids)}
         t_to_col = {t: k for k, t in enumerate(times)}
         j_donors = np.array([id_to_row[j] for j in donors], dtype=int)
@@ -372,7 +382,7 @@ class SyntheticControl:
             }
 
             for t_val in times:
-                tau_val = int(t_val) - int(g)
+                tau_val = _event_tau(t_val, g, t2pos)
                 tau_union.add(tau_val)
 
         # Aggregate across cohorts in event-time τ = t - g
@@ -384,7 +394,7 @@ class SyntheticControl:
             att_path = meta["att_path"]
             n_tr = meta["n_treated"]
             for t_idx, t_val in enumerate(times):
-                tau_val = int(t_val) - int(g)
+                tau_val = _event_tau(t_val, g, t2pos)
                 att_tau_num[tau_val] += n_tr * float(att_path[t_idx])
                 att_tau_den[tau_val] += n_tr
 
@@ -464,7 +474,7 @@ class SyntheticControl:
                     att_path_j = y_j - y_synth_j
                     att_tau_j = np.full(tau_grid.size, np.nan, dtype=float)
                     for t_idx, t_val in enumerate(times):
-                        tau_val = int(t_val) - int(g0)
+                        tau_val = _event_tau(t_val, g0, t2pos)
                         j_tau = np.searchsorted(tau_grid, tau_val)
                         if j_tau < tau_grid.size and tau_grid[j_tau] == tau_val:
                             att_tau_j[j_tau] = att_path_j[t_idx]
@@ -553,9 +563,13 @@ class SyntheticControl:
                     attempts += 1
                     try:
                         if mode == "unit":
-                            df_b = bt.resample_units_block(df, self.spec.id_name, rng)
-                            Y_b, ids_b, times_b = self._wide_from_long(df_b)
-                            cohorts_b, donors_b = self._treated_info(df_b)
+                            n_units = Y.shape[0]
+                            mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                            Y_centered = Y - Y.mean(axis=0, keepdims=True)
+                            Y_b = Y.mean(axis=0, keepdims=True) + Y_centered * mult[:, None]
+                            ids_b, times_b = ids, times
+                            cohorts_b = {g: meta["treated_ids"] for g, meta in results_g.items()}
+                            donors_b = donors
                         else:  # mode == "placebo"
                             control_units = np.flatnonzero(control_mask_boot)
                             n_control = control_units.size
@@ -595,7 +609,7 @@ class SyntheticControl:
                             att_path_g_b = np.mean(att_paths_g_b, axis=0)
                             results_g_b[g] = {"att_path": att_path_g_b, "n_treated": len(treated_units)}
                             for t_val in times_b:
-                                tau_union_b.add(int(t_val) - int(g))
+                                tau_union_b.add(_event_tau(t_val, g, t2pos))
 
                         tau_union_sorted_b = sorted(tau_union_b)
                         att_tau_num_b = {int(tau): 0.0 for tau in tau_union_sorted_b}
@@ -604,7 +618,7 @@ class SyntheticControl:
                             att_path_b = meta_b["att_path"]
                             n_tr_b = meta_b["n_treated"]
                             for t_idx, t_val in enumerate(times_b):
-                                tau_val = int(t_val) - int(g)
+                                tau_val = _event_tau(t_val, g, t2pos)
                                 att_tau_num_b[tau_val] += n_tr_b * float(att_path_b[t_idx])
                                 att_tau_den_b[tau_val] += n_tr_b
 

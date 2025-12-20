@@ -47,6 +47,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+from functools import lru_cache
+
+
 def _env_wants_gpu() -> bool:
     dev = str(os.environ.get("LINEAREG_DEVICE", "")).strip().lower()
     flag = str(os.environ.get("LINEAREG_USE_GPU", "")).strip().lower()
@@ -55,6 +58,7 @@ def _env_wants_gpu() -> bool:
     return flag in {"1", "true", "yes", "on"}
 
 
+@lru_cache(maxsize=1)
 def gpu_available() -> bool:
     """Return True if CuPy is importable and at least one CUDA device is available."""
     if not _CUPY_OK:
@@ -67,6 +71,7 @@ def gpu_available() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
 def gpu_enabled() -> bool:
     """Return True when environment requests GPU and it's available."""
     return _env_wants_gpu() and gpu_available()

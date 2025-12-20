@@ -58,12 +58,15 @@ class ESCellSpec:
     covariate_names: Sequence[str] | None = None
     cov_method: str = "none"  # {"none","reg","ipw","dr"}
 
-    def control_mask(self, df: pd.DataFrame, t: int) -> np.ndarray:
+    def control_mask(self, df: pd.DataFrame, g: int, t: int) -> np.ndarray:
         cg_normalized = self.control_group.lower().replace("treated", "")
+        cohort_arr = df[self.cohort_name].to_numpy()
         if cg_normalized == "never":
-            return df[self.cohort_name] == 0
+            return cohort_arr == 0
         if cg_normalized == "notyet":
-            return (df[self.cohort_name] > t) | (df[self.cohort_name] == 0)
+            base_period = int(g) - 1
+            cutoff = max(int(t), base_period)
+            return (cohort_arr == 0) | (cohort_arr > cutoff)
         raise ValueError(
             "control_group must be 'never'/'nevertreated' or 'notyet'/'notyettreated'",
         )
@@ -447,12 +450,17 @@ class CallawaySantAnnaES:
         # ---- CS long-diff estimator per cell with optional covariates (reg/ipw/dr) ----
         # Build base maps Y_{g-1}(i) by calendar time once
         base_map: dict[int, pd.Series] = {}
+        cov_base_map: dict[int, pd.DataFrame] = {}
         times_all = np.sort(df_aug[self.t_name].unique())
         for t0 in times_all:
             at_t0 = df_aug.loc[
                 df_aug[self.t_name] == int(t0), [self.id_name, self.y_name],
             ]
             base_map[int(t0)] = at_t0.set_index(self.id_name)[self.y_name].astype(float)
+            if self.covariate_names:
+                cov_cols = [self.id_name] + list(self.covariate_names)
+                cov_at_t0 = df_aug.loc[df_aug[self.t_name] == int(t0), cov_cols]
+                cov_base_map[int(t0)] = cov_at_t0.drop_duplicates(subset=[self.id_name]).set_index(self.id_name)
 
         # group size map for tau aggregation (treated count per cohort)
         group_size: dict[int, int] = {}
@@ -469,22 +477,19 @@ class CallawaySantAnnaES:
             W = W / np.sqrt(v.reshape(1, -1))
 
         for g, t in cell_keys:
-            # select rows for calendar time t and cohort g (treated) vs control (not-yet or never)
             mask_t = df_aug[self.t_name].astype(int).to_numpy() == int(t)
+            base_period = int(g) - 1
+            cutoff = max(int(t), base_period)
+            cohort_arr = df_aug[self.cohort_name].astype(int).to_numpy()
             if self.control_group.lower().replace("_", "") == "notyet":
-                ctrl_mask = (df_aug[self.cohort_name].astype(int).to_numpy() == 0) | (
-                    df_aug[self.cohort_name].astype(int).to_numpy() > int(t)
-                )
+                ctrl_mask = (cohort_arr == 0) | (cohort_arr > cutoff)
             else:  # "never"
-                ctrl_mask = df_aug[self.cohort_name].astype(int).to_numpy() == 0
-            mask_cell = mask_t & (
-                (df_aug[self.cohort_name].astype(int).to_numpy() == int(g)) | ctrl_mask
-            )
+                ctrl_mask = cohort_arr == 0
+            mask_cell = mask_t & ((cohort_arr == int(g)) | ctrl_mask)
             sub = df_aug.loc[mask_cell, :].copy()
             if sub.shape[0] == 0:
                 continue
 
-            # long-diff dY = Y_t - Y_{g-1}
             base_time = int(g) - 1
             if base_time not in base_map:
                 continue
@@ -507,13 +512,17 @@ class CallawaySantAnnaES:
 
             dY = sub["_dY"].to_numpy(dtype=float).reshape(-1)
 
-            # Optional covariates
             X = None
-            if self.covariate_names:
-                X = sub.loc[:, list(self.covariate_names)].to_numpy(dtype=float, copy=False)
+            if self.covariate_names and base_time in cov_base_map:
+                cov_df = cov_base_map[base_time]
+                unit_ids = sub[self.id_name].to_numpy()
+                valid_ids = [uid for uid in unit_ids if uid in cov_df.index]
+                if len(valid_ids) == len(unit_ids):
+                    X = cov_df.loc[unit_ids, list(self.covariate_names)].to_numpy(dtype=float)
+                else:
+                    X = None
             cov_mode = self.cov_method
 
-            # Estimate propensity when requested
             ps = None
             if cov_mode in {"ipw", "dr"}:
                 if LogisticRegression is None:

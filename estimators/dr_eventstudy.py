@@ -375,14 +375,13 @@ class DREventStudy:
 
         for g, t in cell_keys:
             mask_t = tcol_all == int(t)
-            ctrl_mask = spec.control_mask(df_aug, int(t))
+            ctrl_mask = spec.control_mask(df_aug, int(g), int(t))
             mask_cell = mask_t & ((gcol_all == int(g)) | ctrl_mask)
             sub = df_aug.loc[mask_cell, :].copy()
             if sub.shape[0] == 0:
                 skipped.append((int(g), int(t), "empty cell"))
                 continue
 
-            # construct long-differences Y_t - Y_{g-1}
             base_time = int(g) - 1
             if base_time not in base_map:
                 skipped.append((int(g), int(t), "no base period g-1"))

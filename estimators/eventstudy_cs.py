@@ -54,6 +54,13 @@ def _event_tau(t, g, t2pos: dict) -> int:
     return t2pos[t] - t2pos[g]
 
 
+def _pret_for_cohort(g, times_sorted, anticipation: int = 0):
+    candidates = [t for t in times_sorted if t + anticipation < g]
+    if len(candidates) == 0:
+        return None
+    return candidates[-1]
+
+
 @dataclass
 class ESCellSpec:
     id_name: str
@@ -64,17 +71,25 @@ class ESCellSpec:
     control_group: str = "notyet"
     center_at: int = -1
     covariate_names: Sequence[str] | None = None
-    cov_method: str = "none"  # {"none","reg","ipw","dr"}
+    cov_method: str = "none"
+    anticipation: int = 0
 
-    def control_mask(self, df: pd.DataFrame, g: int, t: int) -> np.ndarray:
+    def control_mask(self, df: pd.DataFrame, g, t, pret, times_sorted) -> np.ndarray:
         cg_normalized = self.control_group.lower().replace("treated", "")
         cohort_arr = df[self.cohort_name].to_numpy()
         if cg_normalized == "never":
             return cohort_arr == 0
         if cg_normalized == "notyet":
-            base_period = int(g) - 1
-            cutoff = max(int(t), base_period)
-            return (cohort_arr == 0) | (cohort_arr > cutoff)
+            t2pos = _time_to_pos(times_sorted)
+            t_pos = t2pos.get(t, -1)
+            pret_pos = t2pos.get(pret, -1)
+            cutoff_pos = max(t_pos, pret_pos) + self.anticipation
+            cutoff_vals = [tv for tv in times_sorted if t2pos[tv] > cutoff_pos]
+            if len(cutoff_vals) == 0:
+                cutoff = float('inf')
+            else:
+                cutoff = min(cutoff_vals)
+            return (cohort_arr == 0) | (cohort_arr >= cutoff)
         raise ValueError(
             "control_group must be 'never'/'nevertreated' or 'notyet'/'notyettreated'",
         )
@@ -82,18 +97,23 @@ class ESCellSpec:
 
 def build_cells(
     df: pd.DataFrame, spec: ESCellSpec,
-) -> tuple[pd.DataFrame, list[tuple[int, int]], dict]:
+) -> tuple[pd.DataFrame, list[tuple], dict]:
     df_aug = df.copy()
-    times = np.sort(df_aug[spec.t_name].astype(int).unique())
-    cohorts = np.sort(df_aug[spec.cohort_name].astype(int).unique())
-    times_set = {int(t) for t in times}
+    times = np.sort(df_aug[spec.t_name].unique())
+    cohorts = np.sort(df_aug[spec.cohort_name].unique())
+    pret_map = {}
+    for g in cohorts:
+        if g > 0:
+            pret = _pret_for_cohort(g, times, spec.anticipation)
+            if pret is not None:
+                pret_map[g] = pret
     cell_keys = [
-        (int(g), int(t))
+        (g, t, pret_map[g])
         for g in cohorts
-        if g > 0 and int(g - 1) in times_set
+        if g > 0 and g in pret_map
         for t in times
     ]
-    return df_aug, cell_keys, {}
+    return df_aug, cell_keys, {"times": times, "pret_map": pret_map}
 
 
 def aggregate_tau(att_gt: pd.DataFrame, base_tau: int) -> tuple[pd.DataFrame, dict]:
@@ -266,6 +286,7 @@ class CallawaySantAnnaES:
         event_time_name: str | None = None,
         control_group: str = "notyet",
         center_at: int = -1,
+        anticipation: int = 0,
         boot: BootConfig | None = None,
         cluster_ids: Sequence | None = None,
         space_ids: Sequence | None = None,
@@ -286,6 +307,7 @@ class CallawaySantAnnaES:
         self.event_time_name = None if event_time_name is None else str(event_time_name)
         self.control_group = control_group
         self.center_at = int(center_at)
+        self.anticipation = int(anticipation)
         self.alpha = float(alpha)
         self.tau_weight = str(tau_weight).lower()
         if self.tau_weight not in {"group", "equal", "treated_t"}:
@@ -430,12 +452,23 @@ class CallawaySantAnnaES:
             center_at=self.center_at,
             covariate_names=self.covariate_names,
             cov_method=self.cov_method,
+            anticipation=self.anticipation,
         )
 
-        df_aug, cell_keys, _ = build_cells(df, spec)
+        df_aug, cell_keys, cell_meta = build_cells(df, spec)
+        times_all = cell_meta.get("times", np.sort(df_aug[self.t_name].unique()))
+        pret_map = cell_meta.get("pret_map", {})
 
-        # Shared multiplier draws W (common multiplier across cells)
-        # Use external_W if provided (for DDD), otherwise generate fresh multipliers
+        from dataclasses import replace as dc_replace
+        boot_eff = self.boot
+        if boot_eff is not None:
+            if isinstance(self.cluster_ids, str) and self.cluster_ids in df_aug.columns:
+                boot_eff = dc_replace(boot_eff, cluster_ids=df_aug[self.cluster_ids].values)
+            elif isinstance(self.space_ids, str) and self.space_ids in df_aug.columns:
+                space_vals = df_aug[self.space_ids].values
+                time_vals = df_aug[self.time_ids].values if isinstance(self.time_ids, str) else None
+                boot_eff = dc_replace(boot_eff, space_ids=space_vals, time_ids=time_vals)
+
         if external_W is not None:
             W = external_W
             if W.shape[0] != df_aug.shape[0]:
@@ -444,8 +477,8 @@ class CallawaySantAnnaES:
             _boot_log = {"source": "external"}
         else:
             W_df, _boot_log = (
-                self.boot.make_multipliers(df_aug.shape[0])
-                if self.boot is not None
+                boot_eff.make_multipliers(df_aug.shape[0])
+                if boot_eff is not None
                 else (None, {})
             )
             W = W_df.to_numpy() if W_df is not None else None
@@ -485,24 +518,24 @@ class CallawaySantAnnaES:
                 )
             W = W / np.sqrt(v.reshape(1, -1))
 
-        for g, t in cell_keys:
-            mask_t = df_aug[self.t_name].astype(int).to_numpy() == int(t)
-            base_period = int(g) - 1
-            cutoff = max(int(t), base_period)
-            cohort_arr = df_aug[self.cohort_name].astype(int).to_numpy()
-            if self.control_group.lower().replace("_", "") == "notyet":
-                ctrl_mask = (cohort_arr == 0) | (cohort_arr > cutoff)
-            else:  # "never"
-                ctrl_mask = cohort_arr == 0
-            mask_cell = mask_t & ((cohort_arr == int(g)) | ctrl_mask)
+        for g, t, pret in cell_keys:
+            mask_t = df_aug[self.t_name].to_numpy() == t
+            ctrl_mask = spec.control_mask(df_aug, g, t, pret, times_all)
+            cohort_arr = df_aug[self.cohort_name].to_numpy()
+            mask_cell = mask_t & ((cohort_arr == g) | ctrl_mask)
             sub = df_aug.loc[mask_cell, :].copy()
             if sub.shape[0] == 0:
                 continue
 
-            base_time = int(g) - 1
-            if base_time not in base_map:
+            base_time = pret
+            base_key = None
+            for k in base_map.keys():
+                if k == base_time:
+                    base_key = k
+                    break
+            if base_key is None:
                 continue
-            sub["_Ybase"] = sub[self.id_name].map(base_map[base_time])
+            sub["_Ybase"] = sub[self.id_name].map(base_map[base_key])
             sub["_dY"] = (
                 sub[self.y_name].astype(float).to_numpy()
                 - sub["_Ybase"].astype(float).to_numpy()
@@ -512,18 +545,18 @@ class CallawaySantAnnaES:
             if sub.shape[0] == 0:
                 continue
 
-            Dg = (sub[self.cohort_name].astype(int).to_numpy() == int(g)).astype(float)
+            Dg = (sub[self.cohort_name].to_numpy() == g).astype(float)
             n1 = int(Dg.sum())
             n0 = int(Dg.size - n1)
             if n1 == 0 or n0 == 0:
                 continue
-            group_size[int(g)] = group_size.get(int(g), 0) + n1
+            group_size[g] = group_size.get(g, 0) + n1
 
             dY = sub["_dY"].to_numpy(dtype=float).reshape(-1)
 
             X = None
-            if self.covariate_names and base_time in cov_base_map:
-                cov_df = cov_base_map[base_time]
+            if self.covariate_names and base_key in cov_base_map:
+                cov_df = cov_base_map[base_key]
                 unit_ids = sub[self.id_name].to_numpy()
                 valid_ids = [uid for uid in unit_ids if uid in cov_df.index]
                 if len(valid_ids) == len(unit_ids):
@@ -674,10 +707,10 @@ class CallawaySantAnnaES:
             att_star = att_star.reshape(1, -1)
 
             tau = _event_tau(t, g, t2pos)
-            att_rows.append((int(g), int(t), int(tau), float(att), int(n1)))
+            att_rows.append((g, t, int(tau), float(att), int(n1)))
             att_star_cells.append(att_star)
             used_index.append(used_idx)
-            cells_order.append((int(g), int(t)))
+            cells_order.append((g, t))
 
         if not att_rows:
             raise RuntimeError("No valid (g,t) cells found.")

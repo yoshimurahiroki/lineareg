@@ -115,10 +115,9 @@ class SpatialDID:
         spatial_coords: np.ndarray | None = None,
         spatial_radius: float | None = None,
         residual_type: str = "restricted",
-        # ---- NEW: tau aggregation weight (R/Stata did/csdid convention: default 'group') ----
         tau_weight: str = "group",
-        # ---- NEW: rank policy to match R or Stata QR thresholds ----
         rank_policy: str = "stata",
+        s_mode: str = "cohort",
     ) -> None:
         self.id_name = str(id_name)
         self.t_name = str(t_name)
@@ -151,6 +150,9 @@ class SpatialDID:
         self._rank_policy = str(rank_policy).lower()
         if self._rank_policy not in {"stata", "r"}:
             raise ValueError("rank_policy must be one of {'stata','r'}.")
+        self.s_mode = str(s_mode).lower()
+        if self.s_mode not in {"cohort", "treated_now"}:
+            raise ValueError("s_mode must be 'cohort' (cohort g spillover with t>=g) or 'treated_now' (all currently treated).")
 
     # ------------------------------------------------------------------
     def _event_time(self, df: pd.DataFrame) -> pd.Series:
@@ -444,13 +446,13 @@ class SpatialDID:
                     sub[self.cohort_name].astype(int).to_numpy().reshape(-1, 1)
                     == int(g)
                 ).astype(np.float64)
-                # R/Stata parity: Z switches from cohort indicator (pre) to D_t (post)
                 Z = cohort_indicator if (tau_val < int(self.center_at)) else treat_now
-                # Event-study spillover: use COHORT membership for S only in POST periods (t >= g)
-                # In pre-periods (t < g), S = 0 to ensure placebo/pre-trend identification
                 unit_indices = sub["_i"].to_numpy(dtype=int)
-                cohort_treated_now = ((int(g) == G) & (int(t) >= int(g))).astype(np.float64)
-                Svec_raw = la.dot(Wd[unit_indices, :], cohort_treated_now.reshape(-1, 1))
+                if self.s_mode == "treated_now":
+                    s_source = treated_now[:, tt].astype(np.float64)
+                else:
+                    s_source = ((G == int(g)) & (int(t) >= int(g))).astype(np.float64)
+                Svec_raw = la.dot(Wd[unit_indices, :], s_source.reshape(-1, 1))
                 exposed_controls = (Svec_raw.reshape(-1) > 0.0) & (Z.reshape(-1) == 0.0)
                 mean_S_exposed = (
                     float(la.col_mean(Svec_raw.reshape(-1)[exposed_controls].reshape(-1, 1))[0])

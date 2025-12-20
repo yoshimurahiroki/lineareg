@@ -434,8 +434,8 @@ class SyntheticControl:
             mode = (getattr(boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "placebo"
-            if mode not in {"unit", "placebo", "jackknife"}:
-                raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'jackknife'}.")
+            if mode not in {"unit", "placebo", "jackknife", "permutation"}:
+                raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'jackknife', 'permutation'}.")
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='jackknife'.")
 
@@ -507,6 +507,63 @@ class SyntheticControl:
                 else:
                     post_att_se = np.nan
                 boot_info = {"B": n_jack, "post_ATT_draws": att_jack, "ATT_tau_draws": np.full((tau_grid.size, n_jack), np.nan), "method": "jackknife", "post_ATT_se": float(post_att_se) if np.isfinite(post_att_se) else np.nan}
+            elif mode == "permutation":
+                j_donors = np.array([id_to_row[j] for j in donors], dtype=int)
+                g0 = list(results_g.keys())[0]
+                t0_col = t_to_col[g0]
+                pre = np.arange(0, t0_col)
+                post = np.arange(t0_col, len(times))
+                treated_ids_list = []
+                for meta in results_g.values():
+                    treated_ids_list.extend(meta["treated_ids"])
+                i_treated = id_to_row[treated_ids_list[0]]
+                y_pre = Y[i_treated, pre].astype(np.float64)
+                X_pre = Y[j_donors][:, pre].T.astype(np.float64)
+                w_fit = _frank_wolfe_simplex(X_pre, y_pre, max_iter=self.max_iter, tol=self.tol)
+                y_treated = Y[i_treated, :].astype(np.float64)
+                X_all = Y[j_donors, :].T.astype(np.float64)
+                y_synth = la.dot(X_all, w_fit)
+                rmspe_pre_treat = float(np.sqrt(np.mean((y_pre - la.dot(X_pre, w_fit)) ** 2)))
+                rmspe_post_treat = float(np.sqrt(np.mean((y_treated[post] - y_synth[post]) ** 2))) if post.size > 0 else 0.0
+                ratio_treat = rmspe_post_treat / rmspe_pre_treat if rmspe_pre_treat > 0 else np.inf
+                ratios = [ratio_treat]
+                for j_idx in j_donors:
+                    donors_for_j = np.array([d for d in j_donors if d != j_idx], dtype=int)
+                    if donors_for_j.size == 0:
+                        continue
+                    y_pre_j = Y[j_idx, pre].astype(np.float64)
+                    X_pre_j = Y[donors_for_j][:, pre].T.astype(np.float64)
+                    try:
+                        w_j = _frank_wolfe_simplex(X_pre_j, y_pre_j, max_iter=self.max_iter, tol=self.tol)
+                    except Exception:
+                        continue
+                    y_j = Y[j_idx, :].astype(np.float64)
+                    X_all_j = Y[donors_for_j, :].T.astype(np.float64)
+                    y_synth_j = la.dot(X_all_j, w_j)
+                    rmspe_pre_j = float(np.sqrt(np.mean((y_pre_j - la.dot(X_pre_j, w_j)) ** 2)))
+                    rmspe_post_j = float(np.sqrt(np.mean((y_j[post] - y_synth_j[post]) ** 2))) if post.size > 0 else 0.0
+                    ratio_j = rmspe_post_j / rmspe_pre_j if rmspe_pre_j > 0 else np.inf
+                    ratios.append(ratio_j)
+                ratios = np.array(ratios, dtype=float)
+                rank = int(np.sum(ratios >= ratio_treat))
+                p_value = rank / len(ratios)
+                bands = {
+                    "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                    "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                    "full": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                    "post_ATT": post_ci_df,
+                    "__meta__": {
+                        "origin": "permutation",
+                        "mode": mode,
+                        "kind": "permutation",
+                        "level": int(100 * (1.0 - alpha_level)),
+                        "n_placebos": len(ratios) - 1,
+                        "p_value": float(p_value),
+                        "rmspe_ratio_treat": float(ratio_treat),
+                        "estimator": "sc",
+                    },
+                }
+                boot_info = {"method": "permutation", "p_value": float(p_value), "rmspe_ratios": ratios.tolist(), "n_placebos": len(ratios) - 1}
             else:
                 # ----- Bootstrap variance estimation -----
                 att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)

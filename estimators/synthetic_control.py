@@ -589,6 +589,9 @@ class SyntheticControl:
                     _w.warn(f"SC bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
                     att_tau_star = att_tau_star[:, :filled]
 
+                if filled == 0:
+                    raise RuntimeError("SC bootstrap failed: 0 successful draws. Check data/resampling settings.")
+
                 if filled > 1:
                     se_vals = bt.bootstrap_se(att_tau_star)
                     se_series = pd.Series(se_vals, index=tau_grid)

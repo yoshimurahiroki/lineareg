@@ -251,7 +251,7 @@ def _solve_qr_lp_prepared(
     This reuses the constraint matrices and bounds across draws and only
     updates the objective c per call, reducing Python overhead. Numerical
     results are identical to `_solve_qr_lp`.
-    
+
     Parameters
     ----------
     raise_on_failure : bool, default True
@@ -1168,21 +1168,34 @@ class QR(BaseEstimator):
                 policy="boottest",
                 enumeration_mode="boottest",
             )
+        effective_dist = boot.dist
         if isinstance(boot.dist, str):
             dist_norm = str(boot.dist).strip().lower().replace("-", "").replace("_", "")
             if dist_norm in {"11", "13", "31", "33", "33j"}:
-                msg = (
-                    "Quantile regression only supports positive-weight Exp(1) multiplier bootstrap or WGB."
-                    " MNW variants (11/13/31/33/33j) are not supported for QR."
+                import warnings as _w
+                _w.warn(
+                    f"QR: MNW variant '{boot.dist}' not supported; falling back to dist='exp'.",
+                    RuntimeWarning, stacklevel=2,
                 )
-                raise ValueError(msg)
-            if dist_norm in {"rademacher", "mammen", "webb"}:
-                msg = (
-                    "QR bootstrap requires nonnegative weights. "
-                    f"dist='{boot.dist}' can produce negative values which make the LP unbounded. "
-                    "Use dist='exp' (recommended) or dist='wgb' with cluster_ids."
+                effective_dist = "exp"
+            elif dist_norm in {"rademacher", "mammen", "webb"}:
+                import warnings as _w
+                _w.warn(
+                    f"QR: dist='{boot.dist}' produces negative weights incompatible with LP; falling back to dist='exp'.",
+                    RuntimeWarning, stacklevel=2,
                 )
-                raise ValueError(msg)
+                effective_dist = "exp"
+        boot = BootConfig(
+            dist=effective_dist if effective_dist not in {"rademacher", "mammen", "webb"} else "exp",
+            n_boot=boot.n_boot,
+            seed=boot.seed,
+            cluster_ids=boot.cluster_ids,
+            space_ids=boot.space_ids,
+            time_ids=boot.time_ids,
+            multiway_ids=boot.multiway_ids,
+            policy=getattr(boot, "policy", "boottest"),
+            enumeration_mode=getattr(boot, "enumeration_mode", "boottest"),
+        )
 
         B = boot.n_boot
         if boot.dist == "wgb":

@@ -718,6 +718,8 @@ class WildDist:
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return f"WildDist({self.name!r})"
 
+    _ALLOWED_DISTS = frozenset({"rademacher", "rad", "webb", "mammen", "normal", "gaussian", "standard_normal"})
+
     def draw(
         self,
         size: tuple[int, int],
@@ -728,6 +730,9 @@ class WildDist:
         """Draw an (R x C) array of multipliers using an external RNG if provided.
         All supported distributions are centered (mean 0) with unit variance.
         """
+        if self.name not in self._ALLOWED_DISTS:
+            msg = f"Unknown wild distribution: '{self.name}'. Allowed: {sorted(self._ALLOWED_DISTS)}"
+            raise ValueError(msg)
         rng = rng or np.random.default_rng(seed)
         r, c = size
         if self.name in {"rademacher", "rad"}:
@@ -758,7 +763,7 @@ class WildDist:
         if self.name == "exp":
             msg = "Exponential distribution is not supported for wild multipliers; use only for WGB-specific methods."
             raise ValueError(msg)
-        # default: Mammen two-point (mean 0, var 1)
+        # Mammen two-point (mean 0, var 1)
         a = (1.0 - np.sqrt(5.0)) / 2.0
         b = (1.0 + np.sqrt(5.0)) / 2.0
         pa = (np.sqrt(5.0) + 1.0) / (2.0 * np.sqrt(5.0))
@@ -3001,7 +3006,8 @@ def sparse_bootstrap_meat(
     return meat
 
 
-def resample_units_block(df: pd.DataFrame, id_name: str, rng: np.random.Generator) -> pd.DataFrame:
+def resample_units_block(df, id_name: str, rng: np.random.Generator):
+    import pandas as pd
     ids = pd.Index(df[id_name].unique())
     n = int(ids.size)
     draw = rng.choice(ids.to_numpy(), size=n, replace=True)

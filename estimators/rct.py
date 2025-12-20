@@ -662,7 +662,7 @@ class RCT:
         elif len(var_names) != Xv.shape[1]:
             raise ValueError("var_names length mismatch with X columns.")
 
-        # Default contrasts: binary case a∈{0,1} -> 1 vs {0}, overall, both estimators, targets {ATE, ATT}
+        # Default contrasts: binary case a∈{0,1} -> 1 vs {0}, overall, RA only (IPW requires p), targets {ATE, ATT}
         if contrasts is None:
             arms = np.unique(av)
             if arms.size != 2:
@@ -675,7 +675,7 @@ class RCT:
                     "control_arms": control_default,
                     "strata_subset": None,
                     "by_stratum": False,
-                    "estimators": ["ra", "ipw"],
+                    "estimators": ["ra"],
                     "targets": ["ate", "att"],
                     "name": f"{treat_default}_vs_{'+'.join(map(str, control_default))}",
                 },
@@ -756,7 +756,7 @@ class RCT:
             treat_arm = cc["treat_arm"]
             control_arms = cc.get("control_arms", None)
             by_stratum = bool(cc.get("by_stratum", False))
-            estimators = [str(s).lower() for s in cc.get("estimators", ["ra", "ipw"])]
+            estimators = [str(s).lower() for s in cc.get("estimators", ["ra"])]
             targets = [str(t).lower() for t in cc.get("targets", ("ate", "att"))]
             name_prefix = str(
                 cc.get(
@@ -977,7 +977,7 @@ class RCT:
             treat_arm = cc["treat_arm"]
             control_arms = cc.get("control_arms", None)
             by_stratum = bool(cc.get("by_stratum", False))
-            estimators = [str(s).lower() for s in cc.get("estimators", ["ra", "ipw"])]
+            estimators = [str(s).lower() for s in cc.get("estimators", ["ra"])]
             targets = [str(t).lower() for t in cc.get("targets", ("ate", "att"))]
             # strata subset: use numeric strata_codes (not original label strings) so masking
             # remains correct after any trimming/drop operations that changed lengths

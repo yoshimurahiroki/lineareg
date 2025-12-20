@@ -244,10 +244,12 @@ class SDID:
             mode = (getattr(self.boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "placebo"
-            if mode not in {"unit", "placebo", "jackknife"}:
-                raise ValueError("SDID boot mode must be one of {'unit', 'placebo', 'jackknife'}.")
+            if mode == "jackknife":
+                raise ValueError("SDID jackknife is disabled per bootstrap-only inference policy. Use mode='unit' (treated>=2) or mode='placebo'.")
+            if mode not in {"unit", "placebo"}:
+                raise ValueError("SDID boot mode must be 'unit' or 'placebo'.")
             if mode == "unit" and n_treated_total < 2:
-                raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='jackknife'.")
+                raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='placebo'.")
 
             theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
 
@@ -368,6 +370,9 @@ class SDID:
                     _w.warn(f"SDID bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
                     att_tau_star = att_tau_star[:, :filled]
                     att_b = att_b[:filled]
+
+                if filled == 0:
+                    raise RuntimeError("SDID bootstrap failed: 0 successful draws. Check data/resampling settings.")
 
                 boot_info["B"] = filled
                 boot_info["post_ATT_draws"] = att_b

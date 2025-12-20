@@ -456,13 +456,15 @@ class CallawaySantAnnaES:
         group_size: dict[int, int] = {}
 
         # W is aligned to df_aug row order (shared columns across cells)
-        # center columns (finite-sample recentering) and validate variance
+        # center columns (finite-sample recentering) and scale to unit variance (did/DRDID compatible)
         if W is not None:
             W = W - W.mean(axis=0, keepdims=True)
-            if not np.all(np.var(W, axis=0) > 0.0):
+            v = np.var(W, axis=0, ddof=0)
+            if not np.all(v > 0.0):
                 raise ValueError(
                     "bootstrap multipliers have zero-variance column(s) after recentering.",
                 )
+            W = W / np.sqrt(v.reshape(1, -1))
 
         for g, t in cell_keys:
             # select rows for calendar time t and cohort g (treated) vs control (not-yet or never)

@@ -54,13 +54,18 @@ def _frank_wolfe_simplex(
     max_iter: int = 10_000,
     tol: float = 1e-10,
     init: np.ndarray | None = None,
+    V: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Solve min_w 0.5||X w - y||^2  s.t. w in simplex (w>=0, sum w=1) via Frank-Wolfe.
+    """Solve min_w 0.5||V^{1/2}(X w - y)||^2  s.t. w in simplex (w>=0, sum w=1) via Frank-Wolfe.
 
     Returns weights w on the simplex. Deterministic (no randomness).
+    If V is provided (diagonal weights), applies V^{1/2} weighting to the objective.
     """
     T, J = X.shape
-    # start at best single donor
+    if V is not None:
+        sqrt_V = np.sqrt(np.asarray(V, dtype=np.float64).reshape(-1))
+        X = X * sqrt_V.reshape(-1, 1)
+        y = y * sqrt_V
     if init is None:
         errs = np.sum((X - y.reshape(T, 1)) ** 2, axis=0)
         j0 = int(np.argmin(errs))
@@ -74,8 +79,8 @@ def _frank_wolfe_simplex(
 
     Xw = la.dot(X, w)
     for _ in range(int(max_iter)):
-        g = la.dot(X.T, (Xw - y))  # gradient
-        j = int(np.argmin(g))  # FW vertex
+        g = la.dot(X.T, (Xw - y))
+        j = int(np.argmin(g))
         e = np.zeros(J, dtype=np.float64)
         e[j] = 1.0
         d = e - w
@@ -106,6 +111,45 @@ def _frank_wolfe_simplex(
     return w
 
 
+def _optimize_V_nested(
+    X_pred_treat: np.ndarray,
+    X_pred_donors: np.ndarray,
+    Y_pre_treat: np.ndarray,
+    Y_pre_donors: np.ndarray,
+    *,
+    max_iter_fw: int = 10_000,
+    tol_fw: float = 1e-10,
+    max_iter_v: int = 500,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Optimize V (predictor importance weights) via nested MSPE minimization.
+
+    Outer: minimize pre-period outcome MSPE over V (diagonal, sum-to-one via softmax)
+    Inner: for each V, solve simplex LS for w using Frank-Wolfe
+    """
+    from scipy.optimize import minimize
+    K = X_pred_treat.shape[0]
+    T_pre = Y_pre_treat.shape[0]
+    J = X_pred_donors.shape[1]
+
+    def _inner_w(v_diag: np.ndarray) -> np.ndarray:
+        return _frank_wolfe_simplex(
+            X_pred_donors.T, X_pred_treat, max_iter=max_iter_fw, tol=tol_fw, V=v_diag,
+        )
+
+    def _mspe_pre(u: np.ndarray) -> float:
+        v_diag = np.exp(u) / np.sum(np.exp(u))
+        w = _inner_w(v_diag)
+        synth_pre = la.dot(Y_pre_donors.T, w)
+        return float(np.mean((Y_pre_treat - synth_pre) ** 2))
+
+    u0 = np.zeros(K, dtype=np.float64)
+    res = minimize(_mspe_pre, u0, method="Nelder-Mead", options={"maxiter": max_iter_v})
+    u_opt = res.x
+    v_opt = np.exp(u_opt) / np.sum(np.exp(u_opt))
+    w_opt = _inner_w(v_opt)
+    return v_opt, w_opt
+
+
 @dataclass
 class _Spec:
     id_name: str
@@ -133,6 +177,9 @@ class SyntheticControl:
         Maximum Frank-Wolfe iterations for simplex LS on pre-period.
     tol : float, default 1e-10
         Tolerance for Frank-Wolfe line-search / convergence.
+    v_mode : str, default "identity"
+        V matrix mode for predictor weighting: "identity" (no weighting, current default),
+        "nested" (optimize V via pre-MSPE minimization, Abadie-compatible).
 
     """
 
@@ -148,12 +195,16 @@ class SyntheticControl:
         alpha: float = 0.05,
         max_iter: int = 10_000,
         tol: float = 1e-10,
+        v_mode: str = "identity",
     ) -> None:
         # Allow either treat_name or cohort_name for API parity with event-study estimators
         if treat_name is None and cohort_name is None:
             raise TypeError(
                 "Provide either treat_name or cohort_name for SyntheticControl.",
             )
+        if v_mode not in {"identity", "nested"}:
+            raise ValueError("v_mode must be 'identity' or 'nested'")
+        self.v_mode = v_mode
         # Default treat column name when deriving from cohort
         treat_col = "treat" if treat_name is None else str(treat_name)
         self.spec = _Spec(
@@ -281,47 +332,47 @@ class SyntheticControl:
         tau_union: set[int] = set()
 
         for g, treated_units in cohorts.items():
-            # Pre/post masks for this cohort
             t0_col = t_to_col[g]
-            pre = np.arange(0, t0_col)  # strictly before g
-            post = np.arange(t0_col, len(times))  # at/after g
+            pre = np.arange(0, t0_col)
+            post = np.arange(t0_col, len(times))
 
             if pre.size == 0:
-                # Skip cohorts with no pre-treatment periods
                 continue
 
-            # For each treated unit in this cohort, fit synthetic control
             att_paths_g = []
             for treated_id in treated_units:
                 i_treated = id_to_row[treated_id]
 
-                # Design matrices for this treated unit
                 y_pre = Y[i_treated, pre].astype(np.float64)
-                X_pre = Y[j_donors][:, pre].T.astype(np.float64)  # T_pre x J
+                X_pre = Y[j_donors][:, pre].T.astype(np.float64)
+                Y_pre_donors = Y[j_donors][:, pre].astype(np.float64)
 
-                # Fit simplex weights by Frank-Wolfe on pre-period
-                w = _frank_wolfe_simplex(
-                    X_pre, y_pre, max_iter=self.max_iter, tol=self.tol,
-                )
+                if self.v_mode == "nested":
+                    _, w = _optimize_V_nested(
+                        y_pre, X_pre.T,
+                        y_pre, Y_pre_donors,
+                        max_iter_fw=self.max_iter,
+                        tol_fw=self.tol,
+                    )
+                else:
+                    w = _frank_wolfe_simplex(
+                        X_pre, y_pre, max_iter=self.max_iter, tol=self.tol,
+                    )
 
-                # Treated and synthetic series across all times
                 y_treated = Y[i_treated, :].astype(np.float64)
                 X_all = Y[j_donors, :].T.astype(np.float64)
                 y_synth = la.dot(X_all, w)
-                att_path = y_treated - y_synth  # absolute-time path
+                att_path = y_treated - y_synth
                 att_paths_g.append(att_path)
 
-            # Average ATT path across all treated units in this cohort
             att_path_g = np.mean(att_paths_g, axis=0)
 
-            # Store cohort results
             results_g[g] = {
                 "att_path": att_path_g,
                 "n_treated": len(treated_units),
                 "treated_ids": treated_units,
             }
 
-            # Build event-time union
             for t_val in times:
                 tau_val = int(t_val) - int(g)
                 tau_union.add(tau_val)

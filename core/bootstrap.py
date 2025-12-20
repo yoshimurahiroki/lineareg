@@ -1426,6 +1426,7 @@ def _sup_t_distribution_internal(  # noqa: PLR0913
     studentize: str = "bootstrap",
     zero_se_tol: float = 1e-12,
     zero_se_rel: float = 1e-12,
+    scale: str = "sd",
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], float]:
     """Compute sup-t bootstrap studentization objects from bootstrap draws.
 
@@ -1438,6 +1439,12 @@ def _sup_t_distribution_internal(  # noqa: PLR0913
     The function is intentionally conservative and raises if bootstrap standard
     errors are non-finite or below the specified floors. This avoids any
     dependence on analytic VCVs when callers request bootstrap studentization.
+
+    Parameters
+    ----------
+    scale : str, default "sd"
+        Scale estimator for studentization: "sd" uses sample standard deviation
+        (ddof=1), "iqr" uses IQR normalized to Gaussian scale (did/DRDID compatible).
     """
     th = np.asarray(theta, dtype=np.float64).reshape(-1)
     thb = np.asarray(theta_star, dtype=np.float64)
@@ -1453,8 +1460,15 @@ def _sup_t_distribution_internal(  # noqa: PLR0913
         msg = "sup_t_distribution currently supports only studentize='bootstrap'."
         raise ValueError(msg)
 
-    # Compute bootstrap SEs (unbiased sample std with ddof=1 when B>1)
-    se = np.std(thb, axis=1, ddof=1) if B > 1 else np.zeros((K,), dtype=np.float64)
+    if scale == "iqr":
+        from scipy import stats
+        iqr_norm = stats.norm.ppf(0.75) - stats.norm.ppf(0.25)
+        se = np.zeros((K,), dtype=np.float64)
+        for k in range(K):
+            iqr_val = float(np.percentile(thb[k, :], 75) - np.percentile(thb[k, :], 25))
+            se[k] = iqr_val / iqr_norm if iqr_norm > 0 else 0.0
+    else:
+        se = np.std(thb, axis=1, ddof=1) if B > 1 else np.zeros((K,), dtype=np.float64)
 
     floor = max(
         zero_se_tol, zero_se_rel * float(np.max(np.abs(se)) if se.size else 0.0),
@@ -1525,6 +1539,7 @@ def uniform_confidence_band(  # noqa: PLR0913
     zero_se_rel: float = 1e-12,
     context: str | None = None,
     family: Sequence[Sequence[int]] | None = None,
+    scale: str = "sd",
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Sup-t uniform confidence band for a vector of parameters from bootstrap replicates.
 
@@ -1563,6 +1578,7 @@ def uniform_confidence_band(  # noqa: PLR0913
         studentize=studentize,
         zero_se_tol=zero_se_tol,
         zero_se_rel=zero_se_rel,
+        scale=scale,
     )
     # If RCT, allow `family` to partition coordinates into hypothesis families.
     # family: iterable of index sequences; compute per-draw family-wise sup|T|

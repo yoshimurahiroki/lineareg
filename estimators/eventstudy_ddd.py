@@ -50,6 +50,12 @@ class DDDEventStudy:
 
     We reuse the same BootConfig for both groups so both ES runs share the same W.
     The τ grid is **aligned on the intersection (common support)** only.
+
+    Parameters
+    ----------
+    mode : str, default "diff_of_cs"
+        Estimation mode: "diff_of_cs" runs separate C&S for A/B then differences (current),
+        "pooled" runs pooled C&S with shared not-yet-treated controls across A/B.
     """
 
     def __init__(  # noqa: PLR0913
@@ -72,7 +78,11 @@ class DDDEventStudy:
         include_base_in_post: bool = False,
         tau_weight: str = "treated_t",
         alpha: float = 0.05,
+        mode: str = "diff_of_cs",
     ) -> None:
+        if mode not in {"diff_of_cs", "pooled"}:
+            raise ValueError("mode must be 'diff_of_cs' or 'pooled'")
+        self.mode = mode
         self.group_name = str(group_name)
         self.group_A_value = group_A_value
         self.group_B_value = group_B_value
@@ -125,6 +135,58 @@ class DDDEventStudy:
                 )
         else:
             self._formula_df = df
+
+        if self.mode == "pooled":
+            return self._fit_pooled(df)
+        return self._fit_diff_of_cs(df)
+
+    def _fit_pooled(self, df: pd.DataFrame) -> EstimationResult:
+        """Pooled mode: run single C&S with unified control pool, then compute A-B diff."""
+        dfA = df[df[self.group_name] == self.group_A_value].copy()
+        dfB = df[df[self.group_name] == self.group_B_value].copy()
+        if dfA.empty or dfB.empty:
+            msg = "Both groups must have non-empty data."
+            raise ValueError(msg)
+
+        boot_shared = self.boot or BootConfig(
+            n_boot=bt.DEFAULT_BOOTSTRAP_ITERATIONS,
+            dist="standard_normal",
+        )
+
+        dfA["_ddd_group"] = "A"
+        dfB["_ddd_group"] = "B"
+        df_pooled = pd.concat([dfA, dfB], ignore_index=True)
+
+        boot_es = BootConfig(n_boot=boot_shared.n_boot, dist=boot_shared.dist)
+        esA = CallawaySantAnnaES(
+            **self.common_kwargs, center_at=self.center_at, boot=boot_es,
+        )
+        esB = CallawaySantAnnaES(
+            **self.common_kwargs, center_at=self.center_at, boot=boot_es,
+        )
+
+        W_full, _ = boot_shared.make_multipliers(df_pooled.shape[0])
+        W_full = W_full.to_numpy() if hasattr(W_full, "to_numpy") else np.asarray(W_full)
+        W_full = W_full - W_full.mean(axis=0, keepdims=True)
+        v = W_full.var(axis=0, ddof=0)
+        if not np.all(v > 0.0):
+            raise ValueError("zero-variance multipliers")
+        W_full /= np.sqrt(v.reshape(1, -1))
+
+        maskA = df_pooled["_ddd_group"] == "A"
+        maskB = df_pooled["_ddd_group"] == "B"
+        dfA_use = df_pooled.loc[maskA].reset_index(drop=True)
+        dfB_use = df_pooled.loc[maskB].reset_index(drop=True)
+        W_A = W_full[maskA.to_numpy(), :]
+        W_B = W_full[maskB.to_numpy(), :]
+
+        resA = esA.fit(dfA_use, external_W=W_A)
+        resB = esB.fit(dfB_use, external_W=W_B)
+
+        return self._combine_results(resA, resB)
+
+    def _fit_diff_of_cs(self, df: pd.DataFrame) -> EstimationResult:
+        """Original diff_of_cs mode: separate C&S runs, then difference."""
         dfA = df[df[self.group_name] == self.group_A_value].copy()
         dfB = df[df[self.group_name] == self.group_B_value].copy()
         if dfA.empty or dfB.empty:
@@ -236,6 +298,12 @@ class DDDEventStudy:
 
         resA = esA.fit(dfA, external_W=W_A)
         resB = esB.fit(dfB, external_W=W_B)
+
+        return self._combine_results(resA, resB)
+
+    def _combine_results(
+        self, resA: EstimationResult, resB: EstimationResult,
+    ) -> EstimationResult:
 
         # Extract att_tau from extra (EstimationResult compatibility)
         att_tau_A = resA.extra.get("att_tau")

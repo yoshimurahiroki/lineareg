@@ -528,8 +528,8 @@ class CallawaySantAnnaES:
                 cov_at_t0 = df_aug.loc[df_aug[self.t_name] == int(t0), cov_cols]
                 cov_base_map[int(t0)] = cov_at_t0.drop_duplicates(subset=[self.id_name]).set_index(self.id_name)
 
-        # group size map for tau aggregation (treated count per cohort)
-        group_size: dict[int, int] = {}
+        # group_size is computed later (line ~809) after exclusion filters;
+        # prior accumulation code was removed as it was shadowed.
 
         # W is aligned to df_aug row order (shared columns across cells)
         # center columns (finite-sample recentering) and scale to unit variance (did/DRDID compatible)
@@ -574,7 +574,7 @@ class CallawaySantAnnaES:
             n0 = int(Dg.size - n1)
             if n1 == 0 or n0 == 0:
                 continue
-            group_size[g] = group_size.get(g, 0) + n1
+            # NOTE: group_size is computed later after cohort exclusion filters (line ~807)
 
             dY = sub["_dY"].to_numpy(dtype=float).reshape(-1)
 

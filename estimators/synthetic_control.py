@@ -574,7 +574,29 @@ class SyntheticControl:
                         if mode == "unit":
                             n_units = Y.shape[0]
                             mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
-                            Y_cf = np.copy(Y)
+                            Y_cf = np.zeros_like(Y)
+                            # --- LOO counterfactuals for donors ---
+                            # Average weights across all treated units to get a single omega
+                            # Then compute LOO synthetic for each donor
+                            all_weights = []
+                            for g, meta in results_g.items():
+                                for w in meta.get("weights", []):
+                                    all_weights.append(np.asarray(w, dtype=float))
+                            n_donors_boot = j_donors.size
+                            if len(all_weights) > 0 and n_donors_boot >= 2:
+                                omega_avg = np.mean(all_weights, axis=0)
+                                for j_local in range(n_donors_boot):
+                                    j_global = j_donors[j_local]
+                                    mask = np.ones(n_donors_boot, dtype=bool)
+                                    mask[j_local] = False
+                                    omega_loo = omega_avg[mask]
+                                    omega_sum = omega_loo.sum()
+                                    if omega_sum > 1e-12:
+                                        omega_loo_norm = omega_loo / omega_sum
+                                        Y_donors_loo = Y[j_donors[mask], :]
+                                        y_cf_j = np.average(Y_donors_loo, axis=0, weights=omega_loo_norm)
+                                        Y_cf[j_global, :] = y_cf_j
+                            # --- Treated unit counterfactuals ---
                             for g, meta in results_g.items():
                                 y_synth_list = meta.get("y_synth", [])
                                 row_ids = meta.get("treated_row_ids", [])

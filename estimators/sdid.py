@@ -216,6 +216,7 @@ class SDID:
                 "delta_t": delta_gt,
                 "y_tr": y_tr_mean,
                 "y_sc": y_co_omega,
+                "donors_idx": donors_idx,  # indices into Y for donors
             }
 
         # Aggregate across cohorts in event time τ = t - g
@@ -302,6 +303,34 @@ class SDID:
                             n_units = Y.shape[0]
                             mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
                             Y_cf = np.zeros_like(Y)
+                            # --- LOO counterfactuals for donors ---
+                            # For each cohort, compute LOO synthetic for each donor
+                            # Y_cf_j = sum(omega_k * Y_k for k != j) / sum(omega_k for k != j)
+                            # This is aggregated across cohorts using inverse-variance-like weighting
+                            donor_cf_count = np.zeros(n_units, dtype=float)
+                            donor_cf_sum = np.zeros_like(Y)
+                            for g, meta in results_g.items():
+                                omega_g = np.asarray(meta["omega"], dtype=float)
+                                donors_idx_g = np.asarray(meta["donors_idx"], dtype=int)
+                                n_donors = len(donors_idx_g)
+                                if n_donors < 2:
+                                    continue  # Cannot compute LOO with fewer than 2 donors
+                                # For each donor j, compute LOO synthetic outcome
+                                for j_local, j_global in enumerate(donors_idx_g):
+                                    mask = np.ones(n_donors, dtype=bool)
+                                    mask[j_local] = False
+                                    omega_loo = omega_g[mask]
+                                    omega_sum = omega_loo.sum()
+                                    if omega_sum > _EPS:
+                                        omega_loo_norm = omega_loo / omega_sum
+                                        Y_donors_loo = Y[donors_idx_g[mask], :]
+                                        y_cf_j = np.average(Y_donors_loo, axis=0, weights=omega_loo_norm)
+                                        donor_cf_sum[j_global, :] += y_cf_j
+                                        donor_cf_count[j_global] += 1.0
+                            # Finalize donor counterfactuals (average across cohorts if overlapping)
+                            donor_mask = donor_cf_count > 0.5
+                            Y_cf[donor_mask, :] = donor_cf_sum[donor_mask, :] / donor_cf_count[donor_mask, None]
+                            # --- Treated unit counterfactuals (original logic) ---
                             for g, meta in results_g.items():
                                 idx_tr = cohorts[g]
                                 y_sc_g = meta["y_sc"]

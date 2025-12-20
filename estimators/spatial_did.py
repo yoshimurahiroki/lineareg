@@ -112,6 +112,8 @@ class SpatialDID:
         W: la.Matrix,
         row_normalized: bool = True,
         center_at: int = -1,
+        anticipation: int = 0,
+        base_period: str = "varying",
         boot: BootConfig | None = None,
         cluster_ids: Sequence | None = None,
         space_ids: Sequence | None = None,
@@ -130,10 +132,13 @@ class SpatialDID:
         self.y_name = str(y_name)
         self.event_time_name = None if event_time_name is None else str(event_time_name)
         self.W = W
-        # row_normalized=True  -> assume W is already row-normalized (no action)
-        # row_normalized=False -> perform one row-normalization inside fit()
         self.row_normalized = bool(row_normalized)
         self.center_at = int(center_at)
+        self.anticipation = int(anticipation)
+        base_period_norm = str(base_period).lower()
+        if base_period_norm not in {"varying", "universal"}:
+            raise ValueError("base_period must be 'varying' or 'universal'")
+        self.base_period = base_period_norm
 
         self.boot = boot
         self.cluster_ids = cluster_ids

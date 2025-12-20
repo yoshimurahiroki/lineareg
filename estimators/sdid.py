@@ -69,6 +69,8 @@ class SDID:
         y_name: str,
         cohort_name: str = "g",
         control_group: str = "never",
+        anticipation: int = 0,
+        base_period: str = "varying",
         eta_omega: float | None = None,
         eta_lambda: float = 1e-6,
         boot: BootConfig | None = None,
@@ -84,6 +86,11 @@ class SDID:
         self.y_name = str(y_name)
         self.cohort_name = str(cohort_name)
         self.control_group = str(control_group)
+        self.anticipation = int(anticipation)
+        base_period_norm = str(base_period).lower()
+        if base_period_norm not in {"varying", "universal"}:
+            raise ValueError("base_period must be 'varying' or 'universal'")
+        self.base_period = base_period_norm
         self.eta_omega = None if eta_omega is None else float(eta_omega)
         self.eta_lambda = float(eta_lambda)
         self.boot = boot
@@ -294,8 +301,24 @@ class SDID:
                         if mode == "unit":
                             n_units = Y.shape[0]
                             mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
-                            Y_centered = Y - Y.mean(axis=0, keepdims=True)
-                            Y_b = Y.mean(axis=0, keepdims=True) + Y_centered * mult[:, None]
+                            Y_cf = np.zeros_like(Y)
+                            for g, meta in results_g.items():
+                                idx_tr = cohorts[g]
+                                y_sc_g = meta["y_sc"]
+                                lam_g = meta["lambda"]
+                                pre_g = times < g
+                                diff_pre = meta["y_tr"][pre_g] - y_sc_g[pre_g]
+                                bias_g = float(la.dot(lam_g, diff_pre))
+                                Y_cf[idx_tr, :] = y_sc_g + bias_g
+                            att_hat_full = np.zeros_like(Y)
+                            for g, meta in results_g.items():
+                                idx_tr = cohorts[g]
+                                post_g = times >= g
+                                delta_g = meta["delta_t"]
+                                att_hat_full[idx_tr[:, None] & post_g[None, :]] = np.tile(delta_g[post_g], (idx_tr.sum(), 1)).ravel()
+                            U_hat = Y - Y_cf
+                            U_hat[W > 0] -= att_hat_full[W > 0]
+                            Y_b = Y_cf + att_hat_full * (W > 0).astype(float) + U_hat * mult[:, None]
                             W_b = W.copy()
                             units_b, times_b = _units, times
                         else:  # mode == "placebo"

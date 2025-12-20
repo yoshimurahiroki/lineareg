@@ -3007,16 +3007,10 @@ def sparse_bootstrap_meat(
 
 
 def resample_units_block(df, id_name: str, rng: np.random.Generator):
-    import pandas as pd
-    ids = pd.Index(df[id_name].unique())
-    n = int(ids.size)
-    draw = rng.choice(ids.to_numpy(), size=n, replace=True)
-    parts = []
-    for j, orig in enumerate(draw):
-        tmp = df.loc[df[id_name] == orig].copy()
-        tmp[id_name] = j
-        parts.append(tmp)
-    return pd.concat(parts, ignore_index=True)
+    raise RuntimeError(
+        "Policy violation: pairs/block resampling bootstrap is forbidden in lineareg. "
+        "Use wild/multiplier bootstrap or placebo/permutation depending on estimator."
+    )
 
 
 def unit_multipliers(

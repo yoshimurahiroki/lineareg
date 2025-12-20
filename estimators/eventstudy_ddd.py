@@ -71,6 +71,8 @@ class DDDEventStudy:
         event_time_name: str | None = None,
         control_group: str = "nevertreated",
         center_at: int = -1,
+        anticipation: int = 0,
+        base_period: str = "varying",
         boot: BootConfig | None = None,
         cluster_ids: Sequence | None = None,
         space_ids: Sequence | None = None,
@@ -91,6 +93,11 @@ class DDDEventStudy:
         self.cohort_name = str(cohort_name)
         self.y_name = str(y_name)
         self.event_time_name = None if event_time_name is None else str(event_time_name)
+        self.anticipation = int(anticipation)
+        base_period_norm = str(base_period).lower()
+        if base_period_norm not in {"varying", "universal"}:
+            raise ValueError("base_period must be 'varying' or 'universal'")
+        self.base_period = base_period_norm
 
         # Normalize control_group to canonical forms accepted by CallawaySantAnnaES
         _cg = str(control_group).lower().replace("-", "")
@@ -103,7 +110,6 @@ class DDDEventStudy:
                 "control_group must be 'never' or 'notyet' (R/Stata compatible).",
             )
 
-        # only pass arguments strictly accepted by CallawaySantAnnaES
         self.common_kwargs = {
             "id_name": self.id_name,
             "t_name": self.t_name,
@@ -111,6 +117,8 @@ class DDDEventStudy:
             "y_name": self.y_name,
             "event_time_name": self.event_time_name,
             "control_group": _cg,
+            "anticipation": self.anticipation,
+            "base_period": self.base_period,
         }
         self.center_at = int(center_at)
         self.include_base_in_post = bool(include_base_in_post)

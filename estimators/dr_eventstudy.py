@@ -58,6 +58,20 @@ def _event_tau(t, g, t2pos: dict) -> int:
     return t2pos[t] - t2pos[g]
 
 
+def _prev_time(t, times_sorted):
+    idx = np.searchsorted(times_sorted, t) - 1
+    if idx < 0:
+        return None
+    return times_sorted[idx]
+
+
+def _pret_for_cohort(g, times_sorted, anticipation: int = 0):
+    candidates = [t for t in times_sorted if t + anticipation < g]
+    if len(candidates) == 0:
+        return None
+    return candidates[-1]
+
+
 class DREventStudy:
     """Doubly-robust DR-DID event-study with cross-fitting and IF multiplier bootstrap.
 
@@ -82,6 +96,8 @@ class DREventStudy:
         event_time_name: str | None = None,
         control_group: str = "notyet",
         base_tau: int = -1,
+        anticipation: int = 0,
+        base_period: str = "varying",
         method: str = "dr",
         ps_learner=None,
         or_learner=None,
@@ -95,13 +111,8 @@ class DREventStudy:
         space_ids: Sequence | None = None,
         time_ids: Sequence | None = None,
         pihat: np.ndarray | None = None,
-        # --- PATCH: τ aggregation weight choice (R did::aggte wtype compatibility) ---
-        # alias: {"equal","group","treated_t"}
         tau_weight: str = "group",
-        # --- PATCH: PS trimming options ---
-        # trim_ps: fraction in (0,0.5) for two-sided trimming when trim_mode='drop'
         trim_ps: float = 0.0,
-        # trim_mode: "clip" (default) or "drop" (remove observations outside [α,1-α])
         trim_mode: str = "clip",
     ) -> None:
         self.id_name = str(id_name)
@@ -117,6 +128,11 @@ class DREventStudy:
             )
         self.control_group = control_group
         self.base_tau = int(base_tau)
+        self.anticipation = int(anticipation)
+        base_period_norm = str(base_period).lower()
+        if base_period_norm not in {"varying", "universal"}:
+            raise ValueError("base_period must be 'varying' or 'universal'")
+        self.base_period = base_period_norm
         self.alpha = float(alpha)
         method = method.lower().strip()
         if method not in {"dr", "ipw"}:
@@ -244,8 +260,11 @@ class DREventStudy:
             event_time_name=self.event_time_name,
             control_group=self.control_group,
             center_at=self.base_tau,
+            anticipation=self.anticipation,
+            base_period=self.base_period,
         )
-        df_aug, cell_keys, _ = build_cells(df_aug, spec)
+        df_aug, cell_keys, cell_meta = build_cells(df_aug, spec)
+        pret_map = cell_meta.get("pret_map", {})
 
         # Precompute base-period level mappings for constructing long-differences
         df_sorted = df_aug.sort_values([self.id_name, self.t_name])
@@ -382,18 +401,23 @@ class DREventStudy:
         gcol_all = df_aug[self.cohort_name].astype(int).to_numpy()
         tcol_all = df_aug[self.t_name].astype(int).to_numpy()
 
-        for g, t in cell_keys:
+        for cell_key in cell_keys:
+            if len(cell_key) == 3:
+                g, t, base_time = cell_key
+            else:
+                g, t = cell_key
+                base_time = int(g) - 1
+            base_time = int(base_time)
             mask_t = tcol_all == int(t)
-            ctrl_mask = spec.control_mask(df_aug, int(g), int(t))
+            ctrl_mask = spec.control_mask(df_aug, int(g), int(t), base_time, times_all)
             mask_cell = mask_t & ((gcol_all == int(g)) | ctrl_mask)
             sub = df_aug.loc[mask_cell, :].copy()
             if sub.shape[0] == 0:
                 skipped.append((int(g), int(t), "empty cell"))
                 continue
 
-            base_time = int(g) - 1
             if base_time not in base_map:
-                skipped.append((int(g), int(t), "no base period g-1"))
+                skipped.append((int(g), int(t), "no base period"))
                 continue
             sub["_Ybase"] = sub[self.id_name].map(base_map[base_time])
             sub["_dY"] = sub[self.y_name].to_numpy(dtype=np.float64) - sub[

@@ -202,6 +202,8 @@ class SyntheticControl:
         max_iter: int = 10_000,
         tol: float = 1e-10,
         v_mode: str = "identity",
+        anticipation: int = 0,
+        base_period: str = "varying",
     ) -> None:
         # Allow either treat_name or cohort_name for API parity with event-study estimators
         if treat_name is None and cohort_name is None:
@@ -210,7 +212,11 @@ class SyntheticControl:
             )
         if v_mode not in {"identity", "nested"}:
             raise ValueError("v_mode must be 'identity' or 'nested'")
+        if base_period not in {"varying", "universal"}:
+            raise ValueError("base_period must be 'varying' or 'universal'")
         self.v_mode = v_mode
+        self.anticipation = int(anticipation)
+        self.base_period = str(base_period)
         # Default treat column name when deriving from cohort
         treat_col = "treat" if treat_name is None else str(treat_name)
         self.spec = _Spec(
@@ -372,14 +378,17 @@ class SyntheticControl:
                 y_synth = la.dot(X_all, w)
                 att_path = y_treated - y_synth
                 att_paths_g.append(att_path)
+                if "weights" not in results_g.get(g, {}):
+                    results_g[g] = {"weights": [], "y_synth": [], "treated_row_ids": []}
+                results_g[g]["weights"].append(w)
+                results_g[g]["y_synth"].append(y_synth)
+                results_g[g]["treated_row_ids"].append(i_treated)
 
             att_path_g = np.mean(att_paths_g, axis=0)
 
-            results_g[g] = {
-                "att_path": att_path_g,
-                "n_treated": len(treated_units),
-                "treated_ids": treated_units,
-            }
+            results_g[g]["att_path"] = att_path_g
+            results_g[g]["n_treated"] = len(treated_units)
+            results_g[g]["treated_ids"] = treated_units
 
             for t_val in times:
                 tau_val = _event_tau(t_val, g, t2pos)
@@ -565,8 +574,15 @@ class SyntheticControl:
                         if mode == "unit":
                             n_units = Y.shape[0]
                             mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
-                            Y_centered = Y - Y.mean(axis=0, keepdims=True)
-                            Y_b = Y.mean(axis=0, keepdims=True) + Y_centered * mult[:, None]
+                            Y_cf = np.copy(Y)
+                            for g, meta in results_g.items():
+                                y_synth_list = meta.get("y_synth", [])
+                                row_ids = meta.get("treated_row_ids", [])
+                                t0_col = t_to_col.get(g, 0)
+                                for i_tr, y_syn in zip(row_ids, y_synth_list):
+                                    Y_cf[i_tr, :] = y_syn
+                            U_hat = Y - Y_cf
+                            Y_b = Y_cf + U_hat * mult[:, None]
                             ids_b, times_b = ids, times
                             cohorts_b = {g: meta["treated_ids"] for g, meta in results_g.items()}
                             donors_b = donors

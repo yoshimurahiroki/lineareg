@@ -61,6 +61,13 @@ def _pret_for_cohort(g, times_sorted, anticipation: int = 0):
     return candidates[-1]
 
 
+def _prev_time(t, times_sorted):
+    idx = np.searchsorted(times_sorted, t) - 1
+    if idx < 0:
+        return None
+    return times_sorted[idx]
+
+
 @dataclass
 class ESCellSpec:
     id_name: str
@@ -73,6 +80,7 @@ class ESCellSpec:
     covariate_names: Sequence[str] | None = None
     cov_method: str = "none"
     anticipation: int = 0
+    base_period: str = "varying"
 
     def control_mask(self, df: pd.DataFrame, g, t, pret, times_sorted) -> np.ndarray:
         cg_normalized = self.control_group.lower().replace("treated", "")
@@ -107,12 +115,22 @@ def build_cells(
             pret = _pret_for_cohort(g, times, spec.anticipation)
             if pret is not None:
                 pret_map[g] = pret
-    cell_keys = [
-        (g, t, pret_map[g])
-        for g in cohorts
-        if g > 0 and g in pret_map
-        for t in times
-    ]
+    cell_keys = []
+    for g in cohorts:
+        if g <= 0 or g not in pret_map:
+            continue
+        pret_g = pret_map[g]
+        t2pos = _time_to_pos(times)
+        g_pos = t2pos.get(g, len(times))
+        for t in times:
+            t_pos = t2pos.get(t, -1)
+            if spec.base_period == "varying" and t_pos < g_pos:
+                base_t = _prev_time(t, times)
+                if base_t is None:
+                    continue
+            else:
+                base_t = pret_g
+            cell_keys.append((g, t, base_t))
     return df_aug, cell_keys, {"times": times, "pret_map": pret_map}
 
 
@@ -287,6 +305,7 @@ class CallawaySantAnnaES:
         control_group: str = "notyet",
         center_at: int = -1,
         anticipation: int = 0,
+        base_period: str = "varying",
         boot: BootConfig | None = None,
         cluster_ids: Sequence | None = None,
         space_ids: Sequence | None = None,
@@ -308,6 +327,10 @@ class CallawaySantAnnaES:
         self.control_group = control_group
         self.center_at = int(center_at)
         self.anticipation = int(anticipation)
+        base_period_norm = str(base_period).lower()
+        if base_period_norm not in {"varying", "universal"}:
+            raise ValueError("base_period must be 'varying' or 'universal'")
+        self.base_period = base_period_norm
         self.alpha = float(alpha)
         self.tau_weight = str(tau_weight).lower()
         if self.tau_weight not in {"group", "equal", "treated_t"}:
@@ -453,6 +476,7 @@ class CallawaySantAnnaES:
             covariate_names=self.covariate_names,
             cov_method=self.cov_method,
             anticipation=self.anticipation,
+            base_period=self.base_period,
         )
 
         df_aug, cell_keys, cell_meta = build_cells(df, spec)

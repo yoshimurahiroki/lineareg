@@ -84,6 +84,9 @@ def _frank_wolfe_simplex(
         e = np.zeros(J, dtype=np.float64)
         e[j] = 1.0
         d = e - w
+        gap = float(-la.dot(d, g))
+        if gap < tol:
+            break
         Xd = la.dot(X, d)
         num = float(la.dot(Xd.T, (Xw - y)))
         den = float(la.dot(Xd.T, Xd))
@@ -95,12 +98,7 @@ def _frank_wolfe_simplex(
             break
         w_new = w + gamma * d
         Xw_new = Xw + gamma * Xd
-        if float(np.linalg.norm(Xw_new - Xw)) < float(tol):
-            w, Xw = w_new, Xw_new
-            break
         w, Xw = w_new, Xw_new
-        if gamma < tol:
-            break
     w = np.maximum(w, 0.0)
     s = float(w.sum())
     if s <= 0.0:
@@ -447,21 +445,7 @@ class SyntheticControl:
                 g0 = list(results_g.keys())[0]
                 t0_col = t_to_col[g0]
                 pre = np.arange(0, t0_col)
-                post = np.arange(t0_col, len(times))
-                treated_ids_list = []
-                for meta in results_g.values():
-                    treated_ids_list.extend(meta["treated_ids"])
-                i_treated = id_to_row[treated_ids_list[0]]
-                y_pre = Y[i_treated, pre].astype(np.float64)
-                X_pre = Y[j_donors][:, pre].T.astype(np.float64)
-                w_fit = _frank_wolfe_simplex(X_pre, y_pre, max_iter=self.max_iter, tol=self.tol)
-                y_treated = Y[i_treated, :].astype(np.float64)
-                X_all = Y[j_donors, :].T.astype(np.float64)
-                y_synth = la.dot(X_all, w_fit)
-                rmspe_pre_treat = float(np.sqrt(np.mean((y_pre - la.dot(X_pre, w_fit)) ** 2)))
-                rmspe_post_treat = float(np.sqrt(np.mean((y_treated[post] - y_synth[post]) ** 2))) if post.size > 0 else 0.0
-                ratio_treat = rmspe_post_treat / rmspe_pre_treat if rmspe_pre_treat > 0 else np.inf
-                ratios = [ratio_treat]
+                att_placebo_list = []
                 for j_idx in j_donors:
                     donors_for_j = np.array([d for d in j_donors if d != j_idx], dtype=int)
                     if donors_for_j.size == 0:
@@ -475,30 +459,79 @@ class SyntheticControl:
                     y_j = Y[j_idx, :].astype(np.float64)
                     X_all_j = Y[donors_for_j, :].T.astype(np.float64)
                     y_synth_j = la.dot(X_all_j, w_j)
-                    rmspe_pre_j = float(np.sqrt(np.mean((y_pre_j - la.dot(X_pre_j, w_j)) ** 2)))
-                    rmspe_post_j = float(np.sqrt(np.mean((y_j[post] - y_synth_j[post]) ** 2))) if post.size > 0 else 0.0
-                    ratio_j = rmspe_post_j / rmspe_pre_j if rmspe_pre_j > 0 else np.inf
-                    ratios.append(ratio_j)
-                ratios = np.array(ratios, dtype=float)
-                rank = int(np.sum(ratios >= ratio_treat))
-                n_placebos = len(ratios) - 1
-                bands = {
-                    "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
-                    "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
-                    "full": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
-                    "post_ATT": post_ci_df,
-                    "__meta__": {
-                        "origin": "permutation",
-                        "mode": mode,
-                        "kind": "permutation",
-                        "level": int(100 * (1.0 - alpha_level)),
-                        "n_placebos": n_placebos,
-                        "rank": int(rank),
-                        "rmspe_ratio_treat": float(ratio_treat),
-                        "estimator": "sc",
-                    },
-                }
-                boot_info = {"method": "permutation", "rank": int(rank), "rmspe_ratios": ratios.tolist(), "n_placebos": n_placebos}
+                    att_path_j = y_j - y_synth_j
+                    att_tau_j = np.full(tau_grid.size, np.nan, dtype=float)
+                    for t_idx, t_val in enumerate(times):
+                        tau_val = int(t_val) - int(g0)
+                        j_tau = np.searchsorted(tau_grid, tau_val)
+                        if j_tau < tau_grid.size and tau_grid[j_tau] == tau_val:
+                            att_tau_j[j_tau] = att_path_j[t_idx]
+                    att_placebo_list.append(att_tau_j)
+                n_placebos = len(att_placebo_list)
+                if n_placebos > 0:
+                    att_placebo = np.column_stack(att_placebo_list)
+                    se_vals = bt.bootstrap_se(att_placebo)
+                    se_series = pd.Series(se_vals, index=tau_grid)
+                    if center_at in se_series.index:
+                        se_series.loc[center_at] = 0.0
+
+                    def _sup_t_band_placebo(mask):
+                        idx = np.flatnonzero(mask)
+                        if idx.size == 0 or n_placebos < 2:
+                            return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                        th = theta_hat[idx]
+                        thb = att_placebo[idx, :]
+                        diffs = thb
+                        se = np.nanstd(diffs, axis=1, ddof=1)
+                        ok = np.isfinite(se) & (se > 0)
+                        if not np.any(ok):
+                            return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                        tdraw = diffs[ok, :] / se[ok, None]
+                        sup_abs = np.nanmax(np.abs(tdraw), axis=0)
+                        sup_abs_valid = sup_abs[np.isfinite(sup_abs)]
+                        if sup_abs_valid.size == 0:
+                            return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                        c = float(bt.finite_sample_quantile(sup_abs_valid, 1.0 - alpha_level))
+                        lo = th.copy(); hi = th.copy()
+                        lo[ok] = th[ok] - c * se[ok]
+                        hi[ok] = th[ok] + c * se[ok]
+                        return pd.DataFrame({"lower": pd.Series(lo, index=tau_grid[idx]), "upper": pd.Series(hi, index=tau_grid[idx])}).sort_index()
+
+                    pre_mask = tau_array < center_at
+                    band_pre = _sup_t_band_placebo(pre_mask)
+                    band_post = _sup_t_band_placebo(mask_post)
+                    band_full = _sup_t_band_placebo(tau_array != center_at)
+                    if np.any(mask_post):
+                        post_placebo = np.nanmean(att_placebo[np.flatnonzero(mask_post), :], axis=0)
+                        post_placebo_valid = post_placebo[np.isfinite(post_placebo)]
+                        post_att_se = float(np.nanstd(post_placebo_valid, ddof=1)) if post_placebo_valid.size > 1 else 0.0
+                        if np.isfinite(post_att_se) and post_att_se > 0 and post_placebo_valid.size > 1:
+                            tdraw_post = post_placebo_valid / post_att_se
+                            c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
+                            post_ci_df = pd.DataFrame({"lower": [post_agg - c_post * post_att_se], "upper": [post_agg + c_post * post_att_se]})
+                    bands = {
+                        "pre": band_pre,
+                        "post": band_post,
+                        "full": band_full,
+                        "post_scalar": post_ci_df,
+                        "__meta__": {
+                            "origin": "permutation",
+                            "mode": mode,
+                            "kind": "uniform",
+                            "level": int(100 * (1.0 - alpha_level)),
+                            "n_placebos": n_placebos,
+                            "estimator": "sc",
+                        },
+                    }
+                else:
+                    bands = {
+                        "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                        "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                        "full": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+                        "post_scalar": post_ci_df,
+                        "__meta__": {"origin": "permutation", "mode": mode, "kind": "uniform", "level": int(100 * (1.0 - alpha_level)), "n_placebos": 0, "estimator": "sc"},
+                    }
+                boot_info = {"method": "permutation", "n_placebos": n_placebos}
             else:
                 # ----- Bootstrap variance estimation -----
                 att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
@@ -605,7 +638,10 @@ class SyntheticControl:
                             return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
                         th = theta_hat[idx]
                         thb = att_tau_star[idx, :]
-                        diffs = thb - th[:, None]
+                        if mode == "placebo":
+                            diffs = thb
+                        else:
+                            diffs = thb - th[:, None]
                         se = np.nanstd(diffs, axis=1, ddof=1)
                         ok = np.isfinite(se) & (se > 0)
                         if not np.any(ok):
@@ -631,7 +667,10 @@ class SyntheticControl:
                         post_star_valid = post_star[np.isfinite(post_star)]
                         se_hat = float(np.nanstd(post_star_valid, ddof=1)) if post_star_valid.size > 1 else 0.0
                         if np.isfinite(se_hat) and se_hat > 0 and post_star_valid.size > 1:
-                            tdraw_post = (post_star_valid - post_agg) / se_hat
+                            if mode == "placebo":
+                                tdraw_post = post_star_valid / se_hat
+                            else:
+                                tdraw_post = (post_star_valid - post_agg) / se_hat
                             c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
                             post_ci_df = pd.DataFrame({"lower": [post_agg - c_post * se_hat], "upper": [post_agg + c_post * se_hat]})
 

@@ -349,7 +349,10 @@ class SDID:
                         return None
                     th = theta_hat[idx]
                     thb = att_tau_star[idx, :]
-                    diffs = thb - th[:, None]
+                    if mode == "unit":
+                        diffs = thb - th[:, None]
+                    else:
+                        diffs = thb
                     se = np.nanstd(diffs, axis=1, ddof=1)
                     ok = np.isfinite(se) & (se > 0)
                     if not np.any(ok):
@@ -380,7 +383,10 @@ class SDID:
                     post_star = np.nanmean(att_tau_star[np.flatnonzero(mask_post_draws), :], axis=0)
                     post_star_valid = post_star[np.isfinite(post_star)]
                     if post_star_valid.size > 1 and post_att_se > 0:
-                        tdraw_post = (post_star_valid - att_post) / post_att_se
+                        if mode == "unit":
+                            tdraw_post = (post_star_valid - att_post) / post_att_se
+                        else:
+                            tdraw_post = post_star_valid / post_att_se
                         c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
                         lo_post = att_post - c_post * post_att_se
                         hi_post = att_post + c_post * post_att_se

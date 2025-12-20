@@ -1518,11 +1518,13 @@ class GMM(BaseEstimator):
                         sums = la.group_sum_multi(zu, codes)
                     S += sign * la.tdot(sums)
         elif space_ids is not None and time_ids is not None:
-            codes = np.stack(
-                [np.asarray(space_ids).reshape(-1), np.asarray(time_ids).reshape(-1)],
-                axis=1,
-            )
-            S = la.tdot(la.group_sum_multi(zu, codes))
+            code_space = np.asarray(space_ids).astype(np.int64, copy=False).reshape(-1)
+            code_time = np.asarray(time_ids).astype(np.int64, copy=False).reshape(-1)
+            S_space = la.tdot(la.group_sum(zu, code_space))
+            S_time = la.tdot(la.group_sum(zu, code_time))
+            codes_inter = np.column_stack([code_space, code_time])
+            S_inter = la.tdot(la.group_sum_multi(zu, codes_inter))
+            S = S_space + S_time - S_inter
         elif cluster_ids is not None:
             S = la.tdot(la.group_sum(zu, cluster_ids))
         else:
@@ -1555,6 +1557,11 @@ class GMM(BaseEstimator):
         elif cluster_ids is not None:
             G = len(np.unique(cluster_ids))
             S *= (G / (G - 1.0)) if G > 1 else 1.0
+        elif space_ids is not None and time_ids is not None:
+            G_space = len(np.unique(np.asarray(space_ids)))
+            G_time = len(np.unique(np.asarray(time_ids)))
+            Gmin = min(G_space, G_time)
+            S *= (Gmin / (Gmin - 1.0)) if Gmin > 1 else 1.0
         return S
 
     def moment_covariance(  # noqa: PLR0913

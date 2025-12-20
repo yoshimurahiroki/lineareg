@@ -434,80 +434,14 @@ class SyntheticControl:
             mode = (getattr(boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "placebo"
-            if mode not in {"unit", "placebo", "jackknife", "permutation"}:
-                raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'jackknife', 'permutation'}.")
+            if mode not in {"unit", "placebo", "permutation"}:
+                raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'permutation'}.")
             if mode == "unit" and n_treated_total < 2:
-                raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='jackknife'.")
+                raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='permutation'.")
 
             theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
 
-            # ----- Jackknife variance estimation (synthdid-style) -----
-            if mode == "jackknife":
-                N = Y.shape[0]
-                j_donors = np.array([id_to_row[j] for j in donors], dtype=int)
-                att_jack = []
-                for drop_i in range(N):
-                    keep_mask = np.arange(N) != drop_i
-                    Y_i = Y[keep_mask, :]
-                    j_donors_i = j_donors[j_donors != drop_i]
-                    if drop_i < j_donors.shape[0]:
-                        j_donors_i = np.where(j_donors_i > drop_i, j_donors_i - 1, j_donors_i)
-                    if j_donors_i.size == 0:
-                        continue
-                    try:
-                        att_paths = []
-                        for g, meta in results_g.items():
-                            t0_col = t_to_col[g]
-                            pre = np.arange(0, t0_col)
-                            if pre.size == 0:
-                                continue
-                            for tid in meta["treated_ids"]:
-                                orig_row = id_to_row[tid]
-                                if orig_row == drop_i:
-                                    continue
-                                new_row = orig_row - 1 if orig_row > drop_i else orig_row
-                                y_pre = Y_i[new_row, pre].astype(np.float64)
-                                X_pre = Y_i[j_donors_i][:, pre].T.astype(np.float64)
-                                w = _frank_wolfe_simplex(X_pre, y_pre, max_iter=self.max_iter, tol=self.tol)
-                                y_treated = Y_i[new_row, :].astype(np.float64)
-                                X_all = Y_i[j_donors_i, :].T.astype(np.float64)
-                                y_synth = la.dot(X_all, w)
-                                att_paths.append(y_treated - y_synth)
-                        if att_paths:
-                            att_path_mean = np.mean(att_paths, axis=0)
-                            post_vals = att_path_mean[mask_post]
-                            att_jack.append(float(np.mean(post_vals)))
-                    except Exception:
-                        continue
-                att_jack = np.array(att_jack, dtype=float)
-                n_jack = len(att_jack)
-                if n_jack > 1:
-                    jack_mean = float(np.mean(att_jack))
-                    post_att_se = float(np.sqrt((n_jack - 1) / n_jack * np.sum((att_jack - jack_mean) ** 2)))
-                    # Jackknife only computes SE for aggregate post_ATT, not per-tau.
-                    # Leave se_series = None (initialized at start of bootstrap block).
-                    z = 1.96 if alpha_level == 0.05 else bt.finite_sample_quantile(np.abs(np.random.randn(10000)), 1.0 - alpha_level)
-                    lo_post = float(post_agg) - z * post_att_se
-                    hi_post = float(post_agg) + z * post_att_se
-                    post_ci_df = pd.DataFrame({"lower": [lo_post], "upper": [hi_post]})
-                    bands = {
-                        "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
-                        "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
-                        "full": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
-                        "post_ATT": post_ci_df,
-                        "__meta__": {
-                            "origin": "jackknife",
-                            "mode": mode,
-                            "kind": "jackknife",
-                            "level": int(100 * (1.0 - alpha_level)),
-                            "B": n_jack,
-                            "estimator": "sc",
-                        },
-                    }
-                else:
-                    post_att_se = np.nan
-                boot_info = {"B": n_jack, "post_ATT_draws": att_jack, "ATT_tau_draws": np.full((tau_grid.size, n_jack), np.nan), "method": "jackknife", "post_ATT_se": float(post_att_se) if np.isfinite(post_att_se) else np.nan}
-            elif mode == "permutation":
+            if mode == "permutation":
                 j_donors = np.array([id_to_row[j] for j in donors], dtype=int)
                 g0 = list(results_g.keys())[0]
                 t0_col = t_to_col[g0]
@@ -756,10 +690,6 @@ class SyntheticControl:
         if se_series is not None and np.any(mask_post):
             post_star_draws = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
             model_info["PostATT_se"] = float(np.std(post_star_draws, ddof=1))
-        elif boot_info.get("method") == "jackknife":
-            jack_se = boot_info.get("post_ATT_se")
-            if jack_se is not None and np.isfinite(jack_se):
-                model_info["PostATT_se"] = float(jack_se)
         extra = {
             "cohorts": cohorts,
             "results_by_cohort": results_g,
@@ -770,7 +700,7 @@ class SyntheticControl:
             "donors": donors,
             "boot_meta": bands.get("__meta__") if bands else None,
             "boot": boot_info,
-            "se_source": "bootstrap" if se_series is not None else ("jackknife" if boot_info.get("method") == "jackknife" else None),
+            "se_source": "bootstrap" if se_series is not None else None,
         }
 
         res = EstimationResult(

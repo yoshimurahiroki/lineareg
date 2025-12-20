@@ -1245,6 +1245,14 @@ class IV2SLS(BaseEstimator):
                 old2newX_dedup[i] for i in endog_idx_new if i in old2newX_dedup
             ]
 
+        endog_names_current = [var_names_work[i] for i in endog_idx_new]
+        for ename in endog_names_current:
+            if ename in instr_names_work:
+                raise ValueError(
+                    f"Endogenous regressor '{ename}' is included in Z. "
+                    "This causes 2SLS to collapse to OLS. Remove it from instruments or fix the IV specification."
+                )
+
         # --- Reduce constraints consistently with kept X columns (strict) ---
         # Auto-inject formula-derived constraints when absent
         if (

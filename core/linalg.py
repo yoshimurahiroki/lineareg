@@ -851,7 +851,7 @@ def effective_f_from_first_stage(
         L = safe_cholesky(Sig_t, lower=True)
         z = np.linalg.solve(L, pi_t)
         q = np.linalg.solve(L.T, z)
-    except (np.linalg.LinAlgError, ValueError):
+    except (np.linalg.LinAlgError, ValueError, RuntimeError):
         # Ensure symmetry, then use SVD pseudo-inverse with rcond = sqrt(eps)
         Sig_sym = 0.5 * (Sig_t + Sig_t.T)
         U, s, Vt = np.linalg.svd(Sig_sym, full_matrices=False)
@@ -1281,29 +1281,25 @@ def col_var_stata_pw(X: Matrix, pweights: Sequence[float]) -> NDArray[np.float64
 
 def safe_cholesky(A: Matrix, *, lower: bool = True) -> NDArray[np.float64]:
     """Strict Cholesky factorization without implicit ridges.
-    Raises RuntimeError if not positive definite.
+    Raises np.linalg.LinAlgError if not positive definite.
     """
     Ad = to_dense(A)
     Ad = (Ad + Ad.T) * 0.5  # symmetrize
-    # Optional GPU path
     if _bk is not None and _bk.gpu_enabled():
         try:
             return np.asarray(_bk.cholesky(Ad, lower=lower), dtype=np.float64)
         except (RuntimeError, ValueError, np.linalg.LinAlgError):
-            # Fall back to CPU paths below
             pass
     if sla is not None:
         try:
             return sla.cholesky(Ad, lower=lower, check_finite=False)  # type: ignore[union-attr]
         except (np.linalg.LinAlgError, ValueError) as exc:
-            msg = f"Cholesky factorization failed: {exc}"
-            raise RuntimeError(msg) from exc
-    else:  # numpy fallback
+            raise np.linalg.LinAlgError(f"Cholesky factorization failed: {exc}") from exc
+    else:
         try:
             return np.linalg.cholesky(Ad)
         except np.linalg.LinAlgError as exc:
-            msg = f"Cholesky factorization failed: {exc}"
-            raise RuntimeError(msg) from exc
+            raise np.linalg.LinAlgError(f"Cholesky factorization failed: {exc}") from exc
 
 
 def chol_psd(A: Matrix) -> NDArray[np.float64]:

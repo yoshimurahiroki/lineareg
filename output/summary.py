@@ -927,6 +927,23 @@ def modelsummary(  # noqa: PLR0913
     # Rows: parameter, SE row (if bootstrap), CI row for ES families only
     raw_pool = _collect_param_index(results, skip_missing=skip_missing)
 
+    # Auto-detect event-study models and use sort="tau" when appropriate
+    # If user did not explicitly set sort, check if all models are event-study type
+    effective_sort = sort
+    if sort == "alpha":
+        # Check if all non-None results are event-study family
+        es_keywords = {"did", "eventstudy", "event_study", "synthetic", "sdid", "ddd", "rct"}
+        all_es = True
+        for res in results:
+            if res is None:
+                continue
+            est_lbl = str(res.model_info.get("Estimator", "")).lower().replace("-", "").replace(" ", "")
+            if not any(k in est_lbl for k in es_keywords):
+                all_es = False
+                break
+        if all_es and len([r for r in results if r is not None]) > 0:
+            effective_sort = "tau"
+
     # Special handling for PostATT: if explicitly requested in params, temporarily add to pool
     if params is not None and any(
         str(p) in {"PostATT", "PostATT_Diff"} for p in params
@@ -940,12 +957,12 @@ def modelsummary(  # noqa: PLR0913
         params=params,
         include=include,
         exclude=exclude,
-        sort=sort,
+        sort=effective_sort,
         strict=strict,
     )
 
     # Optionally drop the base period (tau == CenterAt) from event-study tables
-    if hide_baseline and sort == "tau":
+    if hide_baseline and effective_sort == "tau":
         # collect all CenterAt values advertised by ES-family models
         center_vals: set[int] = set()
         for res in results:
@@ -1184,7 +1201,7 @@ def modelsummary(  # noqa: PLR0913
                     # Only show SE if non-zero and finite (skip baseline period)
                     if se_val is not None and np.isfinite(se_val) and abs(se_val) > 1e-10:
                         se_cell = f"({se_val:{se_format}})"
-                    
+
                     # Get CI (uniform bands) for ES family
                     ci_cell = _uniform_band_str(res, raw_name, coef_format)
                     # Aggregated post-period effects when requested as parameters

@@ -460,7 +460,13 @@ class SpatialDID:
                 if self.s_mode == "treated_now":
                     s_source = treated_now[:, tt].astype(np.float64)
                 else:
-                    s_source = ((G == int(g)) & (int(t) >= int(g))).astype(np.float64)
+                    # For pre-period (tau < 0), use cohort membership as hypothetical
+                    # treatment source for placebo spillover test.
+                    # For post-period (tau >= 0), use actual treatment status.
+                    if tau_val < int(self.center_at):
+                        s_source = (G == int(g)).astype(np.float64)  # placebo
+                    else:
+                        s_source = ((G == int(g)) & (int(t) >= int(g))).astype(np.float64)
                 Svec_raw = la.dot(Wd[unit_indices, :], s_source.reshape(-1, 1))
                 exposed_controls = (Svec_raw.reshape(-1) > 0.0) & (Z.reshape(-1) == 0.0)
                 mean_S_exposed = (

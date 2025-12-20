@@ -202,12 +202,17 @@ class DDDEventStudy:
             msg = "Both groups must have non-empty data."
             raise ValueError(msg)
 
-        # Shared BootConfig for constructing shared multipliers (default B).
-        # Do not override user-specified boot policy or enumeration here;
-        # inject only aligned ID arrays when creating a default BootConfig.
+        cohorts_A = dfA[self.cohort_name].unique()
+        cohorts_B = dfB[self.cohort_name].unique()
+        has_treatment_A = any(c > 0 for c in cohorts_A if pd.notna(c) and c != 0)
+        has_treatment_B = any(c > 0 for c in cohorts_B if pd.notna(c) and c != 0)
+
+        if not has_treatment_A:
+            msg = "Group A must have at least one treated cohort (cohort > 0)."
+            raise ValueError(msg)
+
         boot_shared = self.boot or BootConfig(
             n_boot=bt.DEFAULT_BOOTSTRAP_ITERATIONS,
-            # Default IF multiplier distribution: standard normal for IF multiplier bootstrap
             dist="standard_normal",
             cluster_ids=(
                 np.asarray(self.cluster_ids) if self.cluster_ids is not None else None
@@ -295,25 +300,76 @@ class DDDEventStudy:
         W_A = W_all[pos_A, :]
         W_B = W_all[pos_B, :]
 
-        # Normalize dfA/dfB to RangeIndex so that external_W rows align exactly with
-        # the passed data rows (CallawaySantAnnaES expects external_W row-order == df row-order).
         dfA = dfA.reset_index(drop=True)
         dfB = dfB.reset_index(drop=True)
 
-        # Pass a minimal BootConfig into the ES estimator; the actual multipliers
-        # used by the ES fit are provided via external_W (row-ordered to match dfA/dfB).
         boot_es_min = BootConfig(n_boot=boot_shared.n_boot, dist=boot_shared.dist)
         esA = CallawaySantAnnaES(
             **self.common_kwargs, center_at=self.center_at, boot=boot_es_min,
         )
-        esB = CallawaySantAnnaES(
-            **self.common_kwargs, center_at=self.center_at, boot=boot_es_min,
-        )
-
         resA = esA.fit(dfA, external_W=W_A)
-        resB = esB.fit(dfB, external_W=W_B)
+
+        if has_treatment_B:
+            esB = CallawaySantAnnaES(
+                **self.common_kwargs, center_at=self.center_at, boot=boot_es_min,
+            )
+            resB = esB.fit(dfB, external_W=W_B)
+        else:
+            resB = self._null_result_from_A(resA, W_B)
 
         return self._combine_results(resA, resB, boot_shared, W_all, W_A, W_B, wlog)
+
+    def _null_result_from_A(
+        self, resA: EstimationResult, W_B: np.ndarray,
+    ) -> EstimationResult:
+        """Create a null result for group B when it has no treatment cohorts.
+
+        In classic DDD, group B (comparison) may have no treatment. In this case,
+        ATT(B,τ) = 0 for all τ, and bootstrap draws are also zero.
+        """
+        att_tau_A = resA.extra.get("att_tau")
+        att_gt_A = resA.extra.get("att_gt")
+        att_tau_star_A = resA.extra.get("att_tau_star")
+
+        if att_tau_A is None or att_tau_star_A is None:
+            raise ValueError("resA must contain att_tau and att_tau_star in extra.")
+
+        tau_grid = att_tau_A["tau"].tolist()
+        B = att_tau_star_A.shape[1]
+
+        att_tau_B = pd.DataFrame({
+            "tau": tau_grid,
+            "params": [0.0] * len(tau_grid),
+        })
+        att_gt_B = pd.DataFrame({
+            "g": [0] * len(tau_grid),
+            "t": tau_grid,
+            "tau": tau_grid,
+            "att": [0.0] * len(tau_grid),
+            "n_treat": [0] * len(tau_grid),
+        })
+        att_tau_star_B = np.zeros((len(tau_grid), B), dtype=np.float64)
+
+        null_bands = {
+            "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+            "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+            "full": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
+            "__meta__": {"origin": "null_B", "kind": "uniform", "estimator": "ddd"},
+        }
+
+        return EstimationResult(
+            params=pd.Series([0.0] * len(tau_grid), index=tau_grid, name="params"),
+            se=pd.Series([0.0] * len(tau_grid), index=tau_grid),
+            n_obs=0,
+            bands=null_bands,
+            model_info={"Estimator": "DDD_null_B", "B": B},
+            extra={
+                "att_tau": att_tau_B,
+                "att_gt": att_gt_B,
+                "att_tau_star": att_tau_star_B,
+                "se_source": "multiplier",
+            },
+        )
 
     def _combine_results(
         self, resA: EstimationResult, resB: EstimationResult,

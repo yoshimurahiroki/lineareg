@@ -466,13 +466,13 @@ class GMM(BaseEstimator):
 
             try:
                 return float(la.effective_f_from_first_stage(pi, Sigma, Z2l))
-            except (np.linalg.LinAlgError, ValueError):
+            except (np.linalg.LinAlgError, ValueError, RuntimeError):
                 Qzz = la.crossprod(Z2l, Z2l)
                 num = float(la.dot(pi.T, la.dot(Qzz, pi)))
                 den = float(np.trace(la.to_dense(la.dot(Sigma, Qzz))))
                 k = pi.shape[0]
                 return (num / den / k) if den > 0 else float("nan")
-        except (np.linalg.LinAlgError, ValueError, ZeroDivisionError, IndexError):
+        except (np.linalg.LinAlgError, ValueError, ZeroDivisionError, IndexError, RuntimeError):
             return float("nan")
 
     def fit(  # noqa: PLR0913
@@ -945,7 +945,7 @@ class GMM(BaseEstimator):
                 clusters=cluster_ids_proc,
                 rank_policy=rank_policy,
             )
-        except (np.linalg.LinAlgError, ValueError, ZeroDivisionError):
+        except (np.linalg.LinAlgError, ValueError, ZeroDivisionError, RuntimeError):
             weak_iv["MOP_effective_F"] = float("nan")
 
         try:

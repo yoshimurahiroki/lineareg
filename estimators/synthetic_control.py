@@ -437,6 +437,8 @@ class SyntheticControl:
                 raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'permutation'}.")
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='permutation'.")
+            if n_treated_total >= 2 and mode in {"placebo", "permutation"}:
+                raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit'), not placebo/permutation.")
 
             theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
 

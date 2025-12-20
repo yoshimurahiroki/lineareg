@@ -263,6 +263,8 @@ class SDID:
                 raise ValueError("SDID boot mode must be 'unit' or 'placebo'.")
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='placebo'.")
+            if n_treated_total >= 2 and mode == "placebo":
+                raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit'), not placebo.")
 
             theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
 

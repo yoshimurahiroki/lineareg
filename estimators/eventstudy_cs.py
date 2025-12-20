@@ -285,6 +285,8 @@ class CallawaySantAnnaES:
         self.cov_method = str(cov_method).lower()
         self.trim_ps = float(trim_ps)
         self.trim_mode = str(trim_mode).lower()
+        if self.trim_mode not in {"clip", "drop"}:
+            raise ValueError("trim_mode must be 'clip' or 'drop'")
         self.balance_e = balance_e
         self.enforce_tau_intersection = bool(enforce_tau_intersection)
 
@@ -518,18 +520,19 @@ class CallawaySantAnnaES:
                     raise ImportError(
                         "scikit-learn is required for ipw/dr in CallawaySantAnnaES. Install scikit-learn.",
                     )
-                # CRITICAL: Never use outcome dY as features for PS. If X is None, use a constant-only design.
-                X_ps = X if X is not None else np.ones((dY.shape[0], 1), dtype=np.float64)
+                X_ps = X if X is not None else np.empty((dY.shape[0], 0), dtype=np.float64)
+                X_ps = np.column_stack([X_ps, np.ones((X_ps.shape[0], 1))])
                 clf = LogisticRegression(
                     penalty=None,
                     solver="lbfgs",
                     max_iter=1000,
+                    fit_intercept=False,
                 )
                 clf.fit(X_ps, Dg.astype(int))
                 ps = np.clip(clf.predict_proba(X_ps)[:, 1],
-                              self.trim_ps if self.trim_mode in {"clip","truncate"} else 0.0,
-                              1.0 - (self.trim_ps if self.trim_mode in {"clip","truncate"} else 0.0))
-                if self.trim_mode in {"drop","discard"} and self.trim_ps > 0.0:
+                              self.trim_ps if self.trim_mode == "clip" else 0.0,
+                              1.0 - (self.trim_ps if self.trim_mode == "clip" else 0.0))
+                if self.trim_mode == "drop" and self.trim_ps > 0.0:
                     keep = (ps >= self.trim_ps) & (ps <= 1.0 - self.trim_ps)
                     dY = dY[keep]
                     Dg = Dg[keep]

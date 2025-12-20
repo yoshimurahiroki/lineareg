@@ -611,14 +611,31 @@ class FormulaParser:
                 msg = "Duplicate (id,time) rows detected; time operators require unique observation per (id,time)."
                 raise ValueError(msg)
 
-        # Grouped shift requires id_name; global shift fallback is disallowed when time ops are used.
-        def _grp_shift(x: pd.Series, k: int) -> pd.Series:
-            if self.id_name is None:
-                msg = (
-                    "Grouped shift requires id_name to be set for panel time operators."
-                )
+        def _time_indexed_lag(x: pd.Series, k: int) -> pd.Series:
+            if self.id_name is None or self.t_name is None:
+                msg = "Panel lag/lead/diff require both id_name and t_name."
                 raise ValueError(msg)
-            return x.groupby(out[self.id_name], sort=False, group_keys=False).shift(k)
+            idn = self.id_name
+            tn = self.t_name
+            var_name = x.name if x.name else "__var__"
+            df_temp = out[[idn, tn]].copy()
+            df_temp[var_name] = x.to_numpy()
+            t_vals = df_temp[tn].to_numpy()
+            try:
+                t_shifted = t_vals - k if k > 0 else t_vals + abs(k)
+            except TypeError:
+                try:
+                    t_shifted = pd.to_datetime(t_vals) - pd.Timedelta(days=k)
+                except Exception:
+                    try:
+                        t_shifted = pd.to_numeric(t_vals) - k
+                    except Exception:
+                        msg = "Time variable must support arithmetic for lag/lead."
+                        raise ValueError(msg)
+            df_temp["__t_target__"] = t_shifted
+            df_lookup = df_temp[[idn, tn, var_name]].rename(columns={tn: "__t_target__", var_name: "__lagged__"})
+            merged = df_temp.merge(df_lookup, on=[idn, "__t_target__"], how="left")
+            return pd.Series(merged["__lagged__"].to_numpy(), index=x.index)
 
         # Handle lag/lead/diff by materializing deterministic column names
         if uses_ts:
@@ -635,7 +652,7 @@ class FormulaParser:
                 for h in range(a, b + 1):
                     new = f"__L{h}__:{var}" if h != 1 else f"__L__:{var}"
                     if new not in out.columns:
-                        out[new] = _grp_shift(out[var], h)
+                        out[new] = _time_indexed_lag(out[var], h)
                     repl.append(f'Q("{new}")')
                 rewritten = re.sub(
                     re.escape(m.group(0)), " + ".join(repl), rewritten, count=1,
@@ -652,7 +669,7 @@ class FormulaParser:
                     msg = f"lag(): unknown variable '{var}' in formula."
                     raise ValueError(msg)
                 if new not in out.columns:
-                    out[new] = _grp_shift(out[var], h)
+                    out[new] = _time_indexed_lag(out[var], h)
                 rewritten = re.sub(
                     re.escape(m.group(0)), f'Q("{new}")', rewritten, count=1,
                 )
@@ -668,7 +685,7 @@ class FormulaParser:
                     msg = f"lead(): unknown variable '{var}' in formula."
                     raise ValueError(msg)
                 if new not in out.columns:
-                    out[new] = _grp_shift(out[var], -h)
+                    out[new] = _time_indexed_lag(out[var], -h)
                 rewritten = re.sub(
                     re.escape(m.group(0)), f'Q("{new}")', rewritten, count=1,
                 )
@@ -684,7 +701,7 @@ class FormulaParser:
                     raise ValueError(msg)
                 base = out[var]
                 for _ in range(k):
-                    base = base - _grp_shift(base, 1)
+                    base = base - _time_indexed_lag(base, 1)
                 # Consistent naming for all orders, simplifies downstream checks.
                 new = f"__D{k}__:{var}"
                 if new not in out.columns:

@@ -425,6 +425,7 @@ class SyntheticControl:
         att_tau_star = np.full((tau_grid.size, 0), np.nan, dtype=float)
         post_ci_df = pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
         post_att_se = None  # Will be set by bootstrap if successful
+        boot_info = None  # Will be set by bootstrap if run
 
         if boot is not None and int(getattr(boot, "n_boot", 0)) > 1:
             B = int(boot.n_boot)
@@ -480,7 +481,7 @@ class SyntheticControl:
                     ratios.append(ratio_j)
                 ratios = np.array(ratios, dtype=float)
                 rank = int(np.sum(ratios >= ratio_treat))
-                p_value = rank / len(ratios)
+                n_placebos = len(ratios) - 1
                 bands = {
                     "pre": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
                     "post": pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)}),
@@ -491,13 +492,13 @@ class SyntheticControl:
                         "mode": mode,
                         "kind": "permutation",
                         "level": int(100 * (1.0 - alpha_level)),
-                        "n_placebos": len(ratios) - 1,
-                        "p_value": float(p_value),
+                        "n_placebos": n_placebos,
+                        "rank": int(rank),
                         "rmspe_ratio_treat": float(ratio_treat),
                         "estimator": "sc",
                     },
                 }
-                boot_info = {"method": "permutation", "p_value": float(p_value), "rmspe_ratios": ratios.tolist(), "n_placebos": len(ratios) - 1}
+                boot_info = {"method": "permutation", "rank": int(rank), "rmspe_ratios": ratios.tolist(), "n_placebos": n_placebos}
             else:
                 # ----- Bootstrap variance estimation -----
                 att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)

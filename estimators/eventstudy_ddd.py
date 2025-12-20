@@ -183,7 +183,8 @@ class DDDEventStudy:
         resA = esA.fit(dfA_use, external_W=W_A)
         resB = esB.fit(dfB_use, external_W=W_B)
 
-        return self._combine_results(resA, resB)
+        wlog = {"method": "pooled", "effective_B": int(W_full.shape[1])}
+        return self._combine_results(resA, resB, boot_shared, W_full, W_A, W_B, wlog)
 
     def _fit_diff_of_cs(self, df: pd.DataFrame) -> EstimationResult:
         """Original diff_of_cs mode: separate C&S runs, then difference."""
@@ -278,8 +279,13 @@ class DDDEventStudy:
                 "external W (union) has zero-variance column(s) after recentering.",
             )
         W_all /= np.sqrt(v.reshape(1, -1))
-        W_A = W_all[dfA.index, :]
-        W_B = W_all[dfB.index, :]
+
+        df_with_pos = df.copy()
+        df_with_pos["__orig_pos__"] = np.arange(len(df))
+        pos_A = df_with_pos.loc[df_with_pos[self.group_name] == self.group_A_value, "__orig_pos__"].to_numpy()
+        pos_B = df_with_pos.loc[df_with_pos[self.group_name] == self.group_B_value, "__orig_pos__"].to_numpy()
+        W_A = W_all[pos_A, :]
+        W_B = W_all[pos_B, :]
 
         # Normalize dfA/dfB to RangeIndex so that external_W rows align exactly with
         # the passed data rows (CallawaySantAnnaES expects external_W row-order == df row-order).
@@ -299,10 +305,15 @@ class DDDEventStudy:
         resA = esA.fit(dfA, external_W=W_A)
         resB = esB.fit(dfB, external_W=W_B)
 
-        return self._combine_results(resA, resB)
+        return self._combine_results(resA, resB, boot_shared, W_all, W_A, W_B, wlog)
 
     def _combine_results(
         self, resA: EstimationResult, resB: EstimationResult,
+        boot_shared: BootConfig | None = None,
+        W_all: np.ndarray | None = None,
+        W_A: np.ndarray | None = None,
+        W_B: np.ndarray | None = None,
+        wlog: dict | None = None,
     ) -> EstimationResult:
 
         # Extract att_tau from extra (EstimationResult compatibility)

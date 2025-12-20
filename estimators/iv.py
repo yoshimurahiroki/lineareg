@@ -70,12 +70,17 @@ def _cd_kp_stats(  # noqa: PLR0913
     u: np.ndarray | None = None,
     clusters: Sequence | None = None,
 ) -> dict:
-    """Cragg-Donald minimum eigenvalue and Kleibergen-Paap rk Wald (robust)."""
+    """Cragg-Donald minimum eigenvalue and Kleibergen-Paap rk Wald (robust).
+
+    Stata ivreg2 compatible: CD Wald F = CDEV * (N - L) / L2
+    where L = total instruments, L2 = excluded instruments.
+    """
     out = {
         "cd_min_eig": float("nan"),
         "cd_wald_F": float("nan"),
         "kp_min_eig": float("nan"),
         "kp_rk_LM": float("nan"),
+        "kp_rk_Wald_F": float("nan"),
     }
 
     # Identify X1 (endogenous) and X0 (exogenous)
@@ -106,6 +111,7 @@ def _cd_kp_stats(  # noqa: PLR0913
     L2 = int(Qxz.shape[0])
     K = int(Qxx.shape[0])
     n = int(X1_t.shape[0])
+    L_total = int(Z.shape[1])
 
     # ---- Cragg-Donald (homoskedastic) ----
     Z2tZ2 = la.crossprod(Z2_t, Z2_t)
@@ -121,10 +127,8 @@ def _cd_kp_stats(  # noqa: PLR0913
         lam_cd = float("nan")
     if np.isfinite(lam_cd):
         out["cd_min_eig"] = float(lam_cd)
-        L2_eff = Z2_t.shape[1]
-        df_num = max(1, L2_eff - K + 1)
-        df_denom = max(1, n - L2_eff - X0.shape[1] if 'X0' in dir() else n - L2_eff)
-        out["cd_wald_F"] = float(lam_cd * df_denom / df_num) if df_num > 0 else float("nan")
+        df_denom = max(1, n - L_total)
+        out["cd_wald_F"] = float(lam_cd * df_denom / L2) if L2 > 0 else float("nan")
 
     # ---- Kleibergen-Paap rk statistic (heterosked/cluster robust) ----
     if u is None or Z2_t.shape[1] == 0:
@@ -178,6 +182,8 @@ def _cd_kp_stats(  # noqa: PLR0913
         if np.isfinite(lam_kp) and lam_kp > 0:
             out["kp_min_eig"] = lam_kp
             out["kp_rk_LM"] = float(n * lam_kp) if n > 0 else float("nan")
+            df_denom_kp = max(1, n - L_total)
+            out["kp_rk_Wald_F"] = float(lam_kp * df_denom_kp / L2) if L2 > 0 else float("nan")
     except (np.linalg.LinAlgError, RuntimeError, ValueError):
         pass
 
@@ -785,12 +791,34 @@ class IV2SLS(BaseEstimator):
             self._var_names = [f"x{i}" for i in range(X_aug.shape[1])]
         if len(self._instr_names) != Z_aug.shape[1]:
             self._instr_names = [f"z{i}" for i in range(Z_aug.shape[1])]
-        self.endog_idx = [int(i) for i in endog_idx]
-        # Optionally include exogenous X columns into the instrument set.
+
+        orig_var_names = (
+            list(var_names) if var_names is not None
+            else [f"x{i}" for i in range(X_arr.shape[1])]
+        )
+        if add_const:
+            endog_names = [orig_var_names[i] for i in endog_idx if 0 <= i < len(orig_var_names)]
+            self.endog_idx = [
+                self._var_names.index(nm) for nm in endog_names
+                if nm in self._var_names
+            ]
+            if len(self.endog_idx) != len(endog_idx):
+                raise ValueError(
+                    f"endog_idx references columns not found after add_constant. "
+                    f"Original indices: {list(endog_idx)}, mapped names: {endog_names}, "
+                    f"found in X_aug: {self.endog_idx}"
+                )
+        else:
+            self.endog_idx = [int(i) for i in endog_idx]
+
+        orig_instr_names = list(self._instr_names)
+        excluded_instr_names = [
+            orig_instr_names[i] for i in z_excluded_idx
+            if 0 <= i < len(orig_instr_names)
+        ]
+
         exog_idx = [j for j in range(X_aug.shape[1]) if j not in self.endog_idx]
-        # Policy: exogenous regressors are ALWAYS included in Z (forced above)
         if exog_idx:
-            # avoid adding duplicate constant column if Z already has it
             const_j = (
                 None
                 if self._const_name is None
@@ -803,13 +831,19 @@ class IV2SLS(BaseEstimator):
                 self._instr_names = list(
                     dict.fromkeys(list(self._instr_names) + z_exog_names),
                 )
-                # Remove numerically duplicate columns (existing behavior, strict tol)
+                Z_before_drop = Z_aug.shape[1]
                 Z_aug = la.drop_duplicate_cols(Z_aug)
+                if Z_aug.shape[1] < Z_before_drop:
+                    self._instr_names = self._instr_names[:Z_aug.shape[1]]
+
+        self.z_excluded_idx = [
+            self._instr_names.index(nm) for nm in excluded_instr_names
+            if nm in self._instr_names
+        ]
 
         self.y_orig = y_arr
         self.X_orig = X_aug
         self.Z_orig = Z_aug
-        self.z_excluded_idx = [int(i) for i in z_excluded_idx]
         self._n_obs_init = y_arr.shape[0]
         self._n_features_init = X_aug.shape[1]
         # default rank policy (Stata-compatible by default); can be overridden at fit time

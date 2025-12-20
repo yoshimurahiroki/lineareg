@@ -974,26 +974,17 @@ class GMM(BaseEstimator):
             )
             lam_cd = float(cdkp.get("cd_min_eig", np.nan))
             lam_kp = float(cdkp.get("kp_min_eig", np.nan))
-            # Store only canonical lowercase keys (legacy uppercase aliases removed)
             weak_iv["cd_min_eig"] = lam_cd
             weak_iv["kp_min_eig"] = lam_kp
-            # Cragg-Donald Wald F (homoskedastic scaling): F_cd = lambda_min * (n - K) / K
-            K = int(X.shape[1]) if X.ndim == 2 else 0
-            n = int(X.shape[0]) if X.ndim == 2 else 0
-            cd_wald = (
-                (lam_cd * (n - K) / K)
-                if (np.isfinite(lam_cd) and K > 0 and n > K)
-                else float("nan")
-            )
-            weak_iv["cd_wald_F"] = cd_wald
-            # KP rk-LM (LM-style scaling): LM = n * lambda_min (values only)
-            kp_lm = (n * lam_kp) if np.isfinite(lam_kp) and n > 0 else float("nan")
-            weak_iv["kp_rk_LM"] = kp_lm
+            weak_iv["cd_wald_F"] = float(cdkp.get("cd_wald_F", np.nan))
+            weak_iv["kp_rk_LM"] = float(cdkp.get("kp_rk_LM", np.nan))
+            weak_iv["kp_rk_Wald_F"] = float(cdkp.get("kp_rk_Wald_F", np.nan))
         except (np.linalg.LinAlgError, ValueError, ZeroDivisionError):
             weak_iv["cd_min_eig"] = float("nan")
             weak_iv["kp_min_eig"] = float("nan")
             weak_iv["cd_wald_F"] = float("nan")
             weak_iv["kp_rk_LM"] = float("nan")
+            weak_iv["kp_rk_Wald_F"] = float("nan")
 
         # Bootstrap SEs (no analytic CIs) -------------------------------------------------------
         cluster_ids_proc = _mask_seq(cluster_ids)

@@ -324,6 +324,9 @@ class OLS(BaseEstimator):
                 "(p-values/critical values remain forbidden)."
             )
             raise ValueError(msg)
+
+        absorb_fe = self._absorb_fe_from_formula(absorb_fe)
+
         # 1) Row pre-filtering: strict NA removal and zero-weight dropping BEFORE FE absorption
         #    This ensures FE codes and singleton removal are computed on the same sample
         #    that will be used downstream. We do not allow NaN propagation.

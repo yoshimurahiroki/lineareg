@@ -534,6 +534,9 @@ class GMM(BaseEstimator):
         if s_dof_used != "none":
             msg = "s_dof must be 'none' (estimation uses raw S only)."
             raise ValueError(msg)
+
+        absorb_fe = self._absorb_fe_from_formula(absorb_fe)
+
         # FE absorption (synchronized) -------------------------------------------------
         if absorb_fe is not None:
             # Use the backend keyword to match BaseEstimator / fe_core signature

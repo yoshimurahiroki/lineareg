@@ -1298,6 +1298,36 @@ class BaseEstimator(ABC):
         return be.DeviceGuard(d)
 
     # -- mandatory API -------------------------------------------------
+
+    def _absorb_fe_from_formula(
+        self,
+        absorb_fe: pd.DataFrame | np.ndarray | None,
+    ) -> pd.DataFrame | np.ndarray | None:
+        """Return absorb_fe or derive from formula-parsed FE codes if available.
+
+        When the estimator was constructed via `from_formula()` with `fe(...)`
+        terms, the parsed FE codes are stored in `_fe_codes_from_formula`. This
+        helper uses those codes when `absorb_fe` is not explicitly provided.
+
+        Parameters
+        ----------
+        absorb_fe : pd.DataFrame | np.ndarray | None
+            User-supplied FE codes or None.
+
+        Returns
+        -------
+        pd.DataFrame | np.ndarray | None
+            The FE codes to use for absorption, or None if not available.
+
+        """
+        if absorb_fe is not None:
+            return absorb_fe
+        fe_list = getattr(self, "_fe_codes_from_formula", None)
+        if fe_list is None or len(fe_list) == 0:
+            return None
+        if isinstance(fe_list, list):
+            return np.column_stack(fe_list)
+        return np.asarray(fe_list)
     @abstractmethod
     def fit(
         self, *args: Any, **kwargs: Any,

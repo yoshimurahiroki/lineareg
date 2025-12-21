@@ -956,6 +956,9 @@ class IV2SLS(BaseEstimator):
         # Enforce weight policy for IV using centralized BaseEstimator helper.
         # This ensures consistent messaging and behavior across estimators.
         self._enforce_weight_policy("iv", weights)
+
+        absorb_fe = self._absorb_fe_from_formula(absorb_fe)
+
         # FE absorption
         dropped_stats: dict[str, Any] = {}
         if absorb_fe is not None:

@@ -314,11 +314,13 @@ class SyntheticControl:
         and row selection) is used by default when `df` is None. This mirrors the
         formula pipeline used across estimators.
         """
-        # For API parity only: Synthetic Control uses placebo inference; `boot` is accepted but ignored.
-        # allow from_formula() defaulting
-        # Accept either `boot` (public) or `_boot` (internal) for compatibility
         if _boot is None and boot is not None:
             _boot = boot
+        if _boot is not None:
+            if isinstance(_boot, dict):
+                _boot = BootConfig(**_boot)
+            elif not isinstance(_boot, BootConfig):
+                raise TypeError("boot must be BootConfig, dict, or None")
         if df is None:
             df = getattr(self, "_formula_df", None)
             if df is None:
@@ -328,13 +330,11 @@ class SyntheticControl:
 
         t_name = self.spec.t_name
         tr = self.spec.treat_name
-        # If treat column is not present but cohort_name is available, derive treat = 1{t >= cohort & cohort > 0}
         if tr not in df.columns and self.spec.cohort_name is not None:
             coh = df[self.spec.cohort_name]
             df = df.copy()
             df[tr] = ((df[t_name] >= coh) & (coh > 0)).astype(int)
 
-        # --- Extract cohort structure and donor pool ---
         cohorts, donors = self._treated_info(df)
         if len(donors) == 0:
             raise ValueError(
@@ -445,16 +445,23 @@ class SyntheticControl:
 
         tau_grid = np.array(tau_union_sorted, dtype=int)
         n_treated_total = sum(len(meta["treated_ids"]) for meta in results_g.values())
+
+        if n_treated_total >= 2 and (_boot is None or int(getattr(_boot, "n_boot", 0)) <= 1):
+            raise ValueError(
+                "Policy: when treated units >=2, bootstrap inference is mandatory. "
+                "Provide boot=BootConfig(n_boot>=2, mode='unit', ...)"
+            )
+
         B = 0
         band_level = round(100.0 * (1.0 - float(self.spec.alpha)))
         bands = None
         se_series = None
         att_tau_star = np.full((tau_grid.size, 0), np.nan, dtype=float)
         post_ci_df = pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
-        post_att_se = None  # Will be set by bootstrap if successful
-        boot_info = None  # Will be set by bootstrap if run
+        post_att_se = None
+        boot_info = None
 
-        if boot is not None and int(getattr(boot, "n_boot", 0)) > 1:
+        if _boot is not None and int(getattr(_boot, "n_boot", 0)) > 1:
             B = int(boot.n_boot)
             alpha_level = float(self.spec.alpha)
             rng = np.random.default_rng(getattr(boot, "seed", None))
@@ -594,28 +601,30 @@ class SyntheticControl:
                             else:
                                 mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
                             Y_cf = np.zeros_like(Y)
-                            # --- LOO counterfactuals for donors ---
-                            # Average weights across all treated units to get a single omega
-                            # Then compute LOO synthetic for each donor
-                            all_weights = []
+                            donor_cf_count = np.zeros(len(ids), dtype=float)
+                            donor_cf_sum = np.zeros_like(Y, dtype=float)
+
                             for g, meta in results_g.items():
-                                for w in meta.get("weights", []):
-                                    all_weights.append(np.asarray(w, dtype=float))
-                            n_donors_boot = j_donors.size
-                            if len(all_weights) > 0 and n_donors_boot >= 2:
-                                omega_avg = np.mean(all_weights, axis=0)
-                                for j_local in range(n_donors_boot):
-                                    j_global = j_donors[j_local]
-                                    mask = np.ones(n_donors_boot, dtype=bool)
+                                omega_g_list = meta.get("weights", [])
+                                donors_idx_g = j_donors
+                                n_donors_g = len(donors_idx_g)
+                                if n_donors_g < 2 or len(omega_g_list) == 0:
+                                    continue
+                                omega_g_avg = np.mean([np.asarray(w, dtype=float) for w in omega_g_list], axis=0)
+                                for j_local in range(n_donors_g):
+                                    j_global = donors_idx_g[j_local]
+                                    mask = np.ones(n_donors_g, dtype=bool)
                                     mask[j_local] = False
-                                    omega_loo = omega_avg[mask]
-                                    omega_sum = omega_loo.sum()
-                                    if omega_sum > 1e-12:
-                                        omega_loo_norm = omega_loo / omega_sum
-                                        Y_donors_loo = Y[j_donors[mask], :]
-                                        y_cf_j = np.average(Y_donors_loo, axis=0, weights=omega_loo_norm)
-                                        Y_cf[j_global, :] = y_cf_j
-                            # --- Treated unit counterfactuals ---
+                                    omega_loo = omega_g_avg[mask]
+                                    s = omega_loo.sum()
+                                    if s > 1e-12:
+                                        omega_loo_norm = omega_loo / s
+                                        y_cf_j = np.average(Y[donors_idx_g[mask], :], axis=0, weights=omega_loo_norm)
+                                        donor_cf_sum[j_global, :] += y_cf_j
+                                        donor_cf_count[j_global] += 1.0
+
+                            donor_mask = donor_cf_count > 0
+                            Y_cf[donor_mask, :] = donor_cf_sum[donor_mask, :] / donor_cf_count[donor_mask, None]
                             for g, meta in results_g.items():
                                 y_synth_list = meta.get("y_synth", [])
                                 row_ids = meta.get("treated_row_ids", [])

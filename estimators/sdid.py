@@ -275,6 +275,12 @@ class SDID:
         tau_grid = np.array(tau_union_sorted, dtype=int)
         n_treated_total = sum(int(idx_tr.sum()) for idx_tr in cohorts.values())
 
+        if n_treated_total >= 2 and (self.boot is None or getattr(self.boot, "n_boot", 0) <= 1):
+            raise ValueError(
+                "Policy: when treated units >=2, bootstrap inference is mandatory. "
+                "Provide boot=BootConfig(n_boot>=2, mode='unit', ...) to SDID.__init__"
+            )
+
         bands = None
         boot_info: dict[str, object] = {"B": 0}
         se_series = None
@@ -968,14 +974,16 @@ class SDID:
             step = np.clip(num / den, 0.0, 1.0) if den > _EPS else 0.0
             # update x and Ax incrementally
             x = x + step * d
+            Ax = Ax + step * d_err
+            # Numerical stability: project back to simplex
             x[x < 0] = 0.0
             sx = float(x.sum())
-            if sx <= 0.0:
+            if sx <= 0.0 or not np.isfinite(sx):
                 x = np.full_like(x, 1.0 / max(1, x.size))
                 Ax = la.dot(A, x.reshape(-1, 1)).reshape(-1)
-            else:
+            elif abs(sx - 1.0) > 1e-12:
                 x = x / sx
-                Ax = Ax + step * d_err
+                Ax = Ax / sx
         return x, np.array(vals, float)
 
     def _sparsify(self, v: NDArray[np.float64]) -> NDArray[np.float64]:

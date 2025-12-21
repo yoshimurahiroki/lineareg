@@ -303,18 +303,54 @@ class SDID:
             if n_treated_total >= 2 and mode == "placebo":
                 raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit'), not placebo.")
             if n_treated_total == 1 and mode == "placebo":
-                import warnings
-                warnings.warn(
-                    "Policy recommendation: treated=1 should ideally use full donor enumeration (permutation test). "
-                    "Current placebo mode uses random draws. For exact inference, implement full donor enumeration.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
-            theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
-
-            # ----- Bootstrap variance estimation -----
-            if True:
+                control_unit_mask = W.sum(axis=1) == 0
+                control_units = np.flatnonzero(control_unit_mask)
+                n_control = control_units.size
+                if n_control < 1:
+                    raise ValueError("Placebo mode with treated=1 requires at least 1 control unit.")
+                B = n_control
+                att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
+                att_b = np.full(B, np.nan, dtype=float)
+                filled = 0
+                treated_unit_indices = np.flatnonzero(~control_unit_mask)
+                true_treated_idx = treated_unit_indices[0]
+                true_treated_pattern = W[true_treated_idx, :]
+                for b, pu in enumerate(control_units):
+                    try:
+                        W_b = np.zeros_like(W)
+                        W_b[pu, :] = true_treated_pattern
+                        Y_b = Y.copy()
+                        units_b, times_b = _units, times
+                        att_post_b, att_tau_b = self._att_path_from_w(
+                            Y_b, W_b, times_b,
+                            zeta_omega=None, zeta_lambda=None,
+                            omega_intercept=self.omega_intercept,
+                            lambda_intercept=self.lambda_intercept,
+                            max_iter=self.fw_max_iter,
+                            tol=self.fw_tol,
+                        )
+                        vec_b = np.full(tau_grid.size, np.nan, dtype=float)
+                        for j, tau in enumerate(tau_grid):
+                            if int(tau) in att_tau_b:
+                                vec_b[j] = att_tau_b[int(tau)]
+                        mask_post_b = tau_grid >= 0
+                        if np.any(~np.isfinite(vec_b[mask_post_b])):
+                            continue
+                        att_tau_star[:, filled] = vec_b
+                        att_b[filled] = float(att_post_b)
+                        filled += 1
+                    except Exception:
+                        continue
+                if filled == 0:
+                    raise RuntimeError("SDID placebo enumeration failed: 0 successful draws.")
+                att_tau_star = att_tau_star[:, :filled]
+                att_b = att_b[:filled]
+                boot_info["B"] = filled
+                boot_info["post_ATT_draws"] = att_b
+                boot_info["ATT_tau_draws"] = att_tau_star
+                boot_info["enumerated"] = True
+            elif mode == "unit":
+                theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
                 att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)
                 att_b = np.full(B, np.nan, dtype=float)
                 filled = 0
@@ -328,82 +364,60 @@ class SDID:
                 while filled < B and attempts < max_attempts:
                     attempts += 1
                     try:
-                        if mode == "unit":
-                            n_units = Y.shape[0]
-                            n_times = Y.shape[1]
-                            if self.boot_cluster == "twoway":
-                                mult_i = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
-                                mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
-                                mult = mult_i[:, None] * mult_t[None, :]
-                            elif self.boot_cluster == "time":
-                                mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
-                                mult = np.ones((n_units, 1)) * mult_t[None, :]
-                            else:
-                                mult_i = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
-                                mult = mult_i[:, None]
-                            Y_cf = np.zeros_like(Y)
-                            # --- LOO counterfactuals for donors ---
-                            # For each cohort, compute LOO synthetic for each donor
-                            # Y_cf_j = sum(omega_k * Y_k for k != j) / sum(omega_k for k != j)
-                            # This is aggregated across cohorts using inverse-variance-like weighting
-                            donor_cf_count = np.zeros(n_units, dtype=float)
-                            donor_cf_sum = np.zeros_like(Y)
-                            for g, meta in results_g.items():
-                                omega_g = np.asarray(meta["omega"], dtype=float)
-                                donors_idx_g = np.asarray(meta["donors_idx"], dtype=int)
-                                n_donors = len(donors_idx_g)
-                                if n_donors < 2:
-                                    continue  # Cannot compute LOO with fewer than 2 donors
-                                # For each donor j, compute LOO synthetic outcome
-                                for j_local, j_global in enumerate(donors_idx_g):
-                                    mask = np.ones(n_donors, dtype=bool)
-                                    mask[j_local] = False
-                                    omega_loo = omega_g[mask]
-                                    omega_sum = omega_loo.sum()
-                                    if omega_sum > _EPS:
-                                        omega_loo_norm = omega_loo / omega_sum
-                                        Y_donors_loo = Y[donors_idx_g[mask], :]
-                                        y_cf_j = np.average(Y_donors_loo, axis=0, weights=omega_loo_norm)
-                                        donor_cf_sum[j_global, :] += y_cf_j
-                                        donor_cf_count[j_global] += 1.0
-                            # Finalize donor counterfactuals (average across cohorts if overlapping)
-                            donor_mask = donor_cf_count > 0.5
-                            Y_cf[donor_mask, :] = donor_cf_sum[donor_mask, :] / donor_cf_count[donor_mask, None]
-                            # --- Treated unit counterfactuals (original logic) ---
-                            for g, meta in results_g.items():
-                                idx_tr = cohorts[g]
-                                y_sc_g = meta["y_sc"]
-                                lam_g = meta["lambda"]
-                                pre_g = times < g
-                                diff_pre = meta["y_tr"][pre_g] - y_sc_g[pre_g]
-                                bias_g = float(la.dot(lam_g, diff_pre))
-                                Y_cf[idx_tr, :] = y_sc_g + bias_g
-                            att_hat_full = np.zeros_like(Y)
-                            for g, meta in results_g.items():
-                                idx_tr = cohorts[g]
-                                post_g = times >= g
-                                delta_g = meta["delta_t"]
-                                att_hat_full[idx_tr[:, None] & post_g[None, :]] = np.tile(delta_g[post_g], (idx_tr.sum(), 1)).ravel()
-                            U_hat = Y - Y_cf
-                            U_hat[W > 0] -= att_hat_full[W > 0]
-                            mult_full = mult if mult.ndim == 2 else mult[:, None]
-                            Y_b = Y_cf + att_hat_full * (W > 0).astype(float) + U_hat * mult_full
-                            W_b = W.copy()
-                            units_b, times_b = _units, times
+                        n_units = Y.shape[0]
+                        n_times = Y.shape[1]
+                        if self.boot_cluster == "twoway":
+                            mult_i = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                            mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
+                            mult = mult_i[:, None] * mult_t[None, :]
+                        elif self.boot_cluster == "time":
+                            mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
+                            mult = np.ones((n_units, 1)) * mult_t[None, :]
                         else:
-                            if n_control < n_treated_total:
-                                raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
-                            placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)
-                            # CRITICAL: Zero out treatment matrix first, then assign treatment
-                            # to placebo units only. This is a proper permutation-style placebo
-                            # where treated units are REPLACED, not ADDED.
-                            W_b = np.zeros_like(W)
-                            treated_unit_indices = np.flatnonzero(~control_unit_mask)
-                            for i, pu in enumerate(placebo_units):
-                                treated_pattern = W[treated_unit_indices[i % n_treated_total], :]
-                                W_b[pu, :] = treated_pattern
-                            Y_b = Y.copy()
-                            units_b, times_b = _units, times
+                            mult_i = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                            mult = mult_i[:, None]
+                        Y_cf = np.zeros_like(Y)
+                        donor_cf_count = np.zeros(n_units, dtype=float)
+                        donor_cf_sum = np.zeros_like(Y)
+                        for g, meta in results_g.items():
+                            omega_g = np.asarray(meta["omega"], dtype=float)
+                            donors_idx_g = np.asarray(meta["donors_idx"], dtype=int)
+                            n_donors = len(donors_idx_g)
+                            if n_donors < 2:
+                                continue
+                            for j_local, j_global in enumerate(donors_idx_g):
+                                mask = np.ones(n_donors, dtype=bool)
+                                mask[j_local] = False
+                                omega_loo = omega_g[mask]
+                                omega_sum = omega_loo.sum()
+                                if omega_sum > _EPS:
+                                    omega_loo_norm = omega_loo / omega_sum
+                                    Y_donors_loo = Y[donors_idx_g[mask], :]
+                                    y_cf_j = np.average(Y_donors_loo, axis=0, weights=omega_loo_norm)
+                                    donor_cf_sum[j_global, :] += y_cf_j
+                                    donor_cf_count[j_global] += 1.0
+                        donor_mask = donor_cf_count > 0.5
+                        Y_cf[donor_mask, :] = donor_cf_sum[donor_mask, :] / donor_cf_count[donor_mask, None]
+                        for g, meta in results_g.items():
+                            idx_tr = cohorts[g]
+                            y_sc_g = meta["y_sc"]
+                            lam_g = meta["lambda"]
+                            pre_g = times < g
+                            diff_pre = meta["y_tr"][pre_g] - y_sc_g[pre_g]
+                            bias_g = float(la.dot(lam_g, diff_pre))
+                            Y_cf[idx_tr, :] = y_sc_g + bias_g
+                        att_hat_full = np.zeros_like(Y)
+                        for g, meta in results_g.items():
+                            idx_tr = cohorts[g]
+                            post_g = times >= g
+                            delta_g = meta["delta_t"]
+                            att_hat_full[idx_tr[:, None] & post_g[None, :]] = np.tile(delta_g[post_g], (idx_tr.sum(), 1)).ravel()
+                        U_hat = Y - Y_cf
+                        U_hat[W > 0] -= att_hat_full[W > 0]
+                        mult_full = mult if mult.ndim == 2 else mult[:, None]
+                        Y_b = Y_cf + att_hat_full * (W > 0).astype(float) + U_hat * mult_full
+                        W_b = W.copy()
+                        units_b, times_b = _units, times
 
                         att_post_b, att_tau_b = self._att_path_from_w(
                             Y_b, W_b, times_b,
@@ -441,6 +455,8 @@ class SDID:
                 boot_info["B"] = filled
                 boot_info["post_ATT_draws"] = att_b
                 boot_info["ATT_tau_draws"] = att_tau_star
+
+            theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
 
             if filled > 1:
                 se_vals = bt.bootstrap_se(att_tau_star)

@@ -382,14 +382,6 @@ class DREventStudy:
                 raise ValueError(msg)
             perm = df_aug["_origpos"].to_numpy(dtype=np.int64)
             W = W0[perm, :]
-            # STRICT: centre to mean zero and scale to unit variance (E[W]=0, Var[W]=1)
-            W = W - W.mean(axis=0, keepdims=True)
-            v = W.var(axis=0, ddof=0)
-            if not np.all(v > 0):
-                raise ValueError(
-                    "external_W has zero-variance column(s) after recentering; invalid for bootstrap.",
-                )
-            W = W / np.sqrt(v.reshape(1, -1))
         else:
             W_df, _ = boot.make_multipliers(n_obs=df_aug.shape[0])
             W = W_df.to_numpy()

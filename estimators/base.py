@@ -593,7 +593,7 @@ class BootConfig:
         "CGM"  # For VCV only; multipliers ignore this (use `bootcluster`)
     )
     bootcluster: str | None = (
-        "max"  # "max", "min", or dimension name for multiway weights
+        "product"  # "product", "max", "min", "intersection", or dimension name for multiway weights
     )
     cluster_ids: Sequence | None = None
     multiway_ids: Sequence[Sequence] | None = None
@@ -692,9 +692,21 @@ class BootConfig:
         }
 
         if self.multiway_ids is not None:
-            # --- Default bootcluster for multiway: INTERSECTION (boottest/fwildclusterboot parity) ---
             bc = None if self.bootcluster is None else str(self.bootcluster).lower()
-            if bc in {None, "intersection", "intersect", "all"}:
+            if bc in {None, "product", "cgm"}:
+                rng_local = None if self.seed is None else np.random.default_rng(self.seed)
+                W = bt.multiway_multipliers(
+                    [_freeze_input(z) for z in self.multiway_ids],
+                    n_boot=self.n_boot,
+                    rng=rng_local,
+                    dist=d,
+                    policy=policy,
+                    enumeration_mode=enum_mode,
+                )
+                log = {"enumerated": False, "effective_dist": dist, "effective_B": self.n_boot, "warnings": []}
+                log.setdefault("G", len(self.multiway_ids))
+                log.setdefault("enum_attempted", False)
+            elif bc in {"intersection", "intersect", "all"}:
                 keys = np.column_stack(
                     [_freeze_input(z).reshape(-1, 1) for z in self.multiway_ids],
                 )
@@ -709,7 +721,6 @@ class BootConfig:
                     use_enumeration=use_enum,
                     enumeration_mode=enum_mode,
                 )
-                # Enrich log with reproducibility info
                 log.setdefault("G", int(keys.shape[1]))
                 log.setdefault("enum_attempted", bool(log.get("enumerated", False)))
                 log.setdefault("enum_mode", self.enumeration_mode)
@@ -776,9 +787,21 @@ class BootConfig:
                 log.setdefault("G", 1)
                 log.setdefault("enum_attempted", bool(log.get("enumerated", False)))
         elif self.space_ids is not None and self.time_ids is not None:
-            # --- Default for (space,time): INTERSECTION (state×time), boottest parity ---
             bc = None if self.bootcluster is None else str(self.bootcluster).lower()
-            if bc in {None, "intersection", "intersect", "all"}:
+            if bc in {None, "product", "cgm"}:
+                rng_local = None if self.seed is None else np.random.default_rng(self.seed)
+                W = bt.multiway_multipliers(
+                    [_freeze_input(self.space_ids), _freeze_input(self.time_ids)],
+                    n_boot=self.n_boot,
+                    rng=rng_local,
+                    dist=d,
+                    policy=policy,
+                    enumeration_mode=enum_mode,
+                )
+                log = {"enumerated": False, "effective_dist": dist, "effective_B": self.n_boot, "warnings": []}
+                log.setdefault("G", 2)
+                log.setdefault("enum_attempted", False)
+            elif bc in {"intersection", "intersect", "all"}:
                 keys = np.column_stack(
                     [
                         _freeze_input(self.space_ids).reshape(-1, 1),

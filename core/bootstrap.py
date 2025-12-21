@@ -314,9 +314,28 @@ def finite_sample_quantile(t_stats: np.ndarray, alpha: float) -> float:
     B = int(arr.shape[0])
     k = int(np.ceil((B + 1) * float(alpha)))
     k = min(max(k, 1), B)
-    # zero-indexed partition
     quantile_value = np.partition(arr, k - 1)[k - 1]
     return float(quantile_value)
+
+
+_NORM_IQR = 1.3489795003921634
+
+
+def robust_sigma_iqr_normal(x, axis=0):
+    q75 = np.quantile(x, 0.75, axis=axis, method="linear")
+    q25 = np.quantile(x, 0.25, axis=axis, method="linear")
+    return (q75 - q25) / _NORM_IQR
+
+
+def uniform_band_did_mboot(theta_hat, theta_star, alpha=0.05, n_eff=None):
+    if n_eff is None:
+        n_eff = theta_star.shape[0]
+    b = np.sqrt(n_eff) * (theta_star - theta_hat.reshape(1, -1))
+    bSigma = robust_sigma_iqr_normal(b, axis=0)
+    bT = np.max(np.abs(b / bSigma.reshape(1, -1)), axis=1)
+    crit = finite_sample_quantile(bT, 1.0 - alpha)
+    half = crit * bSigma / np.sqrt(n_eff)
+    return theta_hat - half, theta_hat + half, crit, bSigma
 
 
 def rademacher_enumeration(G: int) -> np.ndarray:

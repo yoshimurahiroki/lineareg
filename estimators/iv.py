@@ -1606,93 +1606,162 @@ class IV2SLS(BaseEstimator):
                 "Use wald_test()/ar_test() for {'WCR','WCU_score'} if needed.",
             )
         Wmult, boot_log = self._bootstrap_multipliers(Xw.shape[0], boot=boot)
-        Ystar, _ = bt.apply_wild_bootstrap(yhat, uhat, Wmult.to_numpy())
-        B = Ystar.shape[1]
+        W_arr = Wmult.to_numpy()
+        B = W_arr.shape[1]
         boot_betas = np.empty((Xw.shape[1], B), dtype=np.float64)
 
-        # Apply constraints consistently in each bootstrap replicate. The
-        # point estimate above used a projected constrained solve when
-        # `constraints`/`constraint_vals` were provided; mirror that here by
-        # projecting y_b onto Qz and calling the same constrained solver.
+        qr_res_z = la.qr(la.to_dense(Zw), mode="economic", pivoting=True)
+        if len(qr_res_z) == 3:
+            Qz_rf, Rz_rf, _piv_rf = qr_res_z
+        else:
+            Qz_rf, Rz_rf = qr_res_z
+        diagR_rf = (
+            np.abs(np.diag(la.to_dense(Rz_rf))) if getattr(Rz_rf, "size", 0) else np.array([])
+        )
+        r_rf = (
+            la.rank_from_diag(diagR_rf, Zw.shape[1], mode=self._rank_policy)
+            if diagR_rf.size
+            else 0
+        )
+        if r_rf == 0:
+            raise RuntimeError("Instrument matrix Z is rank-deficient (rank=0) in reduced-form bootstrap.")
+        Qz_rf = Qz_rf[:, :r_rf]
+
+        y_rf_hat = la.dot(Qz_rf, la.dot(Qz_rf.T, yw))
+        e_y = yw - y_rf_hat
+
+        endog_idx_local = self.endog_idx if hasattr(self, "endog_idx") else []
+        if len(endog_idx_local) == 0:
+            Ystar, _ = bt.apply_wild_bootstrap(yhat, uhat, W_arr)
+        else:
+            X_endog = Xw[:, endog_idx_local]
+            X_rf_hat = la.dot(Qz_rf, la.dot(Qz_rf.T, X_endog))
+            e_x = X_endog - X_rf_hat
+
         with self._device_context(device):
-            if constraints is None or constraint_vals is None:
-                # Vectorized 2SLS across bootstrap draws using projection via Qz
-                # Compute economy QR of Z once and retain identified columns per rank policy
-                qr_res = la.qr(la.to_dense(Zw), mode="economic", pivoting=True)
-                if len(qr_res) == 3:
-                    Qz_loc, Rz_loc, _piv_loc = qr_res
-                else:
-                    Qz_loc, Rz_loc = qr_res
-                diagR_loc = (
-                    np.abs(np.diag(la.to_dense(Rz_loc))) if getattr(Rz_loc, "size", 0) else np.array([])
-                )
-                r_loc = (
-                    la.rank_from_diag(diagR_loc, Zw.shape[1], mode=self._rank_policy)
-                    if diagR_loc.size
-                    else 0
-                )
-                if r_loc == 0:
-                    raise RuntimeError("Instrument matrix Z is rank-deficient (rank=0).")
-                Qz_eff = Qz_loc[:, :r_loc]
-                # Project X and all bootstrap outcomes Ystar at once
-                X_t = la.dot(Qz_eff.T, Xw)
-                Y_t = la.dot(Qz_eff.T, Ystar)
-                # Solve for all RHS in one QR solve; la.solve supports multi-RHS
-                beta_all = la.solve(
-                    X_t, Y_t, method=method, rank_policy=self._rank_policy,
-                )  # shape (K, B)
-                boot_betas[:, :] = np.asarray(beta_all)
+            if len(endog_idx_local) > 0:
+                for b in range(B):
+                    w_b = W_arr[:, b:b+1]
+                    y_star_b = y_rf_hat + e_y * w_b
+                    X_star_b = Xw.copy() if isinstance(Xw, np.ndarray) else la.to_dense(Xw).copy()
+                    for j_enum, j_col in enumerate(endog_idx_local):
+                        X_star_b[:, j_col:j_col+1] = X_rf_hat[:, j_enum:j_enum+1] + e_x[:, j_enum:j_enum+1] * w_b
+
+                    if constraints is None or constraint_vals is None:
+                        qr_res_b = la.qr(la.to_dense(Zw), mode="economic", pivoting=True)
+                        if len(qr_res_b) == 3:
+                            Qz_b, Rz_b, _piv_b = qr_res_b
+                        else:
+                            Qz_b, Rz_b = qr_res_b
+                        diagR_b = (
+                            np.abs(np.diag(la.to_dense(Rz_b))) if getattr(Rz_b, "size", 0) else np.array([])
+                        )
+                        r_b = (
+                            la.rank_from_diag(diagR_b, Zw.shape[1], mode=self._rank_policy)
+                            if diagR_b.size
+                            else 0
+                        )
+                        if r_b == 0:
+                            boot_betas[:, b] = np.nan
+                            continue
+                        Qz_b_eff = Qz_b[:, :r_b]
+                        X_t_b = la.dot(Qz_b_eff.T, X_star_b)
+                        y_t_b = la.dot(Qz_b_eff.T, y_star_b)
+                        beta_b = la.solve(X_t_b, y_t_b, method=method, rank_policy=self._rank_policy)
+                        boot_betas[:, b] = np.asarray(beta_b).reshape(-1)
+                    else:
+                        if "Qz" not in locals():
+                            qr_res = la.qr(la.to_dense(Zw), mode="economic", pivoting=True)
+                            if len(qr_res) == 3:
+                                Qz_tmp, Rz_tmp, _p = qr_res
+                            else:
+                                Qz_tmp, Rz_tmp = qr_res
+                            diagR_tmp = (
+                                np.abs(np.diag(la.to_dense(Rz_tmp)))
+                                if Rz_tmp.size
+                                else np.array([])
+                            )
+                            r_tmp = (
+                                la.rank_from_diag(diagR_tmp, Zw.shape[1], mode=self._rank_policy)
+                                if diagR_tmp.size
+                                else 0
+                            )
+                            if r_tmp == 0:
+                                raise RuntimeError("Instrument matrix Z is rank-deficient (rank=0).")
+                            Qz = Qz_tmp[:, :r_tmp]
+                        X_t_b = la.dot(Qz.T, X_star_b)
+                        y_t_b = la.dot(Qz.T, y_star_b)
+                        beta_b = solve_constrained(X_t_b, y_t_b, constraints, constraint_vals)
+                        boot_betas[:, b] = np.asarray(beta_b).reshape(-1)
             else:
-                # Ensure Qz (trimmed to instrument rank) is available; if not,
-                # compute it similarly to the identification stage above.
-                if "Qz" not in locals():
+                Ystar, _ = bt.apply_wild_bootstrap(yhat, uhat, W_arr)
+                if constraints is None or constraint_vals is None:
                     qr_res = la.qr(la.to_dense(Zw), mode="economic", pivoting=True)
                     if len(qr_res) == 3:
-                        Qz_tmp, Rz_tmp, _p = qr_res
+                        Qz_loc, Rz_loc, _piv_loc = qr_res
                     else:
-                        Qz_tmp, Rz_tmp = qr_res
-                    diagR_tmp = (
-                        np.abs(np.diag(la.to_dense(Rz_tmp)))
-                        if Rz_tmp.size
-                        else np.array([])
+                        Qz_loc, Rz_loc = qr_res
+                    diagR_loc = (
+                        np.abs(np.diag(la.to_dense(Rz_loc))) if getattr(Rz_loc, "size", 0) else np.array([])
                     )
-                    r_tmp = (
-                        la.rank_from_diag(diagR_tmp, Zw.shape[1], mode=self._rank_policy)
-                        if diagR_tmp.size
+                    r_loc = (
+                        la.rank_from_diag(diagR_loc, Zw.shape[1], mode=self._rank_policy)
+                        if diagR_loc.size
                         else 0
                     )
-                    if r_tmp == 0:
-                        raise RuntimeError(
-                            "Instrument matrix Z is rank-deficient (rank=0).",
-                        )
-                    Qz = Qz_tmp[:, :r_tmp]
-
-                # Project X onto Qz once for efficiency
-                X_t = la.dot(Qz.T, Xw)
-                # Optional threaded bootstrap for constrained case (independent draws)
-                workers_env = os.getenv("LINEAREG_IV_BOOTSTRAP_WORKERS", "").strip()
-                try:
-                    workers = int(workers_env) if workers_env else 0
-                except ValueError:
-                    workers = 0
-                do_parallel = (workers and workers > 1) and (
-                    device is None or str(device).lower() == "cpu"
-                )
-
-                def _solve_one(b: int) -> tuple[int, np.ndarray]:
-                    yb = Ystar[:, b : b + 1]
-                    yb_t = la.dot(Qz.T, yb)
-                    beta_b = solve_constrained(X_t, yb_t, constraints, constraint_vals)
-                    return b, np.asarray(beta_b).reshape(-1)
-
-                if do_parallel:
-                    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-                        for b_idx, beta_vec in ex.map(_solve_one, range(B)):
-                            boot_betas[:, b_idx] = beta_vec
+                    if r_loc == 0:
+                        raise RuntimeError("Instrument matrix Z is rank-deficient (rank=0).")
+                    Qz_eff = Qz_loc[:, :r_loc]
+                    X_t = la.dot(Qz_eff.T, Xw)
+                    Y_t = la.dot(Qz_eff.T, Ystar)
+                    beta_all = la.solve(
+                        X_t, Y_t, method=method, rank_policy=self._rank_policy,
+                    )
+                    boot_betas[:, :] = np.asarray(beta_all)
                 else:
-                    for b in range(B):
-                        _, beta_vec = _solve_one(b)
-                        boot_betas[:, b] = beta_vec
+                    if "Qz" not in locals():
+                        qr_res = la.qr(la.to_dense(Zw), mode="economic", pivoting=True)
+                        if len(qr_res) == 3:
+                            Qz_tmp, Rz_tmp, _p = qr_res
+                        else:
+                            Qz_tmp, Rz_tmp = qr_res
+                        diagR_tmp = (
+                            np.abs(np.diag(la.to_dense(Rz_tmp)))
+                            if Rz_tmp.size
+                            else np.array([])
+                        )
+                        r_tmp = (
+                            la.rank_from_diag(diagR_tmp, Zw.shape[1], mode=self._rank_policy)
+                            if diagR_tmp.size
+                            else 0
+                        )
+                        if r_tmp == 0:
+                            raise RuntimeError("Instrument matrix Z is rank-deficient (rank=0).")
+                        Qz = Qz_tmp[:, :r_tmp]
+                    X_t = la.dot(Qz.T, Xw)
+                    workers_env = os.getenv("LINEAREG_IV_BOOTSTRAP_WORKERS", "").strip()
+                    try:
+                        workers = int(workers_env) if workers_env else 0
+                    except ValueError:
+                        workers = 0
+                    do_parallel = (workers and workers > 1) and (
+                        device is None or str(device).lower() == "cpu"
+                    )
+
+                    def _solve_one(b: int) -> tuple[int, np.ndarray]:
+                        yb = Ystar[:, b : b + 1]
+                        yb_t = la.dot(Qz.T, yb)
+                        beta_b = solve_constrained(X_t, yb_t, constraints, constraint_vals)
+                        return b, np.asarray(beta_b).reshape(-1)
+
+                    if do_parallel:
+                        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                            for b_idx, beta_vec in ex.map(_solve_one, range(B)):
+                                boot_betas[:, b_idx] = beta_vec
+                    else:
+                        for b in range(B):
+                            _, beta_vec = _solve_one(b)
+                            boot_betas[:, b] = beta_vec
         se_vals = bt.bootstrap_se(boot_betas)
         se = pd.Series(se_vals, index=var_names_work, name="se")
 

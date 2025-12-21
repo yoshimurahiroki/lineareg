@@ -1064,43 +1064,58 @@ class GMM(BaseEstimator):
                 enumeration_mode=getattr(boot, "enumeration_mode", "boottest"),
             )
         Wmult, boot_log = self._bootstrap_multipliers(n_eff, boot=boot)
-        # Reflect the actual MNW variant selected by core.bootstrap in logs
-        # boot_log may contain keys like 'mnw_variant_used' or 'variant' describing
-        # the exact variant (e.g., '11','33','33J', 'webb', etc.). Prefer explicit key.
         _variant = None
         if isinstance(boot_log, dict):
             _variant = boot_log.get("mnw_variant_used") or boot_log.get("variant")
 
-        Ystar, _ = bt.apply_wild_bootstrap(
-            yhat, u, Wmult.to_numpy(), residual_type="unrestricted",
-        )
+        W_arr = Wmult.to_numpy()
+        B_boot = W_arr.shape[1]
+
+        endog_idx_local = self.endog_idx if hasattr(self, "endog_idx") else []
+        if len(endog_idx_local) > 0:
+            Qz_rf_gmm = la.dot(Z, la.pinv(la.crossprod(Z, Z)))
+            Qz_rf_gmm = la.dot(Qz_rf_gmm, la.crossprod(Z, Z))
+            y_rf_hat_gmm = la.dot(Z, la.dot(la.pinv(la.crossprod(Z, Z)), la.crossprod(Z, y)))
+            e_y_gmm = y - y_rf_hat_gmm
+            X_endog_gmm = X[:, endog_idx_local]
+            X_rf_hat_gmm = la.dot(Z, la.dot(la.pinv(la.crossprod(Z, Z)), la.crossprod(Z, X_endog_gmm)))
+            e_x_gmm = X_endog_gmm - X_rf_hat_gmm
+        else:
+            Ystar, _ = bt.apply_wild_bootstrap(yhat, u, W_arr, residual_type="unrestricted")
 
         if (
             weight_type.lower() in {"2sls", "1step", "one-step", "identity"}
             and constraints is None
             and constraint_vals is None
+            and len(endog_idx_local) == 0
         ):
-            # Vectorized 1-step path: constant weight W_1
             with self._device_context(device):
                 G1 = la.crossprod(X, la.dot(Z, la.dot(W_1, la.crossprod(Z, X))))
-                ZtYstar = la.crossprod(Z, Ystar)  # (L x B)
-                g_star = la.dot(la.crossprod(X, Z), la.dot(W_1, ZtYstar))  # (K x B)
-                # Use QR-based symmetric solve for bootstrap path (QR-only policy)
+                ZtYstar = la.crossprod(Z, Ystar)
+                g_star = la.dot(la.crossprod(X, Z), la.dot(W_1, ZtYstar))
                 boot_betas = la.solve(G1, g_star, sym_pos=True)
         else:
-            B = Ystar.shape[1]
+            B = B_boot if len(endog_idx_local) > 0 else Ystar.shape[1]
             boot_betas = np.empty((self.n_features, B), dtype=np.float64)
             with self._device_context(device):
                 for b in range(B):
-                    yb = Ystar[:, b : b + 1]
+                    if len(endog_idx_local) > 0:
+                        w_b = W_arr[:, b:b+1]
+                        y_star_b = y_rf_hat_gmm + e_y_gmm * w_b
+                        X_star_b = X.copy() if isinstance(X, np.ndarray) else la.to_dense(X).copy()
+                        for j_enum, j_col in enumerate(endog_idx_local):
+                            X_star_b[:, j_col:j_col+1] = X_rf_hat_gmm[:, j_enum:j_enum+1] + e_x_gmm[:, j_enum:j_enum+1] * w_b
+                        yb = y_star_b
+                    else:
+                        yb = Ystar[:, b : b + 1]
+                        X_star_b = X
                     if weight_type.lower() in {"2sls", "1step", "one-step", "identity"}:
                         boot_betas[:, b] = self._gmm_solve(
-                            X, Z, yb, W_1, weights_proc, constraints, constraint_vals,
+                            X_star_b, Z, yb, W_1, weights_proc, constraints, constraint_vals,
                         ).reshape(-1)
                     else:
-                        beta1_b, _ = self._gmm_1step(X, Z, yb, weights_proc)
-                        u1_b = yb.reshape(-1) - la.dot(X, beta1_b).reshape(-1)
-                        # Use raw S in replicate estimation as well
+                        beta1_b, _ = self._gmm_1step(X_star_b, Z, yb, weights_proc)
+                        u1_b = yb.reshape(-1) - la.dot(X_star_b, beta1_b).reshape(-1)
                         S_b = self._moment_covariance(
                             Z,
                             u1_b,
@@ -1116,8 +1131,6 @@ class GMM(BaseEstimator):
                             fe_count=fe_count,
                             fe_nested_mask=fe_nested_mask,
                         )
-                        # Maintain scaling consistency: weight matrix is inverse of
-                        # S_bar = S_b / scale_b where scale_b mirrors the estimation scale
                         scale_b = (
                             float(X.shape[0])
                             if (weights_proc is None)
@@ -1134,7 +1147,7 @@ class GMM(BaseEstimator):
                         Wk_b = la.chol_solve(Lk_b, la.eye(Sk_b.shape[0]))
                         W_b = la.dot(Q_b[:, keep_b], la.dot(Wk_b, Q_b[:, keep_b].T))
                         boot_betas[:, b] = self._gmm_solve(
-                            X, Z, yb, W_b, weights_proc, constraints, constraint_vals,
+                            X_star_b, Z, yb, W_b, weights_proc, constraints, constraint_vals,
                         ).reshape(-1)
 
         se_hat = bt.bootstrap_se(boot_betas)

@@ -247,51 +247,68 @@ class DDDEventStudy:
             raise ValueError(msg)
 
         if use_cluster or use_time or use_space:
-            # Multiway support:
-            # - include cluster if provided
-            # - include both space and time when both provided
-            clusters_all: list = []
-            if use_cluster:
-                clusters_all.append(np.asarray(boot_shared.cluster_ids))
-            if use_space and use_time:
-                clusters_all.append(np.asarray(boot_shared.space_ids))
-                clusters_all.append(np.asarray(boot_shared.time_ids))
-            bootcluster = "intersection" if len(clusters_all) > 1 else "first"
-            W_all, wlog = bt.cluster_multipliers(
-                clusters_all,
-                n_boot=boot_shared.n_boot,
-                dist=getattr(boot_shared, "dist", "standard_normal"),
-                use_enumeration=(
-                    False
-                    if len(clusters_all) > 1
-                    else getattr(boot_shared, "use_enumeration", True)
-                ),
-                enumeration_mode=(
-                    "boottest"
-                    if len(clusters_all) > 1
-                    else getattr(boot_shared, "enumeration_mode", "boottest")
-                ),
-                enum_max_g=None,
-                policy=getattr(boot_shared, "policy", None),
-                bootcluster=bootcluster,
-            )
+            if use_cluster and (use_space or use_time):
+                multiway_list = [np.asarray(boot_shared.cluster_ids)]
+                if use_space:
+                    multiway_list.append(np.asarray(boot_shared.space_ids))
+                if use_time:
+                    multiway_list.append(np.asarray(boot_shared.time_ids))
+                boot_all = BootConfig(
+                    n_boot=boot_shared.n_boot,
+                    dist=getattr(boot_shared, "dist", "standard_normal"),
+                    multiway_ids=multiway_list,
+                    bootcluster="product",
+                    policy=getattr(boot_shared, "policy", "boottest"),
+                    use_enumeration=False,
+                    seed=getattr(boot_shared, "seed", None),
+                )
+            elif use_space and use_time:
+                boot_all = BootConfig(
+                    n_boot=boot_shared.n_boot,
+                    dist=getattr(boot_shared, "dist", "standard_normal"),
+                    space_ids=boot_shared.space_ids,
+                    time_ids=boot_shared.time_ids,
+                    bootcluster="product",
+                    policy=getattr(boot_shared, "policy", "boottest"),
+                    use_enumeration=False,
+                    seed=getattr(boot_shared, "seed", None),
+                )
+            elif use_cluster:
+                boot_all = BootConfig(
+                    n_boot=boot_shared.n_boot,
+                    dist=getattr(boot_shared, "dist", "standard_normal"),
+                    cluster_ids=boot_shared.cluster_ids,
+                    policy=getattr(boot_shared, "policy", "boottest"),
+                    use_enumeration=getattr(boot_shared, "use_enumeration", True),
+                    seed=getattr(boot_shared, "seed", None),
+                )
+            elif use_space:
+                boot_all = BootConfig(
+                    n_boot=boot_shared.n_boot,
+                    dist=getattr(boot_shared, "dist", "standard_normal"),
+                    cluster_ids=boot_shared.space_ids,
+                    policy=getattr(boot_shared, "policy", "boottest"),
+                    use_enumeration=getattr(boot_shared, "use_enumeration", True),
+                    seed=getattr(boot_shared, "seed", None),
+                )
+            else:
+                boot_all = BootConfig(
+                    n_boot=boot_shared.n_boot,
+                    dist=getattr(boot_shared, "dist", "standard_normal"),
+                    cluster_ids=boot_shared.time_ids,
+                    policy=getattr(boot_shared, "policy", "boottest"),
+                    use_enumeration=getattr(boot_shared, "use_enumeration", True),
+                    seed=getattr(boot_shared, "seed", None),
+                )
+            W_all_df, wlog = boot_all.make_multipliers(len(df.index))
+            W_all = W_all_df.to_numpy(dtype=np.float64)
         else:
-            # IID wild multipliers at the observation level (Rademacher by default)
             W_all = bt.wild_multipliers(
                 len(df.index), n_boot=boot_shared.n_boot, dist="standard_normal",
             )
             wlog = {"method": "iid", "effective_B": int(W_all.shape[1])}
 
-        # Enforce zero column means on the UNION once (shared-W principle), then slice
         W_all = W_all.astype(np.float64, copy=True)
-        # Centre to mean zero and scale to unit variance (E[W]=0, Var[W]=1) per column
-        W_all -= W_all.mean(axis=0, keepdims=True)
-        v = W_all.var(axis=0, ddof=0)
-        if not np.all(v > 0.0):
-            raise ValueError(
-                "external W (union) has zero-variance column(s) after recentering.",
-            )
-        W_all /= np.sqrt(v.reshape(1, -1))
 
         df_with_pos = df.copy()
         df_with_pos["__orig_pos__"] = np.arange(len(df))

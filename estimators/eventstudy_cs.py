@@ -544,17 +544,6 @@ class CallawaySantAnnaES:
         # group_size is computed later (line ~809) after exclusion filters;
         # prior accumulation code was removed as it was shadowed.
 
-        # W is aligned to df_aug row order (shared columns across cells)
-        # center columns (finite-sample recentering) and scale to unit variance (did/DRDID compatible)
-        if W is not None:
-            W = W - W.mean(axis=0, keepdims=True)
-            v = np.var(W, axis=0, ddof=0)
-            if not np.all(v > 0.0):
-                raise ValueError(
-                    "bootstrap multipliers have zero-variance column(s) after recentering.",
-                )
-            W = W / np.sqrt(v.reshape(1, -1))
-
         for g, t, pret in cell_keys:
             mask_t = df_aug[self.t_name].to_numpy() == t
             ctrl_mask = spec.control_mask(df_aug, g, t, pret, times_all)

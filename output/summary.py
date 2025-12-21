@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 from tabulate import tabulate
 
+from lineareg.core import bootstrap as bt
 # Keep package-relative imports centralized in helpers; use absolute package paths.
 from lineareg.estimators.base import EstimationResult
 from lineareg.spatial.spatial import moran_i as _moran_i
@@ -299,14 +300,14 @@ def modelsummary(  # noqa: PLR0913
                                 meta = bands.setdefault("__meta__", {})
                                 meta.setdefault("kind", "uniform")
                                 meta.setdefault("estimator", "eventstudy")
-                            # Derive SE from CI bands (SE ≈ (upper - lower) / (2 * 1.96) for 95% CI)
                             spill_se = None
                             try:
-                                full_bands = bands.get("full")
-                                if isinstance(full_bands, pd.DataFrame) and {"lower", "upper"}.issubset(full_bands.columns):
-                                    spill_se = (full_bands["upper"] - full_bands["lower"]) / (2 * 1.96)
-                                    spill_se.index = spill_series.index
-                            except (KeyError, TypeError, ValueError):
+                                spill_boot_star = extra.get("spill_tau_star")
+                                if spill_boot_star is not None and isinstance(spill_boot_star, np.ndarray) and spill_boot_star.shape[1] > 1:
+                                    spill_se = pd.Series(bt.bootstrap_se(spill_boot_star), index=spill_series.index, name="se")
+                                elif _res.se is not None:
+                                    spill_se = _res.se
+                            except (KeyError, TypeError, ValueError, AttributeError):
                                 spill_se = None
                             info = dict(_res.model_info)
                             info["Estimator"] = f"{info.get('Estimator', '')} (Spill)"

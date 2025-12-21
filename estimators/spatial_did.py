@@ -1161,6 +1161,7 @@ class SpatialDID:
                 ),
                 "spill_tau": spi_tau_out,
                 "beta_s_tau": bs_tau_out,
+                "spill_tau_star": spi_tau_star,
                 "W_multipliers_inference": W_used,
                 "bands_source": "bootstrap",
                 "se_source": se_source_val,

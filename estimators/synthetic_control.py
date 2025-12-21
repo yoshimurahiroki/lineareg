@@ -603,8 +603,19 @@ class SyntheticControl:
                                 t0_col = t_to_col.get(g, 0)
                                 for i_tr, y_syn in zip(row_ids, y_synth_list):
                                     Y_cf[i_tr, :] = y_syn
+                            # Build treatment effect matrix delta_hat_full for treated-post cells
+                            delta_hat_full = np.zeros_like(Y)
+                            for g, meta in results_g.items():
+                                att_path_g = np.asarray(meta["att_path"], dtype=float)
+                                t0_col = t_to_col.get(g, 0)
+                                for tid in meta["treated_ids"]:
+                                    i_tr = id_to_row[tid]
+                                    delta_hat_full[i_tr, t0_col:] = att_path_g[t0_col:]
+                            # Compute residuals and REMOVE estimated treatment effect (SDID-consistent)
                             U_hat = Y - Y_cf
-                            Y_b = Y_cf + U_hat * mult[:, None]
+                            U_hat[W > 0] -= delta_hat_full[W > 0]
+                            # Generate bootstrap sample: Y_b = Y_cf + delta_hat*(W>0) + U_hat*mult
+                            Y_b = Y_cf + delta_hat_full * (W > 0).astype(float) + U_hat * mult[:, None]
                             ids_b, times_b = ids, times
                             cohorts_b = {g: meta["treated_ids"] for g, meta in results_g.items()}
                             donors_b = donors

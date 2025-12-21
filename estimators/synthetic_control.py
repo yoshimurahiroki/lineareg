@@ -468,13 +468,15 @@ class SyntheticControl:
 
             mode = (getattr(boot, "mode", None) or "auto").lower()
             if mode == "auto":
-                mode = "unit" if n_treated_total >= 2 else "placebo"
+                mode = "unit" if n_treated_total >= 2 else "permutation"
             if mode not in {"unit", "placebo", "permutation"}:
                 raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'permutation'}.")
             if mode == "unit" and n_treated_total < 2:
-                raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='placebo' or mode='permutation'.")
+                raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='permutation'.")
             if n_treated_total >= 2 and mode in {"placebo", "permutation"}:
                 raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit'), not placebo/permutation.")
+            if n_treated_total == 1 and mode == "placebo":
+                raise ValueError("Policy: treated=1 inference should use permutation (full donor enumeration), not random placebo. Use mode='permutation'.")
 
             theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
 

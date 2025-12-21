@@ -687,12 +687,12 @@ class CallawaySantAnnaES:
                 w0 = (1.0 - Dg) * ps_safe / (1.0 - ps_safe)
                 den1 = float(w1.sum()) if w1.sum() > 0 else 1.0
                 den0 = float(w0.sum()) if w0.sum() > 0 else 1.0
-                R1 = float((w1 * (dY - m0)).sum() / den1)
+                R1 = float((w1 * (dY - m1)).sum() / den1)
                 R0 = float((w0 * (dY - m0)).sum() / den0)
                 n_treat_local = int(Dg.sum())
                 mu_aug = float((Dg * (m1 - m0)).sum() / n_treat_local) if n_treat_local > 0 else 0.0
                 att = mu_aug + R1 - R0
-                psi_t = (w1 * (dY - m0)) / den1 - R1 * (w1 / den1)
+                psi_t = (w1 * (dY - m1)) / den1 - R1 * (w1 / den1)
                 psi_c = -(w0 * (dY - m0)) / den0 + R0 * (w0 / den0)
                 aug = np.zeros_like(dY)
                 if n_treat_local > 0:
@@ -721,8 +721,9 @@ class CallawaySantAnnaES:
                         Iinv = np.linalg.solve(Ihat, np.eye(Ihat.shape[0]))
                     except np.linalg.LinAlgError:
                         Iinv = np.linalg.pinv(Ihat)
-                    resid_dr = dY - m0
-                    sens_ps = np.mean(w0.reshape(-1, 1) * resid_dr.reshape(-1, 1) * X_ps, axis=0)
+                    resid_dr_t = (dY - m1) * Dg
+                    resid_dr_c = (dY - m0) * (1.0 - Dg)
+                    sens_ps = np.mean(w0.reshape(-1, 1) * resid_dr_c.reshape(-1, 1) * X_ps, axis=0)
                     IF_gamma = score @ Iinv
                     psi_ps = (IF_gamma @ sens_ps.reshape(-1, 1)).reshape(-1)
                     psi_centered = psi_centered + psi_ps - float(psi_ps.mean())

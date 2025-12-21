@@ -918,7 +918,42 @@ def cluster_multipliers(  # noqa: PLR0913
         sizes = [np.unique(ids_dim).size for ids_dim in clusters_list]
         if isinstance(bootcluster, str):
             bk = bootcluster.lower()
-            if bk in {"max", "largest"}:
+            if bk in {"twoway", "product"} and len(clusters_list) == 2:
+                ids_0 = clusters_list[0]
+                ids_1 = clusters_list[1]
+                labels_0, inv_0 = np.unique(ids_0, return_inverse=True)
+                labels_1, inv_1 = np.unique(ids_1, return_inverse=True)
+                G0 = labels_0.size
+                G1 = labels_1.size
+                D = dist if isinstance(dist, WildDist) else WildDist(str(dist), policy=policy)
+                if D.name in {"rademacher", "rad"}:
+                    v0 = rng.choice(np.array([-1.0, 1.0]), size=(G0, n_boot))
+                    v1 = rng.choice(np.array([-1.0, 1.0]), size=(G1, n_boot))
+                elif D.name == "webb":
+                    weights_w = np.array([-1.0, -np.sqrt(0.5), 0.0, np.sqrt(0.5), 1.0])
+                    probs_w = np.array([1.0/6, 1.0/6, 1.0/3, 1.0/6, 1.0/6])
+                    v0 = rng.choice(weights_w, size=(G0, n_boot), p=probs_w)
+                    v1 = rng.choice(weights_w, size=(G1, n_boot), p=probs_w)
+                elif D.name == "mammen":
+                    s5 = np.sqrt(5.0)
+                    w1, w2 = -(s5 - 1.0) / 2.0, (s5 + 1.0) / 2.0
+                    p1, p2 = (s5 + 1.0) / (2.0 * s5), (s5 - 1.0) / (2.0 * s5)
+                    v0 = rng.choice(np.array([w1, w2]), size=(G0, n_boot), p=np.array([p1, p2]))
+                    v1 = rng.choice(np.array([w1, w2]), size=(G1, n_boot), p=np.array([p1, p2]))
+                else:
+                    v0 = rng.standard_normal((G0, n_boot))
+                    v1 = rng.standard_normal((G1, n_boot))
+                Wobs = v0[inv_0, :] * v1[inv_1, :]
+                log = {
+                    "mode": "twoway_product",
+                    "G0": G0,
+                    "G1": G1,
+                    "n_boot": n_boot,
+                    "dist": D.name,
+                    "enumerated": False,
+                }
+                return Wobs, log
+            elif bk in {"max", "largest"}:
                 dim_idx = int(np.argmax(sizes))
             elif bk in {"min", "smallest"}:
                 dim_idx = int(np.argmin(sizes))
@@ -930,7 +965,7 @@ def cluster_multipliers(  # noqa: PLR0913
                 ids = inv.astype(int, copy=False)
                 dim_idx = -1
             else:
-                msg = "bootcluster must be 'intersection','max','min','first', or integer index"
+                msg = "bootcluster must be 'twoway','intersection','max','min','first', or integer index"
                 raise ValueError(msg)
         elif isinstance(bootcluster, int) and 0 <= int(bootcluster) < len(
             clusters_list,

@@ -176,7 +176,7 @@ def _solve_qr_lp(
     # Use the adopted active solution (res or res2) for objective verification
     u_plus = active.x[k : k + n]
     u_minus = active.x[k + n : k + 2 * n]
-    obj_unperturbed = float(tau * np.sum(u_plus) + (1.0 - tau) * np.sum(u_minus))
+    obj_unperturbed = float(np.sum(w.ravel() * (tau * u_plus + (1.0 - tau) * u_minus)))
     tol_obj = 1e-6 * max(1.0, abs(obj_unperturbed))
     perturbation_effect = abs(
         obj_unperturbed - float(active.fun - la.dot(tie, active.x[:k])),
@@ -342,7 +342,7 @@ def _solve_qr_lp_prepared(
     # objective perturbation check (same policy as _solve_qr_lp)
     u_plus = active.x[k : k + n]
     u_minus = active.x[k + n : k + 2 * n]
-    obj_unperturbed = float(tau * np.sum(u_plus) + (1.0 - tau) * np.sum(u_minus))
+    obj_unperturbed = float(np.sum(w.ravel() * (tau * u_plus + (1.0 - tau) * u_minus)))
     tol_obj = 1e-6 * max(1.0, abs(obj_unperturbed))
     # la.dot expects array-likes; ensure 1-D inputs
     perturbation_effect = abs(

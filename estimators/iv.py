@@ -1964,9 +1964,7 @@ class IV2SLS(BaseEstimator):
         Wmat = Wmult_df.to_numpy()
         B_actual = Wmat.shape[1]
 
-        # Determine residual_type behavior: default to WCU (wild cluster unrestricted)
-        rtype = getattr(boot, "residual_type", "WCU")
-        # Prepare base y and residuals according to requested type
+        rtype = getattr(boot, "residual_type", "WCU_score")
         yhat_U = la.dot(X, beta_hat)
         if rtype == "WCR":
             base_y = yhat_R
@@ -1975,11 +1973,9 @@ class IV2SLS(BaseEstimator):
             base_y = yhat_U
             base_u = uhat
             if rtype == "WCU_score":
-                # Score re-centering to match bootstrap.py behavior: use IV (Z)-based score recentering
                 try:
                     base_u = bt.score_recentering_iv(base_u, Z, cluster_ids_use)
-                except Exception:  # noqa: BLE001
-                    # fall back to unrestricted resid if score re-centering fails
+                except Exception:
                     base_u = uhat
 
         betas_star = np.empty((X.shape[1], B_actual), dtype=np.float64)

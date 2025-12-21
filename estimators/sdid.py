@@ -302,6 +302,14 @@ class SDID:
                 raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='placebo'.")
             if n_treated_total >= 2 and mode == "placebo":
                 raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit'), not placebo.")
+            if n_treated_total == 1 and mode == "placebo":
+                import warnings
+                warnings.warn(
+                    "Policy recommendation: treated=1 should ideally use full donor enumeration (permutation test). "
+                    "Current placebo mode uses random draws. For exact inference, implement full donor enumeration.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
             theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
 

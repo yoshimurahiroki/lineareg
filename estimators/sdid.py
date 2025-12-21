@@ -223,7 +223,8 @@ class SDID:
             results_g[g] = {
                 "omega": omega,
                 "lambda": lam,
-                "fw_meta": fw_meta,  # diagnostics: iterations, last gap, sparsity
+                "bias": bias,
+                "fw_meta": fw_meta,
                 "post_ATT": att_post_g,
                 "n_tr": N1,
                 "T0": T0,
@@ -231,7 +232,7 @@ class SDID:
                 "delta_t": delta_gt,
                 "y_tr": y_tr_mean,
                 "y_sc": y_co_omega,
-                "donors_idx": donors_idx,  # indices into Y for donors
+                "donors_idx": donors_idx,
             }
 
         # Aggregate across cohorts in event time τ = t - g
@@ -296,13 +297,73 @@ class SDID:
                 mode = "unit" if n_treated_total >= 2 else "placebo"
             if mode == "jackknife":
                 raise ValueError("SDID jackknife is disabled per bootstrap-only inference policy. Use mode='unit' (treated>=2) or mode='placebo'.")
-            if mode not in {"unit", "placebo"}:
-                raise ValueError("SDID boot mode must be 'unit' or 'placebo'.")
+            if mode not in {"unit", "placebo", "if"}:
+                raise ValueError("SDID boot mode must be 'unit', 'placebo', or 'if'.")
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SDID unit bootstrap needs >=2 treated units. Use mode='placebo'.")
             if n_treated_total >= 2 and mode == "placebo":
                 raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit'), not placebo.")
-            if n_treated_total == 1 and mode == "placebo":
+            if mode == "if":
+                n_units, n_times = Y.shape
+                Y_cf = np.zeros((n_units, n_times), dtype=float)
+                att_hat_full = np.zeros((n_units, n_times), dtype=float)
+                cohort_count = np.zeros(n_units, dtype=float)
+
+                for g, meta in results_g.items():
+                    donors_idx = np.asarray(meta["donors_idx"], dtype=int)
+                    omega = np.asarray(meta["omega"], dtype=float).reshape(-1)
+                    idx_tr = cohorts[g]
+                    y_sc = np.asarray(meta["y_sc"], dtype=float).reshape(-1)
+                    bias = float(meta["bias"])
+
+                    omega_sum = float(omega.sum())
+                    if omega_sum <= 0:
+                        continue
+                    omega = omega / omega_sum
+
+                    for j_local, j_global in enumerate(donors_idx):
+                        denom = 1.0 - omega[j_local]
+                        if denom <= 0:
+                            continue
+                        omega_loo = omega.copy()
+                        omega_loo[j_local] = 0.0
+                        omega_loo = omega_loo / denom
+                        y_cf_j = omega_loo @ Y[donors_idx]
+                        Y_cf[j_global] += y_cf_j
+                        cohort_count[j_global] += 1.0
+
+                    y_cf_tr = y_sc + bias
+                    for i_tr in np.flatnonzero(idx_tr):
+                        Y_cf[i_tr] += y_cf_tr
+                        att_hat_full[i_tr] += (Y[i_tr] - y_cf_tr)
+                        cohort_count[i_tr] += 1.0
+
+                valid = cohort_count > 0
+                Y_cf[valid] = Y_cf[valid] / cohort_count[valid, None]
+                att_hat_full[valid] = att_hat_full[valid] / cohort_count[valid, None]
+
+                U_hat = Y - Y_cf - att_hat_full * W
+
+                psi_tau, psi_post = self._sdid_if_unit_scores(
+                    Y=Y, W=W, times=times, cohorts=cohorts, results_g=results_g,
+                    U_hat=U_hat, tau_grid=tau_grid,
+                    omega_intercept=self.omega_intercept, lambda_intercept=self.lambda_intercept,
+                    zeta_omega=self.eta_omega if self.eta_omega is not None else 1.0,
+                    zeta_lambda=self.eta_lambda,
+                )
+
+                dist = getattr(self.boot, "dist", "rademacher")
+                mult_u = bt.wild_multipliers(n_units, n_boot=B, dist=dist, rng=rng)
+
+                theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
+                att_tau_star = theta_hat[:, None] + psi_tau.T @ mult_u
+                att_b = float(att_post) + psi_post @ mult_u
+
+                boot_info["B"] = B
+                boot_info["post_ATT_draws"] = att_b
+                boot_info["ATT_tau_draws"] = att_tau_star
+                filled = B
+            elif n_treated_total == 1 and mode == "placebo":
                 control_unit_mask = W.sum(axis=1) == 0
                 control_units = np.flatnonzero(control_unit_mask)
                 n_control = control_units.size
@@ -471,10 +532,11 @@ class SDID:
                         return None
                     th = theta_hat[idx]
                     thb = att_tau_star[idx, :]
-                    if mode == "unit":
+                    if mode == "unit" or mode == "if":
                         diffs = thb - th[:, None]
                     else:
-                        diffs = thb
+                        mu = np.nanmean(thb, axis=1)
+                        diffs = thb - mu[:, None]
                     se = np.nanstd(diffs, axis=1, ddof=1)
                     ok = np.isfinite(se) & (se > 0)
                     if not np.any(ok):
@@ -1019,6 +1081,193 @@ class SDID:
         w[w <= thr] = 0.0
         s = float(w.sum())
         return w if s <= 0.0 else (w / s)
+
+    def _sdid_if_unit_scores(
+        self,
+        Y: np.ndarray,
+        W: np.ndarray,
+        times: np.ndarray,
+        cohorts: dict[int, np.ndarray],
+        results_g: dict[int, dict],
+        U_hat: np.ndarray,
+        tau_grid: np.ndarray,
+        *,
+        omega_intercept: bool,
+        lambda_intercept: bool,
+        zeta_omega: float,
+        zeta_lambda: float,
+        tol: float = 1e-12,
+        jitter: float = 1e-12,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        N, T = Y.shape
+        t2pos = {t: idx for idx, t in enumerate(times)}
+        tau2k = {int(tau): k for k, tau in enumerate(tau_grid)}
+
+        den_tau = {int(tau): 0.0 for tau in tau_grid}
+        for g, meta in results_g.items():
+            idx_tr = cohorts[g]
+            ntr = float(idx_tr.sum())
+            if ntr <= 0:
+                continue
+            for t_idx in range(T):
+                tau = _event_tau(times[t_idx], g, t2pos)
+                if int(tau) in den_tau:
+                    den_tau[int(tau)] += ntr
+
+        post_den = sum(v for tau, v in den_tau.items() if tau >= 0)
+        if post_den <= 0:
+            raise ValueError("No post-treatment periods to form post ATT.")
+
+        psi_tau = np.zeros((N, len(tau_grid)))
+        psi_post = np.zeros(N)
+
+        def _kkt_dx_active(As, b, xs, eta, dAs, db):
+            k = xs.size
+            if k <= 1:
+                return np.zeros_like(xs)
+            K = As.T @ As + float(eta) * np.eye(k) + float(jitter) * np.eye(k)
+            dg = dAs.T @ b + As.T @ db
+            Ax = As @ xs
+            dAx = dAs @ xs
+            dKxs = dAs.T @ Ax + As.T @ dAx
+            r = dg - dKxs
+
+            ones = np.ones((k, 1))
+            M = np.block([[K, ones], [ones.T, np.zeros((1, 1))]])
+            rhs = np.concatenate([r, np.zeros(1)])
+            sol = la.solve(M, rhs, method="qr")
+            dxs = sol[:k]
+            dxs = dxs - dxs.mean()
+            return dxs
+
+        for g, meta in results_g.items():
+            idx_tr = cohorts[g]
+            ntr = int(idx_tr.sum())
+            if ntr <= 0:
+                continue
+
+            donors_idx = np.asarray(meta["donors_idx"], dtype=int)
+            N0 = donors_idx.size
+            if N0 == 0:
+                continue
+
+            omega = np.asarray(meta["omega"], dtype=float).reshape(-1)
+            lam = np.asarray(meta["lambda"], dtype=float).reshape(-1)
+
+            pre = times < g
+            post = ~pre
+            T0 = int(pre.sum())
+            if T0 <= 0:
+                continue
+
+            y_tr = np.asarray(meta["y_tr"], dtype=float).reshape(-1)
+            y_sc = np.asarray(meta["y_sc"], dtype=float).reshape(-1)
+            diff = y_tr - y_sc
+            diff_pre = diff[pre]
+
+            Y0_pre = Y[donors_idx][:, pre]
+            y1_pre = y_tr[pre].copy()
+            if omega_intercept:
+                Y0_pre = Y0_pre - Y0_pre.mean(axis=1, keepdims=True)
+                y1_pre = y1_pre - float(y1_pre.mean())
+            A_omg = Y0_pre.T
+            b_omg = y1_pre
+
+            supp_omg = np.flatnonzero(omega > tol)
+            As_omg = A_omg[:, supp_omg]
+            xs_omg = omega[supp_omg]
+
+            Y0_post_mean = Y[donors_idx][:, post].mean(axis=1)
+            A_lam = Y[donors_idx][:, pre].copy()
+            b_lam = Y0_post_mean.copy()
+            if lambda_intercept:
+                m = (A_lam.sum(axis=1) + b_lam) / float(T0 + 1)
+                A_lam = A_lam - m[:, None]
+                b_lam = b_lam - m
+            supp_lam = np.flatnonzero(lam > tol)
+            As_lam = A_lam[:, supp_lam]
+            xs_lam = lam[supp_lam]
+
+            Y_donors = Y[donors_idx]
+
+            involved_units = np.unique(np.concatenate([np.flatnonzero(idx_tr), donors_idx]))
+            for i in involved_units:
+                u = U_hat[i, :]
+
+                d_y_tr = np.zeros(T)
+                if idx_tr[i]:
+                    d_y_tr = u / float(ntr)
+
+                d_omega = np.zeros(N0)
+                if supp_omg.size >= 2:
+                    dA_s = np.zeros_like(As_omg)
+                    db = np.zeros_like(b_omg)
+
+                    if idx_tr[i]:
+                        u_pre = u[pre] / float(ntr)
+                        if omega_intercept:
+                            u_pre = u_pre - float(u_pre.mean())
+                        db = u_pre
+                    else:
+                        if i in donors_idx:
+                            j_loc = int(np.where(donors_idx == i)[0][0])
+                            u_pre = u[pre]
+                            if omega_intercept:
+                                u_pre = u_pre - float(u_pre.mean())
+                            if j_loc in supp_omg:
+                                col = int(np.where(supp_omg == j_loc)[0][0])
+                                dA_s[:, col] = u_pre
+
+                    if (dA_s != 0).any() or (db != 0).any():
+                        dxs = _kkt_dx_active(As_omg, b_omg, xs_omg, zeta_omega, dA_s, db)
+                        d_omega[supp_omg] = dxs.ravel()
+
+                d_lam = np.zeros(T0)
+                if supp_lam.size >= 2 and (not idx_tr[i]) and (i in donors_idx):
+                    dA_s = np.zeros_like(As_lam)
+                    db = np.zeros_like(b_lam)
+
+                    j_loc = int(np.where(donors_idx == i)[0][0])
+                    u_pre = u[pre]
+                    u_post_mean = float(u[post].mean())
+
+                    if lambda_intercept:
+                        dm = (float(u_pre.sum()) + u_post_mean) / float(T0 + 1)
+                        u_pre_row = u_pre - dm
+                        u_post_row = u_post_mean - dm
+                    else:
+                        u_pre_row = u_pre
+                        u_post_row = u_post_mean
+
+                    for kk, s in enumerate(supp_lam):
+                        dA_s[j_loc, kk] = u_pre_row[int(s)]
+                    db[j_loc] = u_post_row
+
+                    dxs = _kkt_dx_active(As_lam, b_lam, xs_lam, zeta_lambda, dA_s, db)
+                    d_lam[supp_lam] = dxs.ravel()
+
+                d_y_sc = np.zeros(T)
+                if i in donors_idx:
+                    j_loc = int(np.where(donors_idx == i)[0][0])
+                    d_y_sc += omega[j_loc] * u
+                if (d_omega != 0).any():
+                    d_y_sc += d_omega @ Y_donors
+
+                d_diff = d_y_tr - d_y_sc
+                d_diff_pre = d_diff[pre]
+
+                dbias = float(d_lam @ diff_pre) + float(lam @ d_diff_pre)
+                d_delta = d_diff - dbias
+
+                for t_idx in range(T):
+                    tau = int(_event_tau(times[t_idx], g, t2pos))
+                    if tau in tau2k and den_tau[tau] > 0:
+                        k = tau2k[tau]
+                        psi_tau[i, k] += float(ntr) * float(d_delta[t_idx]) / float(den_tau[tau])
+                    if tau >= 0:
+                        psi_post[i] += float(ntr) * float(d_delta[t_idx]) / float(post_den)
+
+        return psi_tau, psi_post
 
     def _att_from_w(
         self, Y: NDArray[np.float64], W: NDArray[np.int64], times: NDArray[np.int64],

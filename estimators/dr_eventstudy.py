@@ -393,7 +393,7 @@ class DREventStudy:
         skipped: list[tuple[int, int, str]] = []
         folds_used: list[int] = []
 
-        gcol_all = df_aug[self.cohort_name].astype(int).to_numpy()
+        gcol_all = pd.to_numeric(df_aug[self.cohort_name], errors="coerce").fillna(0).astype(int).to_numpy()
         tcol_all = df_aug[self.t_name].astype(int).to_numpy()
 
         for cell_key in cell_keys:
@@ -425,9 +425,8 @@ class DREventStudy:
                 continue
             sub = sub.loc[valid_dy, :].copy()
 
-            Dg = (sub[self.cohort_name].astype(int).to_numpy() == int(g)).astype(
-                np.float64,
-            )
+            cohort_sub = pd.to_numeric(sub[self.cohort_name], errors="coerce").fillna(0).astype(int).to_numpy()
+            Dg = ((cohort_sub > 0) & (cohort_sub == int(g))).astype(np.float64)
             n1 = int(Dg.sum())
             n0 = int(Dg.shape[0] - n1)
             if n1 == 0 or n0 == 0:

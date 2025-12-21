@@ -297,6 +297,132 @@ class SyntheticControl:
 
         return cohorts, donors
 
+    def _sc_if_unit_scores(
+        self,
+        Y: np.ndarray,
+        W: np.ndarray,
+        times: np.ndarray,
+        cohorts: dict,
+        results_g: dict,
+        U_hat: np.ndarray,
+        tau_grid: np.ndarray,
+        *,
+        tol: float = 1e-12,
+        jitter: float = 1e-12,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        N, T = Y.shape
+        t2pos = {t: idx for idx, t in enumerate(times)}
+        tau2k = {int(tau): k for k, tau in enumerate(tau_grid)}
+
+        den_tau = {int(tau): 0.0 for tau in tau_grid}
+        for g, meta in results_g.items():
+            idx_tr = meta["idx_tr"]
+            ntr = float(idx_tr.sum())
+            if ntr <= 0:
+                continue
+            for t_idx in range(T):
+                tau = _event_tau(times[t_idx], g, t2pos)
+                if int(tau) in den_tau:
+                    den_tau[int(tau)] += ntr
+
+        post_den = sum(v for tau, v in den_tau.items() if tau >= 0)
+        if post_den <= 0:
+            raise ValueError("No post-treatment periods to form post ATT.")
+
+        psi_tau = np.zeros((N, len(tau_grid)))
+        psi_post = np.zeros(N)
+
+        def _kkt_dx_active(As, b, xs, dAs, db):
+            k = xs.size
+            if k <= 1:
+                return np.zeros_like(xs)
+            K = As.T @ As + float(jitter) * np.eye(k)
+            dg = dAs.T @ b + As.T @ db
+            Ax = As @ xs
+            dAx = dAs @ xs
+            dKxs = dAs.T @ Ax + As.T @ dAx
+            r = dg - dKxs
+
+            ones = np.ones((k, 1))
+            M = np.block([[K, ones], [ones.T, np.zeros((1, 1))]])
+            rhs = np.concatenate([r, np.zeros(1)])
+            sol = la.solve(M, rhs, method="qr")
+            dxs = sol[:k]
+            dxs = dxs - dxs.mean()
+            return dxs
+
+        for g, meta in results_g.items():
+            idx_tr = meta["idx_tr"]
+            ntr = int(idx_tr.sum())
+            if ntr <= 0:
+                continue
+
+            donors_idx = np.asarray(meta["donors_idx"], dtype=int)
+            N0 = donors_idx.size
+            if N0 == 0:
+                continue
+
+            omega = np.asarray(meta["omega"], dtype=float).reshape(-1)
+            pre = times < g
+
+            Y0_pre = Y[donors_idx][:, pre]
+            Y1_pre = Y[np.flatnonzero(idx_tr)][:, pre]
+            y_tr_pre = Y1_pre.mean(axis=0)
+
+            A_omg = Y0_pre.T
+            b_omg = y_tr_pre
+
+            supp_omg = np.flatnonzero(omega > tol)
+            As_omg = A_omg[:, supp_omg]
+            xs_omg = omega[supp_omg]
+
+            involved_units = np.unique(np.concatenate([np.flatnonzero(idx_tr), donors_idx]))
+            for i in involved_units:
+                u = U_hat[i, :]
+
+                d_y_tr = np.zeros(T)
+                if idx_tr[i]:
+                    d_y_tr = u / float(ntr)
+
+                d_omega = np.zeros(N0)
+                if supp_omg.size >= 2:
+                    dA_s = np.zeros_like(As_omg)
+                    db = np.zeros_like(b_omg)
+
+                    if idx_tr[i]:
+                        u_pre = u[pre] / float(ntr)
+                        db = u_pre
+                    else:
+                        if i in donors_idx:
+                            j_loc = int(np.where(donors_idx == i)[0][0])
+                            u_pre = u[pre]
+                            if j_loc in supp_omg:
+                                col = int(np.where(supp_omg == j_loc)[0][0])
+                                dA_s[:, col] = u_pre
+
+                    if (dA_s != 0).any() or (db != 0).any():
+                        dxs = _kkt_dx_active(As_omg, b_omg, xs_omg, dA_s, db)
+                        d_omega[supp_omg] = dxs.ravel()
+
+                d_y_sc = np.zeros(T)
+                if i in donors_idx:
+                    j_loc = int(np.where(donors_idx == i)[0][0])
+                    d_y_sc += omega[j_loc] * u
+                if (d_omega != 0).any():
+                    d_y_sc += d_omega @ Y[donors_idx]
+
+                d_att = d_y_tr - d_y_sc
+
+                for t_idx in range(T):
+                    tau = int(_event_tau(times[t_idx], g, t2pos))
+                    if tau in tau2k and den_tau[tau] > 0:
+                        k = tau2k[tau]
+                        psi_tau[i, k] += float(ntr) * float(d_att[t_idx]) / float(den_tau[tau])
+                    if tau >= 0:
+                        psi_post[i] += float(ntr) * float(d_att[t_idx]) / float(post_den)
+
+        return psi_tau, psi_post
+
     # --------------------------------------------------------------
     def fit(
         self,
@@ -469,12 +595,12 @@ class SyntheticControl:
             mode = (getattr(boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "permutation"
-            if mode not in {"unit", "placebo", "permutation"}:
-                raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'permutation'}.")
+            if mode not in {"unit", "placebo", "permutation", "if"}:
+                raise ValueError("SC boot mode must be one of {'unit', 'placebo', 'permutation', 'if'}.")
             if mode == "unit" and n_treated_total < 2:
                 raise ValueError("SC unit bootstrap needs >=2 treated units. Use mode='permutation'.")
             if n_treated_total >= 2 and mode in {"placebo", "permutation"}:
-                raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit'), not placebo/permutation.")
+                raise ValueError("Policy: when treated units >=2, inference must use bootstrap (mode='unit' or 'if'), not placebo/permutation.")
             if n_treated_total == 1 and mode == "placebo":
                 raise ValueError("Policy: treated=1 inference should use permutation (full donor enumeration), not random placebo. Use mode='permutation'.")
 
@@ -572,6 +698,124 @@ class SyntheticControl:
                         "__meta__": {"origin": "permutation", "mode": mode, "kind": "uniform", "level": int(100 * (1.0 - alpha_level)), "n_placebos": 0, "estimator": "sc"},
                     }
                 boot_info = {"method": "permutation", "n_placebos": n_placebos}
+            elif mode == "if":
+                W = np.zeros((len(ids), len(times)), dtype=int)
+                for g, meta in results_g.items():
+                    t0_col = t_to_col[g]
+                    for tid in meta["treated_ids"]:
+                        i_tr = id_to_row[tid]
+                        W[i_tr, t0_col:] = 1
+
+                n_units, n_times = Y.shape
+                Y_cf = np.zeros((n_units, n_times), dtype=float)
+                att_hat_full = np.zeros((n_units, n_times), dtype=float)
+                cohort_count = np.zeros(n_units, dtype=float)
+
+                for g, meta in results_g.items():
+                    donors_idx = j_donors
+                    weights_list = meta.get("weights", [])
+                    if len(weights_list) == 0:
+                        continue
+                    omega = np.mean([np.asarray(w, dtype=float) for w in weights_list], axis=0)
+                    idx_tr = meta["idx_tr"]
+
+                    omega_sum = float(omega.sum())
+                    if omega_sum <= 0:
+                        continue
+                    omega = omega / omega_sum
+
+                    for j_local, j_global in enumerate(donors_idx):
+                        denom = 1.0 - omega[j_local]
+                        if denom <= 0:
+                            continue
+                        omega_loo = omega.copy()
+                        omega_loo[j_local] = 0.0
+                        omega_loo = omega_loo / denom
+                        y_cf_j = omega_loo @ Y[donors_idx]
+                        Y_cf[j_global] += y_cf_j
+                        cohort_count[j_global] += 1.0
+
+                    y_sc = omega @ Y[donors_idx]
+                    for i_tr in np.flatnonzero(idx_tr):
+                        Y_cf[i_tr] += y_sc
+                        att_hat_full[i_tr] += (Y[i_tr] - y_sc)
+                        cohort_count[i_tr] += 1.0
+
+                valid = cohort_count > 0
+                Y_cf[valid] = Y_cf[valid] / cohort_count[valid, None]
+                att_hat_full[valid] = att_hat_full[valid] / cohort_count[valid, None]
+
+                U_hat = Y - Y_cf - att_hat_full * W
+
+                psi_tau, psi_post = self._sc_if_unit_scores(
+                    Y=Y, W=W, times=times_arr, cohorts=cohorts, results_g=results_g,
+                    U_hat=U_hat, tau_grid=tau_grid,
+                )
+
+                dist = getattr(boot, "dist", "rademacher")
+                mult_u = bt.wild_multipliers(n_units, n_boot=B, dist=dist, rng=rng)
+
+                theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
+                att_tau_star = theta_hat[:, None] + psi_tau.T @ mult_u
+                att_b = float(post_agg) + psi_post @ mult_u
+
+                boot_info = {"B": B}
+                filled = B
+                se_vals = bt.bootstrap_se(att_tau_star)
+                se_series_tau = pd.Series(se_vals, index=tau_grid)
+                if center_at in se_series_tau.index:
+                    se_series_tau.loc[center_at] = 0.0
+                post_att_se = float(np.std(att_b, ddof=1))
+
+                def _sup_t_band_if(mask):
+                    idx = np.flatnonzero(mask)
+                    if idx.size == 0 or filled < 2:
+                        return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                    th = theta_hat[idx]
+                    thb = att_tau_star[idx, :]
+                    diffs = thb - th[:, None]
+                    se = np.nanstd(diffs, axis=1, ddof=1)
+                    ok = np.isfinite(se) & (se > 0)
+                    if not np.any(ok):
+                        return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                    tdraw = diffs[ok, :] / se[ok, None]
+                    sup_abs = np.nanmax(np.abs(tdraw), axis=0)
+                    sup_abs_valid = sup_abs[np.isfinite(sup_abs)]
+                    if sup_abs_valid.size == 0:
+                        return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                    c = float(bt.finite_sample_quantile(sup_abs_valid, 1.0 - alpha_level))
+                    lo = th.copy(); hi = th.copy()
+                    lo[ok] = th[ok] - c * se[ok]
+                    hi[ok] = th[ok] + c * se[ok]
+                    return pd.DataFrame({"lower": pd.Series(lo, index=tau_grid[idx]), "upper": pd.Series(hi, index=tau_grid[idx])}).sort_index()
+
+                tau_array = tau_grid
+                pre_mask = tau_array < center_at
+                post_mask = tau_array > center_at
+                band_pre = _sup_t_band_if(pre_mask)
+                band_post = _sup_t_band_if(post_mask)
+                band_full = _sup_t_band_if(tau_array != center_at)
+
+                post_ci_df = pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
+                if post_att_se > 0:
+                    tdraw_post = (att_b - post_agg) / post_att_se
+                    c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
+                    post_ci_df = pd.DataFrame({"lower": [post_agg - c_post * post_att_se], "upper": [post_agg + c_post * post_att_se]})
+
+                bands = {
+                    "pre": band_pre,
+                    "post": band_post,
+                    "full": band_full,
+                    "post_scalar": post_ci_df,
+                    "__meta__": {
+                        "origin": "bootstrap_if",
+                        "mode": mode,
+                        "kind": "uniform",
+                        "level": int(100 * (1.0 - alpha_level)),
+                        "B": B,
+                        "estimator": "sc",
+                    },
+                }
             else:
                 # ----- Bootstrap variance estimation -----
                 att_tau_star = np.full((tau_grid.size, B), np.nan, dtype=float)

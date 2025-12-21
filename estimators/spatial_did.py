@@ -171,9 +171,8 @@ class SpatialDID:
     def _event_time(self, df: pd.DataFrame) -> pd.Series:
         if self.event_time_name and self.event_time_name in df.columns:
             return df[self.event_time_name].astype(int)
-        return (df[self.t_name].astype(int) - df[self.cohort_name].astype(int)).astype(
-            int,
-        )
+        cohort_clean = pd.to_numeric(df[self.cohort_name], errors="coerce").fillna(0).astype(int)
+        return (df[self.t_name].astype(int) - cohort_clean).astype(int)
 
     def _first_difference(self, df: pd.DataFrame) -> pd.DataFrame:
         dfx = df[[self.id_name, self.t_name, self.y_name]].copy()
@@ -216,7 +215,8 @@ class SpatialDID:
             raise ValueError("Duplicate (id,time) rows detected.")
         # cohort must be unique per id (ignore missing/zero cohorts)
         _c = df[[self.id_name, self.cohort_name]].dropna()
-        _c = _c[_c[self.cohort_name].astype(int) > 0]
+        cohort_c_clean = pd.to_numeric(_c[self.cohort_name], errors="coerce").fillna(0).astype(int)
+        _c = _c[cohort_c_clean > 0]
         if not _c.empty:
             chk = _c.groupby(self.id_name)[self.cohort_name].nunique()
             if int((chk > 1).sum()) > 0:
@@ -455,10 +455,8 @@ class SpatialDID:
                 treat_now = (
                     sub[self.treat_name].to_numpy(dtype=np.float64).reshape(-1, 1)
                 )
-                cohort_indicator = (
-                    sub[self.cohort_name].astype(int).to_numpy().reshape(-1, 1)
-                    == int(g)
-                ).astype(np.float64)
+                cohort_sub_clean = pd.to_numeric(sub[self.cohort_name], errors="coerce").fillna(0).astype(int).to_numpy()
+                cohort_indicator = (cohort_sub_clean.reshape(-1, 1) == int(g)).astype(np.float64)
                 Z = cohort_indicator if (tau_val < int(self.center_at)) else treat_now
                 unit_indices = sub["_i"].to_numpy(dtype=int)
                 if self.s_mode == "treated_now":
@@ -599,13 +597,12 @@ class SpatialDID:
         # group size n_g for "group" weights
         # R did/csdid compatibility: N_g = number of unique ids with cohort == g
         group_size: dict[int, int] = {}
-        cohort_vals = np.sort(np.unique(df[self.cohort_name].astype(int).to_numpy()))
+        cohort_all_clean = pd.to_numeric(df[self.cohort_name], errors="coerce").fillna(0).astype(int).to_numpy()
+        cohort_vals = np.sort(np.unique(cohort_all_clean))
         for g in cohort_vals:
             if int(g) <= 0:
                 continue
-            ids_g = df.loc[
-                df[self.cohort_name].astype(int).to_numpy() == int(g), self.id_name,
-            ].unique()
+            ids_g = df.loc[cohort_all_clean == int(g), self.id_name].unique()
             group_size[int(g)] = len(ids_g)
 
         def _agg(df_in: pd.DataFrame, val_col: str, kind: str) -> pd.DataFrame:

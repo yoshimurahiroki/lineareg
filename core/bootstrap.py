@@ -894,18 +894,28 @@ def cluster_multipliers(  # noqa: PLR0913
     # rng and seed
     rng = rng or np.random.default_rng(seed)
 
-    # Multiway detection: input can be a sequence of cluster arrays.
-    if (
+    clusters_arr = np.asarray(clusters)
+    if clusters_arr.ndim == 2:
+        clusters_list = [clusters_arr[:, j].astype(int) for j in range(clusters_arr.shape[1])]
+    elif (
         isinstance(clusters, (list, tuple))
         and len(clusters) > 0
-        and isinstance(clusters[0], (list, tuple, np.ndarray))
+        and hasattr(clusters[0], '__len__')
+        and not isinstance(clusters[0], str)
     ):
         clusters_list = [np.asarray(c, dtype=int).reshape(-1) for c in clusters]
+    else:
+        clusters_list = None
+
+    if clusters_list is not None:
         if len(clusters_list) == 0 or clusters_list[0] is None:
             msg = "No cluster ids provided"
             raise ValueError(msg)
-        # choose dimension using bootcluster policy (R/Stata-compatible)
-        sizes = [np.unique(ids).size for ids in clusters_list]
+        n_obs = len(clusters_list[0])
+        for j, arr in enumerate(clusters_list):
+            if len(arr) != n_obs:
+                raise ValueError(f"Cluster dimension {j} has length {len(arr)} != n={n_obs}")
+        sizes = [np.unique(ids_dim).size for ids_dim in clusters_list]
         if isinstance(bootcluster, str):
             bk = bootcluster.lower()
             if bk in {"max", "largest"}:
@@ -915,7 +925,6 @@ def cluster_multipliers(  # noqa: PLR0913
             elif bk in {"first"}:
                 dim_idx = 0
             elif bk in {"intersection", "intersect", "all"}:
-                # Build combined keys by column-stacking the cluster columns and take unique rows
                 keys = la.column_stack([c.reshape(-1, 1) for c in clusters_list])
                 _, inv = np.unique(keys, axis=0, return_inverse=True)
                 ids = inv.astype(int, copy=False)
@@ -933,8 +942,8 @@ def cluster_multipliers(  # noqa: PLR0913
         if "ids" not in locals():
             ids = np.asarray(clusters_list[dim_idx])
     else:
-        ids = np.asarray(clusters).reshape(-1)
-        dim_idx = 0  # single-way: record explicit dimension for logging
+        ids = clusters_arr.reshape(-1).astype(int)
+        dim_idx = 0
 
     labels, inv = np.unique(ids, return_inverse=True)
     G = labels.size

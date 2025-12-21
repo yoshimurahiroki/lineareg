@@ -84,6 +84,7 @@ class SDID:
         fw_tol: float = 1e-8,
         omega_intercept: bool = True,
         lambda_intercept: bool = True,
+        boot_cluster: str = "twoway",
     ) -> None:
         self.id_name = str(id_name)
         self.t_name = str(t_name)
@@ -109,6 +110,10 @@ class SDID:
         self.fw_tol = float(fw_tol)
         self.omega_intercept = bool(omega_intercept)
         self.lambda_intercept = bool(lambda_intercept)
+        boot_cluster_norm = str(boot_cluster).lower()
+        if boot_cluster_norm not in {"unit", "twoway", "time"}:
+            raise ValueError("boot_cluster must be 'unit', 'twoway', or 'time'")
+        self.boot_cluster = boot_cluster_norm
 
     def fit(self, df: pd.DataFrame | None = None) -> EstimationResult:
         """Fit SDID on a long balanced panel DataFrame.
@@ -311,7 +316,17 @@ class SDID:
                     try:
                         if mode == "unit":
                             n_units = Y.shape[0]
-                            mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                            n_times = Y.shape[1]
+                            if self.boot_cluster == "twoway":
+                                mult_i = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                                mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
+                                mult = mult_i[:, None] * mult_t[None, :]
+                            elif self.boot_cluster == "time":
+                                mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
+                                mult = np.ones((n_units, 1)) * mult_t[None, :]
+                            else:
+                                mult_i = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                                mult = mult_i[:, None]
                             Y_cf = np.zeros_like(Y)
                             # --- LOO counterfactuals for donors ---
                             # For each cohort, compute LOO synthetic for each donor
@@ -357,10 +372,11 @@ class SDID:
                                 att_hat_full[idx_tr[:, None] & post_g[None, :]] = np.tile(delta_g[post_g], (idx_tr.sum(), 1)).ravel()
                             U_hat = Y - Y_cf
                             U_hat[W > 0] -= att_hat_full[W > 0]
-                            Y_b = Y_cf + att_hat_full * (W > 0).astype(float) + U_hat * mult[:, None]
+                            mult_full = mult if mult.ndim == 2 else mult[:, None]
+                            Y_b = Y_cf + att_hat_full * (W > 0).astype(float) + U_hat * mult_full
                             W_b = W.copy()
                             units_b, times_b = _units, times
-                        else:  # mode == "placebo"
+                        else:
                             if n_control < n_treated_total:
                                 raise ValueError("Placebo bootstrap requires at least as many control units as treated units.")
                             placebo_units = rng.choice(control_units, size=n_treated_total, replace=False)

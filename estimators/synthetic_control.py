@@ -208,6 +208,7 @@ class SyntheticControl:
         anticipation: int = 0,
         base_period: str = "varying",
         tau_weight: str = "treated_t",
+        boot_cluster: str = "twoway",
     ) -> None:
         if treat_name is None and cohort_name is None:
             raise TypeError(
@@ -221,6 +222,10 @@ class SyntheticControl:
         if tau_weight_norm not in {"equal", "group", "treated_t"}:
             raise ValueError("tau_weight must be one of {'equal','group','treated_t'}.")
         self.tau_weight = tau_weight_norm
+        boot_cluster_norm = str(boot_cluster).lower()
+        if boot_cluster_norm not in {"unit", "twoway", "time"}:
+            raise ValueError("boot_cluster must be 'unit', 'twoway', or 'time'")
+        self.boot_cluster = boot_cluster_norm
         self.v_mode = v_mode
         self.anticipation = int(anticipation)
         self.base_period = str(base_period)
@@ -236,7 +241,6 @@ class SyntheticControl:
         )
         self.max_iter = int(max_iter)
         self.tol = float(tol)
-        # populated by from_formula()
         self._formula = None
         self._formula_df: pd.DataFrame | None = None
 
@@ -579,7 +583,16 @@ class SyntheticControl:
                     try:
                         if mode == "unit":
                             n_units = Y.shape[0]
-                            mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                            n_times = Y.shape[1]
+                            if self.boot_cluster == "twoway":
+                                mult_i = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
+                                mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
+                                mult = mult_i[:, None] * mult_t[None, :]
+                            elif self.boot_cluster == "time":
+                                mult_t = rng.choice(np.array([-1.0, 1.0]), size=n_times, replace=True)
+                                mult = np.ones((n_units, 1)) * mult_t[None, :]
+                            else:
+                                mult = rng.choice(np.array([-1.0, 1.0]), size=n_units, replace=True)
                             Y_cf = np.zeros_like(Y)
                             # --- LOO counterfactuals for donors ---
                             # Average weights across all treated units to get a single omega
@@ -617,11 +630,10 @@ class SyntheticControl:
                                 for tid in meta["treated_ids"]:
                                     i_tr = id_to_row[tid]
                                     delta_hat_full[i_tr, t0_col:] = att_path_g[t0_col:]
-                            # Compute residuals and REMOVE estimated treatment effect (SDID-consistent)
                             U_hat = Y - Y_cf
                             U_hat[W > 0] -= delta_hat_full[W > 0]
-                            # Generate bootstrap sample: Y_b = Y_cf + delta_hat*(W>0) + U_hat*mult
-                            Y_b = Y_cf + delta_hat_full * (W > 0).astype(float) + U_hat * mult[:, None]
+                            mult_full = mult if mult.ndim == 2 else mult[:, None]
+                            Y_b = Y_cf + delta_hat_full * (W > 0).astype(float) + U_hat * mult_full
                             ids_b, times_b = ids, times
                             cohorts_b = {g: meta["treated_ids"] for g, meta in results_g.items()}
                             donors_b = donors

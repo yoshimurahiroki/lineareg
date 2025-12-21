@@ -41,7 +41,10 @@ def _time_to_pos(times: np.ndarray) -> dict:
 
 
 def _event_tau(t, g, t2pos: dict) -> int:
-    return t2pos[t] - t2pos[g]
+    try:
+        return int(t) - int(g)
+    except (TypeError, ValueError):
+        return t2pos[t] - t2pos[g]
 
 
 class SDID:
@@ -71,6 +74,8 @@ class SDID:
         control_group: str = "never",
         anticipation: int = 0,
         base_period: str = "varying",
+        center_at: int = -1,
+        tau_weight: str = "treated_t",
         eta_omega: float | None = None,
         eta_lambda: float = 1e-6,
         boot: BootConfig | None = None,
@@ -91,6 +96,11 @@ class SDID:
         if base_period_norm not in {"varying", "universal"}:
             raise ValueError("base_period must be 'varying' or 'universal'")
         self.base_period = base_period_norm
+        self.center_at = int(center_at)
+        tau_weight_norm = str(tau_weight).lower()
+        if tau_weight_norm not in {"equal", "group", "treated_t"}:
+            raise ValueError("tau_weight must be one of {'equal','group','treated_t'}.")
+        self.tau_weight = tau_weight_norm
         self.eta_omega = None if eta_omega is None else float(eta_omega)
         self.eta_lambda = float(eta_lambda)
         self.boot = boot

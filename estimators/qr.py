@@ -1277,13 +1277,13 @@ class QR(BaseEstimator):
 
             valid_mask = ~np.isnan(boot_betas[0, :])
             if valid_mask.sum() < 2:
-                warnings.warn("QR bootstrap: fewer than 2 valid draws; SE will be NaN.", RuntimeWarning, stacklevel=2)
-                se_hat = np.full(self.n_features, np.nan)
+                warnings.warn("QR bootstrap: fewer than 2 valid draws; SE not available.", RuntimeWarning, stacklevel=2)
+                se_hat = None
             else:
                 se_hat = bt.bootstrap_se(boot_betas[:, valid_mask])
 
         params = pd.Series(beta_hat.reshape(-1), index=self._var_names, name="coef")
-        se = pd.Series(se_hat.reshape(-1), index=self._var_names, name="se")
+        se = pd.Series(se_hat.reshape(-1), index=self._var_names, name="se") if se_hat is not None else None
 
         # Build results
         # WGB_Recommended only when a one-way cluster id is present

@@ -44,7 +44,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _event_tau(t, g, t_map: dict) -> int:
-    return t_map[t] - t_map[g]
+    try:
+        return int(t) - int(g)
+    except (TypeError, ValueError):
+        return t_map[t] - t_map[g]
 
 
 @dataclass
@@ -114,6 +117,7 @@ class SpatialDID:
         center_at: int = -1,
         anticipation: int = 0,
         base_period: str = "varying",
+        alpha: float = 0.05,
         boot: BootConfig | None = None,
         cluster_ids: Sequence | None = None,
         space_ids: Sequence | None = None,
@@ -139,6 +143,7 @@ class SpatialDID:
         if base_period_norm not in {"varying", "universal"}:
             raise ValueError("base_period must be 'varying' or 'universal'")
         self.base_period = base_period_norm
+        self.alpha = float(alpha)
 
         self.boot = boot
         self.cluster_ids = cluster_ids
@@ -150,7 +155,6 @@ class SpatialDID:
             msg = 'residual_type must be "restricted" or "unrestricted".'
             raise ValueError(msg)
         self.residual_type = residual_type
-        # validate tau_weight
         self.tau_weight = str(tau_weight).lower()
         if self.tau_weight not in {"group", "equal", "treated_t"}:
             msg = "tau_weight must be one of {'group','equal','treated_t'}."
@@ -790,7 +794,7 @@ class SpatialDID:
                 lo, hi = bt.uniform_confidence_band(
                     theta,
                     th_star,
-                    alpha=0.05,
+                    alpha=self.alpha,
                     studentize="bootstrap",
                     context="eventstudy",
                 )
@@ -860,7 +864,7 @@ class SpatialDID:
             lo_b, hi_b = bt.uniform_confidence_band(
                 np.array([theta], dtype=np.float64),
                 star.reshape(1, -1),
-                alpha=0.05,
+                alpha=self.alpha,
                 studentize="bootstrap",
                 context="eventstudy",
             )

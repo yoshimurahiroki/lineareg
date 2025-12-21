@@ -1457,6 +1457,8 @@ def _sup_t_distribution_internal(  # noqa: PLR0913
         msg = "theta_star must be (K x B)."
         raise ValueError(msg)
     K, B = thb.shape
+    if B < 2:
+        raise ValueError("Uniform bands require at least 2 bootstrap draws (B>=2).")
     if th.shape[0] != K:
         msg = "theta and theta_star dimension mismatch."
         raise ValueError(msg)

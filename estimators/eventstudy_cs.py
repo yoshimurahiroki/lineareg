@@ -51,7 +51,10 @@ def _time_to_pos(times) -> dict:
 
 
 def _event_tau(t, g, t2pos: dict) -> int:
-    return t2pos[t] - t2pos[g]
+    try:
+        return int(t) - int(g)
+    except (TypeError, ValueError):
+        return t2pos[t] - t2pos[g]
 
 
 def _pret_for_cohort(g, times_sorted, anticipation: int = 0):
@@ -150,6 +153,16 @@ def compute_uniform_bands(
     base_tau: int,
     alpha: float,
 ):
+    B = att_tau_star.shape[1] if att_tau_star.ndim == 2 else 0
+    if B < 2:
+        att_tau = att_tau.copy()
+        att_tau["ci_lower"] = np.nan
+        att_tau["ci_upper"] = np.nan
+        att_tau["ci_lower_full"] = np.nan
+        att_tau["ci_upper_full"] = np.nan
+        empty_band = (pd.Series([], dtype=float), pd.Series([], dtype=float))
+        return att_tau, empty_band, empty_band, empty_band
+
     taus = att_tau["tau"].to_numpy(dtype=int)
     pre_mask = taus < int(base_tau)
     post_mask = taus > int(base_tau)

@@ -1493,13 +1493,12 @@ class GMM(BaseEstimator):
         Note: Multiway G-1 scaling uses average per-dimension factors and
         should be interpreted cautiously; no rigorous multiway small-G correction exists.
         """
-        # Apply observation-level weighting if provided: g_i^* = sqrt(w_i) z_i u_i
-        u_col = u.reshape(-1, 1) if u.ndim == 1 else u  # Ensure column vector
+        u_col = u.reshape(-1, 1) if u.ndim == 1 else u
         if obs_weights is not None:
-            sw = np.sqrt(obs_weights).reshape(-1, 1)
-            zu = la.hadamard(la.hadamard(Z, sw), u_col)
+            w_full = np.asarray(obs_weights).reshape(-1, 1)
+            zu = la.hadamard(la.hadamard(Z, w_full), u_col)
         else:
-            zu = la.hadamard(Z, u_col)  # (n x L)
+            zu = la.hadamard(Z, u_col)
         # Strict policy: no centering for moment covariance (finite-sample adjustment not used).
 
         if multiway_ids is not None:

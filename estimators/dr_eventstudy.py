@@ -55,7 +55,10 @@ def _time_to_pos(times) -> dict:
 
 
 def _event_tau(t, g, t2pos: dict) -> int:
-    return t2pos[t] - t2pos[g]
+    try:
+        return int(t) - int(g)
+    except (TypeError, ValueError):
+        return t2pos[t] - t2pos[g]
 
 
 def _prev_time(t, times_sorted):

@@ -52,7 +52,10 @@ def _time_to_pos(times: np.ndarray) -> dict:
 
 
 def _event_tau(t, g, t2pos: dict) -> int:
-    return t2pos[t] - t2pos[g]
+    try:
+        return int(t) - int(g)
+    except (TypeError, ValueError):
+        return t2pos[t] - t2pos[g]
 
 
 def _frank_wolfe_simplex(
@@ -204,8 +207,8 @@ class SyntheticControl:
         v_mode: str = "identity",
         anticipation: int = 0,
         base_period: str = "varying",
+        tau_weight: str = "treated_t",
     ) -> None:
-        # Allow either treat_name or cohort_name for API parity with event-study estimators
         if treat_name is None and cohort_name is None:
             raise TypeError(
                 "Provide either treat_name or cohort_name for SyntheticControl.",
@@ -214,10 +217,13 @@ class SyntheticControl:
             raise ValueError("v_mode must be 'identity' or 'nested'")
         if base_period not in {"varying", "universal"}:
             raise ValueError("base_period must be 'varying' or 'universal'")
+        tau_weight_norm = str(tau_weight).lower()
+        if tau_weight_norm not in {"equal", "group", "treated_t"}:
+            raise ValueError("tau_weight must be one of {'equal','group','treated_t'}.")
+        self.tau_weight = tau_weight_norm
         self.v_mode = v_mode
         self.anticipation = int(anticipation)
         self.base_period = str(base_period)
-        # Default treat column name when deriving from cohort
         treat_col = "treat" if treat_name is None else str(treat_name)
         self.spec = _Spec(
             id_name=str(id_name),

@@ -233,6 +233,8 @@ class SDID:
                 "y_tr": y_tr_mean,
                 "y_sc": y_co_omega,
                 "donors_idx": donors_idx,
+                "zeta_omega": zeta_omega,
+                "zeta_lambda": zeta_lambda,
             }
 
         # Aggregate across cohorts in event time τ = t - g
@@ -567,10 +569,11 @@ class SDID:
                     post_star = np.nanmean(att_tau_star[np.flatnonzero(mask_post_draws), :], axis=0)
                     post_star_valid = post_star[np.isfinite(post_star)]
                     if post_star_valid.size > 1 and post_att_se > 0:
-                        if mode == "unit":
+                        if mode == "unit" or mode == "if":
                             tdraw_post = (post_star_valid - att_post) / post_att_se
                         else:
-                            tdraw_post = post_star_valid / post_att_se
+                            mu_post = np.nanmean(post_star_valid)
+                            tdraw_post = (post_star_valid - mu_post) / post_att_se
                         c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
                         lo_post = att_post - c_post * post_att_se
                         hi_post = att_post + c_post * post_att_se
@@ -1153,6 +1156,8 @@ class SDID:
 
             omega = np.asarray(meta["omega"], dtype=float).reshape(-1)
             lam = np.asarray(meta["lambda"], dtype=float).reshape(-1)
+            zeta_omega = float(meta.get("zeta_omega", 0.0))
+            zeta_lambda = float(meta.get("zeta_lambda", 0.0))
 
             pre = times < g
             post = ~pre

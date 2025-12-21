@@ -525,6 +525,11 @@ class SyntheticControl:
             results_g[g]["att_path"] = att_path_g
             results_g[g]["n_treated"] = len(treated_units)
             results_g[g]["treated_ids"] = treated_units
+            idx_tr = np.isin(ids, treated_units)
+            results_g[g]["idx_tr"] = idx_tr
+            omega_avg = np.mean([np.asarray(w, dtype=float) for w in results_g[g]["weights"]], axis=0)
+            results_g[g]["omega"] = omega_avg
+            results_g[g]["donors_idx"] = j_donors
 
             for t_val in times:
                 tau_val = _event_tau(t_val, g, t2pos)
@@ -717,7 +722,9 @@ class SyntheticControl:
                     if len(weights_list) == 0:
                         continue
                     omega = np.mean([np.asarray(w, dtype=float) for w in weights_list], axis=0)
-                    idx_tr = meta["idx_tr"]
+                    idx_tr = meta.get("idx_tr")
+                    if idx_tr is None:
+                        idx_tr = np.isin(ids, meta["treated_ids"])
 
                     omega_sum = float(omega.sum())
                     if omega_sum <= 0:
@@ -759,7 +766,7 @@ class SyntheticControl:
                 att_tau_star = theta_hat[:, None] + psi_tau.T @ mult_u
                 att_b = float(post_agg) + psi_post @ mult_u
 
-                boot_info = {"B": B}
+                boot_info = {"B": B, "post_ATT_draws": att_b.copy(), "ATT_tau_draws": att_tau_star.copy()}
                 filled = B
                 se_vals = bt.bootstrap_se(att_tau_star)
                 se_series_tau = pd.Series(se_vals, index=tau_grid)
@@ -964,6 +971,10 @@ class SyntheticControl:
                 if filled == 0:
                     raise RuntimeError("SC bootstrap failed: 0 successful draws. Check data/resampling settings.")
 
+                post_star_arr = np.full(filled, np.nan, dtype=float)
+                if np.any(mask_post) and filled > 0:
+                    post_star_arr = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
+
                 if filled > 1:
                     se_vals = bt.bootstrap_se(att_tau_star)
                     se_series = pd.Series(se_vals, index=tau_grid)
@@ -977,7 +988,8 @@ class SyntheticControl:
                         th = theta_hat[idx]
                         thb = att_tau_star[idx, :]
                         if mode == "placebo":
-                            diffs = thb
+                            mu = np.nanmean(thb, axis=1)
+                            diffs = thb - mu[:, None]
                         else:
                             diffs = thb - th[:, None]
                         se = np.nanstd(diffs, axis=1, ddof=1)
@@ -1000,13 +1012,15 @@ class SyntheticControl:
                     band_post = _sup_t_band(mask_post)
                     band_full = _sup_t_band(tau_array != center_at)
 
-                    if np.any(mask_post):
+                    if np.any(mask_post) and filled > 1:
                         post_star = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
                         post_star_valid = post_star[np.isfinite(post_star)]
+                        post_star_arr = post_star.copy()
                         se_hat = float(np.nanstd(post_star_valid, ddof=1)) if post_star_valid.size > 1 else 0.0
                         if np.isfinite(se_hat) and se_hat > 0 and post_star_valid.size > 1:
                             if mode == "placebo":
-                                tdraw_post = post_star_valid / se_hat
+                                mu_post = np.nanmean(post_star_valid)
+                                tdraw_post = (post_star_valid - mu_post) / se_hat
                             else:
                                 tdraw_post = (post_star_valid - post_agg) / se_hat
                             c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
@@ -1028,7 +1042,9 @@ class SyntheticControl:
                             "cohorts": sorted(list(cohorts.keys())),
                         },
                     }
-                boot_info = {"B": filled, "post_ATT_draws": np.full(filled, np.nan), "ATT_tau_draws": att_tau_star}
+                    se_series = se_series
+                    bands_meta = bands
+                boot_info = {"B": filled, "post_ATT_draws": post_star_arr, "ATT_tau_draws": att_tau_star}
 
         att_df = pd.DataFrame({"tau": att_series.index, "att": att_series.to_numpy()}).set_index("tau")
 

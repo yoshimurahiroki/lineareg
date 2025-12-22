@@ -292,14 +292,12 @@ class DREventStudy:
                 Xc["const"] = 1.0
             return Xc
 
+        # Allow covariates=None (constant-only model) for DR-DID
+        # When x_ps or x_or is None, create a constant-only DataFrame
         if x_ps is None:
-            raise ValueError(
-                "x_ps not supplied: must specify x_ps with covariates for reliable overlap diagnostics.",
-            )
+            x_ps = pd.DataFrame({"const": 1.0}, index=df_aug.index)
         if x_or is None:
-            raise ValueError(
-                "x_or not supplied: DR double robustness requires specifying x_or.",
-            )
+            x_or = pd.DataFrame({"const": 1.0}, index=df_aug.index)
         x_ps = _ensure_const_df(x_ps.loc[df_aug.index, :])
         x_or = _ensure_const_df(x_or.loc[df_aug.index, :])
 

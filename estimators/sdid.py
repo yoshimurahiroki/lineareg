@@ -278,23 +278,25 @@ class SDID:
         tau_grid = np.array(tau_union_sorted, dtype=int)
         n_treated_total = sum(int(idx_tr.sum()) for idx_tr in cohorts.values())
 
-        if n_treated_total >= 2 and (self.boot is None or getattr(self.boot, "n_boot", 0) <= 1):
-            raise ValueError(
-                "Policy: when treated units >=2, bootstrap inference is mandatory. "
-                "Provide boot=BootConfig(n_boot>=2, mode='unit', ...) to SDID.__init__"
-            )
+        # Default inference: placebo for treated=1, unit bootstrap for treated>=2
+        boot_eff = self.boot
+        if boot_eff is None:
+            if n_treated_total >= 2:
+                boot_eff = BootConfig(n_boot=bt.DEFAULT_BOOTSTRAP_ITERATIONS, mode="unit")
+            else:
+                boot_eff = BootConfig(n_boot=bt.DEFAULT_BOOTSTRAP_ITERATIONS, mode="placebo")
 
         bands = None
         boot_info: dict[str, object] = {"B": 0}
         se_series = None
         att_tau_star = np.full((tau_grid.size, 0), np.nan, dtype=float)
 
-        if self.boot is not None and getattr(self.boot, "n_boot", 0) > 1:
-            B = int(self.boot.n_boot)
+        if boot_eff is not None and getattr(boot_eff, "n_boot", 0) > 1:
+            B = int(boot_eff.n_boot)
             alpha_level = float(self.alpha)
-            rng = np.random.default_rng(getattr(self.boot, "seed", None))
+            rng = np.random.default_rng(getattr(boot_eff, "seed", None))
 
-            mode = (getattr(self.boot, "mode", None) or "auto").lower()
+            mode = (getattr(boot_eff, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "placebo"
             if mode == "jackknife":
@@ -354,7 +356,7 @@ class SDID:
                     zeta_lambda=self.eta_lambda,
                 )
 
-                dist = getattr(self.boot, "dist", "rademacher")
+                dist = getattr(boot_eff, "dist", "rademacher")
                 mult_u = bt.wild_multipliers(n_units, n_boot=B, dist=dist, rng=rng)
 
                 theta_hat = att_tau.set_index("tau")["att"].reindex(tau_grid).to_numpy(dtype=float)
@@ -526,7 +528,8 @@ class SDID:
                 se_series_tau = pd.Series(se_vals, index=tau_grid)
                 if base_tau in se_series_tau.index:
                     se_series_tau.loc[base_tau] = 0.0
-                post_att_se = float(np.std(att_b, ddof=1))
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    post_att_se = float(np.std(att_b, ddof=1)) if att_b.size > 1 else 0.0
 
                 def _sup_t_band(mask):
                     idx = np.flatnonzero(mask)
@@ -642,7 +645,8 @@ class SDID:
         if se_series is not None:
             post_att_draws = boot_info.get("post_ATT_draws", [])
             if len(post_att_draws) > 1:
-                info["PostATT_se"] = float(np.std(post_att_draws, ddof=1))
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    info["PostATT_se"] = float(np.std(post_att_draws, ddof=1)) if post_att_draws.size > 1 else 0.0
         elif boot_info.get("method") == "jackknife":
             jack_se = boot_info.get("post_ATT_se")
             if jack_se is not None and np.isfinite(jack_se):

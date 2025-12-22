@@ -277,6 +277,7 @@ class GLS(BaseEstimator):
             # Otherwise AR(1) with equal spacing is ill-defined -> raise.
             # If force_irregular=True, relax spacing checks and treat adjacency by ordering
             # (series-only adjacency), matching xtgls 'force' semantics.
+            d: float = 1.0  # default: unit spacing (overwritten if constant Δ≠1)
             seg_break = np.ones(ys.shape[0], dtype=bool)
             if ys.shape[0] > 1:
                 if force_irregular:
@@ -308,6 +309,13 @@ class GLS(BaseEstimator):
                                 "AR1 requires constant time spacing within each series.",
                             )
                         delta_by_series[ss[a]] = float(uniq[0])
+                    # Compute common d if all series share the same spacing
+                    if len(delta_by_series) > 0:
+                        deltas = np.array(list(delta_by_series.values()), dtype=float)
+                        if np.allclose(deltas, deltas[0]) and not np.isclose(
+                            deltas[0], 1.0,
+                        ):
+                            d = float(deltas[0])
                     # contiguous adjacency: within-series and delta matches the per-series delta
                     same_series = ss[1:] == ss[:-1]
                     inside = np.zeros(ys.shape[0] - 1, dtype=bool)
@@ -368,18 +376,6 @@ class GLS(BaseEstimator):
                     raise ValueError(
                         "rho_method must be one of {'dw','durbin-watson','ols','regress'}",
                     )
-                # If constant spacing per series and Δ != 1, convert from adjacency estimator
-                if (
-                    (not force_irregular)
-                    and ("delta_by_series" in locals())
-                    and len(delta_by_series) > 0
-                ):
-                    deltas = np.array(list(delta_by_series.values()), dtype=float)
-                    if np.allclose(deltas, deltas[0]) and not np.isclose(
-                        deltas[0], 1.0,
-                    ):
-                        d = float(deltas[0])
-                        rho = np.sign(rho) * (abs(rho) ** (1.0 / d))
                 rho = float(np.clip(rho, -0.999999, 0.999999))
 
             # Check spacing within series: if constant but !=1, xtgls semantics require caution.
@@ -409,7 +405,13 @@ class GLS(BaseEstimator):
                     if np.any(~np.isfinite(w)) or np.any(w <= 0):
                         raise ValueError("weights must be positive and finite")
                     # Use central helper to assemble AR1+weights covariance
+                    # ar1_covariance_from_weights_by_groups uses actual time differences
+                    # in the matrix: R_ij = rho^|t_i - t_j|.  rho is the per-unit-time
+                    # autocorrelation.  If panel spacing is Δ≠1 and rho was estimated
+                    # from adjacent residuals, we need the Δ-th root.
                     rho = float(np.clip(rho, -0.999999, 0.999999))
+                    if d != 1 and rho != 0:
+                        rho = np.sign(rho) * (abs(rho) ** (1.0 / d))
                     Sigma = la.ar1_covariance_from_weights_by_groups(
                         ts, seg_id, rho=rho, weights=w,
                     )
@@ -426,18 +428,10 @@ class GLS(BaseEstimator):
                     y_t = ypw[inv]
                 else:
                     # If common Δ!=1 and not force_irregular, convert rho^Δ -> rho per-unit
+                    # d is already computed earlier from delta_by_series
                     tau = rho
-                    if (
-                        (not force_irregular)
-                        and ("delta_by_series" in locals())
-                        and len(delta_by_series) > 0
-                    ):
-                        deltas = np.array(list(delta_by_series.values()), dtype=float)
-                        if np.allclose(deltas, deltas[0]) and not np.isclose(
-                            deltas[0], 1.0,
-                        ):
-                            d = float(deltas[0])
-                            tau = np.sign(rho) * (abs(rho) ** (1.0 / d))
+                    if d != 1 and rho != 0:
+                        tau = np.sign(rho) * (abs(rho) ** (1.0 / d))
                     Xp, yp = self._prais_winsten_by_segments(
                         Xs, ys, seg_id, tau, transform=ar1_transform,
                     )
@@ -498,11 +492,17 @@ class GLS(BaseEstimator):
                             )
                         else:
                             # Assemble covariance for current rho via centralized helper
+                            # Apply Δ-th root if spacing != 1 (rho was estimated from
+                            # adjacent observations but matrix uses actual time diffs)
                             rho_old_eff = (
                                 float(np.clip(rho_old, -0.999999, 0.999999))
                                 if not isinstance(rho_old, dict)
                                 else rho_old
                             )
+                            if d != 1 and rho_old_eff != 0:
+                                rho_old_eff = np.sign(rho_old_eff) * (
+                                    abs(rho_old_eff) ** (1.0 / d)
+                                )
                             Sigma = la.ar1_covariance_from_weights_by_groups(
                                 ts,
                                 seg_id,
@@ -531,13 +531,26 @@ class GLS(BaseEstimator):
                     else:
                         # For PSAR1 we need to apply series-specific PW scaling
                         if psar1:
+                            # PSAR1 with no weights: need to transform each rho_g
+                            # if Δ != 1 (rho_old is adjacency correlation)
+                            if d != 1:
+                                rho_old_adj = {
+                                    k: np.sign(v) * (abs(v) ** (1.0 / d))
+                                    for k, v in rho_old.items()
+                                }
+                            else:
+                                rho_old_adj = rho_old
                             X_tmp_sorted, y_tmp_sorted = self._prais_winsten_psar1(
-                                Xs, ys, ss, seg_id, rho_old, transform=ar1_transform,
+                                Xs, ys, ss, seg_id, rho_old_adj, transform=ar1_transform,
                             )
                         else:
+                            # AR1 with no weights: transform rho for Δ != 1
+                            rho_pw = rho_old
+                            if d != 1 and rho_old != 0:
+                                rho_pw = np.sign(rho_old) * (abs(rho_old) ** (1.0 / d))
                             X_tmp_sorted, y_tmp_sorted = (
                                 self._prais_winsten_by_segments(
-                                    Xs, ys, seg_id, rho_old, transform=ar1_transform,
+                                    Xs, ys, seg_id, rho_pw, transform=ar1_transform,
                                 )
                             )
                         # restore to original masked order before solving so solver sees original order
@@ -623,22 +636,22 @@ class GLS(BaseEstimator):
                     Xp = la.triangular_solve(L, Xs)
                     yp = la.triangular_solve(L, ys)
                 elif psar1:
+                    # For PSAR1 with no weights: need to transform each rho_g if Δ != 1
+                    if d != 1:
+                        rho_old_adj = {
+                            k: np.sign(v) * (abs(v) ** (1.0 / d))
+                            for k, v in rho_old.items()
+                        }
+                    else:
+                        rho_old_adj = rho_old
                     Xp, yp = self._prais_winsten_psar1(
-                        Xs, ys, ss, seg_id, rho_old, transform=ar1_transform,
+                        Xs, ys, ss, seg_id, rho_old_adj, transform=ar1_transform,
                     )
                 else:
+                    # d is already computed earlier from delta_by_series
                     tau_old = rho_old
-                    if (
-                        (not force_irregular)
-                        and ("delta_by_series" in locals())
-                        and len(delta_by_series) > 0
-                    ):
-                        deltas = np.array(list(delta_by_series.values()), dtype=float)
-                        if np.allclose(deltas, deltas[0]) and not np.isclose(
-                            deltas[0], 1.0,
-                        ):
-                            d = float(deltas[0])
-                            tau_old = np.sign(rho_old) * (abs(rho_old) ** (1.0 / d))
+                    if d != 1 and rho_old != 0:
+                        tau_old = np.sign(rho_old) * (abs(rho_old) ** (1.0 / d))
                     Xp, yp = self._prais_winsten_by_segments(
                         Xs, ys, seg_id, tau_old, transform=ar1_transform,
                     )

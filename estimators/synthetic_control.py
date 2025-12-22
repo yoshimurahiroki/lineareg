@@ -777,11 +777,13 @@ class SyntheticControl:
         tau_grid = np.array(tau_union_sorted, dtype=int)
         n_treated_total = sum(len(meta["treated_ids"]) for meta in results_g.values())
 
-        if n_treated_total >= 2 and (_boot is None or int(getattr(_boot, "n_boot", 0)) <= 1):
-            raise ValueError(
-                "Policy: when treated units >=2, bootstrap inference is mandatory. "
-                "Provide boot=BootConfig(n_boot>=2, mode='unit', ...)"
-            )
+        # Default inference: permutation for treated=1, unit bootstrap for treated>=2
+        if _boot is None:
+            if n_treated_total >= 2:
+                _boot = BootConfig(n_boot=bt.DEFAULT_BOOTSTRAP_ITERATIONS, mode="unit")
+            else:
+                _boot = BootConfig(n_boot=bt.DEFAULT_BOOTSTRAP_ITERATIONS, mode="permutation")
+            boot = _boot  # Sync aliases
 
         B = 0
         band_level = round(100.0 * (1.0 - float(self.spec.alpha)))
@@ -853,7 +855,9 @@ class SyntheticControl:
                         th = theta_hat[idx]
                         thb = att_placebo[idx, :]
                         diffs = thb
-                        se = np.nanstd(diffs, axis=1, ddof=1)
+                        # Robust SE: avoid ddof issues when sample is too small
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            se = np.nanstd(diffs, axis=1, ddof=1) if diffs.shape[1] > 1 else np.zeros(diffs.shape[0])
                         ok = np.isfinite(se) & (se > 0)
                         if not np.any(ok):
                             return pd.DataFrame({"lower": pd.Series(dtype=float), "upper": pd.Series(dtype=float)})
@@ -875,7 +879,8 @@ class SyntheticControl:
                     if np.any(mask_post):
                         post_placebo = np.nanmean(att_placebo[np.flatnonzero(mask_post), :], axis=0)
                         post_placebo_valid = post_placebo[np.isfinite(post_placebo)]
-                        post_att_se = float(np.nanstd(post_placebo_valid, ddof=1)) if post_placebo_valid.size > 1 else 0.0
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            post_att_se = float(np.nanstd(post_placebo_valid, ddof=1)) if post_placebo_valid.size > 1 else 0.0
                         if np.isfinite(post_att_se) and post_att_se > 0 and post_placebo_valid.size > 1:
                             tdraw_post = post_placebo_valid / post_att_se
                             c_post = float(bt.finite_sample_quantile(np.abs(tdraw_post), 1.0 - alpha_level))
@@ -972,7 +977,8 @@ class SyntheticControl:
                 se_series_tau = pd.Series(se_vals, index=tau_grid)
                 if center_at in se_series_tau.index:
                     se_series_tau.loc[center_at] = 0.0
-                post_att_se = float(np.std(att_b, ddof=1))
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    post_att_se = float(np.std(att_b, ddof=1)) if att_b.size > 1 else 0.0
 
                 def _sup_t_band_if(mask):
                     idx = np.flatnonzero(mask)
@@ -1286,7 +1292,8 @@ class SyntheticControl:
         # Compute PostATT_se from bootstrap draws if available
         if se_series is not None and np.any(mask_post):
             post_star_draws = np.nanmean(att_tau_star[np.flatnonzero(mask_post), :], axis=0)
-            model_info["PostATT_se"] = float(np.std(post_star_draws, ddof=1))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                model_info["PostATT_se"] = float(np.std(post_star_draws, ddof=1)) if post_star_draws.size > 1 else 0.0
         extra = {
             "cohorts": cohorts,
             "results_by_cohort": results_g,

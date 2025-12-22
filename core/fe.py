@@ -461,9 +461,8 @@ def _drop_singletons_iteratively(
             return True
         return False
 
-    # Iteratively drop singletons until convergence (reghdfe-style recursive)
     while pass_once():
-        pass
+        continue
     return keep
 
 
@@ -697,16 +696,14 @@ def compute_fe_dof(
                 if is_nested:
                     Mk[k] = levels[k]
         except (ValueError, TypeError, IndexError):
-            # conservative fallback: leave Mk unchanged if helper fails
-            pass
+            Mk = [0] * len(levels)
     fe_dof = int(sum(L - M for L, M in zip(levels, Mk)))
-    # Continuous-slope adjustments
     if continuous:
         try:
             cadj = _continuous_slope_dof_adjustment(codes_list, continuous)
             fe_dof -= cadj
         except (ValueError, TypeError):
-            pass
+            fe_dof = max(0, fe_dof)
 
     # 'all' is functionally the same as 'pairwise' for our conservative
     # implementation; keep the method label for clarity in returned dict.
@@ -1465,10 +1462,8 @@ def _absorb_impl(  # noqa: PLR0913
             fe_ids_masked = [np.asarray(z)[mask] for z in raw_fe_list]
             codes_list = _prepare_and_prune_fe(fe_ids_masked)
         else:
-            # fixest mode: keep rows but remember zero_row_mask to produce NaNs later
-            pass
+            codes_list = []
 
-    # Iteratively drop singletons if requested
     n_before_singleton = int(np.sum(mask))
     if drop_singletons:
         w_for_drop = (

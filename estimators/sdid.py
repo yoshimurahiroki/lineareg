@@ -1128,7 +1128,7 @@ class SDID:
             k = xs.size
             if k <= 1:
                 return np.zeros_like(xs)
-            K = As.T @ As + float(eta) * np.eye(k) + float(jitter) * np.eye(k)
+            K = As.T @ As + float(eta) * np.eye(k)
             dg = dAs.T @ b + As.T @ db
             Ax = As @ xs
             dAx = dAs @ xs
@@ -1138,9 +1138,10 @@ class SDID:
             ones = np.ones((k, 1))
             M = np.block([[K, ones], [ones.T, np.zeros((1, 1))]])
             rhs = np.concatenate([r, np.zeros(1)])
-            sol = la.solve(M, rhs, method="qr")
-            dxs = sol[:k]
-            dxs = dxs - dxs.mean()
+            U, s, Vt = np.linalg.svd(M, full_matrices=False)
+            s_inv = np.where(s > 1e-14, 1.0 / s, 0.0)
+            sol = (Vt.T * s_inv) @ (U.T @ rhs.reshape(-1, 1))
+            dxs = sol[:k, 0]
             return dxs
 
         for g, meta in results_g.items():

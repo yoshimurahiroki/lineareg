@@ -130,8 +130,7 @@ def _cd_kp_stats(  # noqa: PLR0913
         df_denom = max(1, n - L_total)
         out["cd_wald_F"] = float(lam_cd * df_denom / L2) if L2 > 0 else float("nan")
 
-    # ---- Kleibergen-Paap rk statistic (heterosked/cluster robust) ----
-    if u is None or Z2_t.shape[1] == 0:
+    if Z2_t.shape[1] == 0 or X1_t.shape[1] == 0 or u is None:
         return out
 
     try:

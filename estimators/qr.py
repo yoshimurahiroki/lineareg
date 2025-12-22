@@ -1051,10 +1051,9 @@ class QR(BaseEstimator):
         space_ids: Sequence | None = None,
         time_ids: Sequence | None = None,
     ) -> EstimationResult:
-        """Fit QR by exact LP (HiGHS) and compute multiplier-bootstrap SEs (no analytic weights, no CIs)."""
-        with self._device_context(device):
-            pass
-        # Handle NA/missing values
+        if device is not None and device != "cpu":
+            import warnings
+            warnings.warn(f"QR device '{device}' requested but only 'cpu' is supported; proceeding with CPU.", RuntimeWarning, stacklevel=2)
         mask = np.isfinite(self.y_orig).ravel() & np.all(
             np.isfinite(self.X_orig), axis=1,
         )
@@ -1563,9 +1562,9 @@ class IVQR(BaseEstimator):
         observation weights = analytic weights * Exp(1) multipliers (cluster-constant
         when cluster_ids provided). Pair bootstrap is forbidden.
         """
-        with self._device_context(device):
-            pass
-        # mask missing
+        if device is not None and device != "cpu":
+            import warnings
+            warnings.warn(f"IVQR device '{device}' requested but only 'cpu' is supported; proceeding with CPU.", RuntimeWarning, stacklevel=2)
         mask = (
             np.isfinite(self.y_orig).ravel()
             & np.all(np.isfinite(self.X_orig), axis=1)

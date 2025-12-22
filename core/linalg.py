@@ -1289,7 +1289,7 @@ def safe_cholesky(A: Matrix, *, lower: bool = True) -> NDArray[np.float64]:
         try:
             return np.asarray(_bk.cholesky(Ad, lower=lower), dtype=np.float64)
         except (RuntimeError, ValueError, np.linalg.LinAlgError):
-            pass
+            Ad = Ad + np.eye(Ad.shape[0]) * 1e-12
     if sla is not None:
         try:
             return sla.cholesky(Ad, lower=lower, check_finite=False)  # type: ignore[union-attr]
@@ -2115,10 +2115,10 @@ def min_gen_eig(A: Matrix, B: Matrix, *, rcond: float | None = None) -> float:
         C = 0.5 * (C + C.T)
         return float(np.min(np.linalg.eigvalsh(C)))
     except (RuntimeError, np.linalg.LinAlgError, ValueError):
-        # fallback to SVD route for PSD/singular B
-        pass
+        Bd = to_dense(B)
+        if np.allclose(Bd, np.zeros_like(Bd), atol=1e-12):
+            return float("nan")
 
-    # SVD on B to extract image (range) space
     U, s, _Vt = np.linalg.svd(Bd, full_matrices=True)
     if rcond is None:
         rcond = np.sqrt(np.finfo(float).eps)
@@ -2266,12 +2266,14 @@ def xtwx_inv_via_qr(
             invp = np.argsort(P[:p])
             A = A[invp][:, invp]
             return A.astype(np.float64)
-        # rank-deficient -> fall through to SVD pseudo-inverse below
     except (np.linalg.LinAlgError, ValueError, RuntimeError):
-        # If QR fails for any reason, fall back to SVD-based pseudo-inverse
-        pass
+        _U, s, Vt = np.linalg.svd(Xw, full_matrices=False)
+        rcond = np.sqrt(np.finfo(float).eps) if svd_rcond is None else float(svd_rcond)
+        svd_tol = rcond * (s.max() if s.size else 0.0)
+        s_inv2 = np.where(s > svd_tol, 1.0 / (s * s), 0.0)
+        A = (Vt.T * s_inv2) @ Vt
+        return np.asarray(A, dtype=np.float64)
 
-    # SVD fallback: compute pseudo-inverse of Xw via its singular values.
     _U, s, Vt = np.linalg.svd(Xw, full_matrices=False)
     rcond = np.sqrt(np.finfo(float).eps) if svd_rcond is None else float(svd_rcond)
     svd_tol = rcond * (s.max() if s.size else 0.0)

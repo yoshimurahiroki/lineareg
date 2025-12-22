@@ -74,22 +74,21 @@ def _tau_sort_key(label: Any) -> tuple[int, float, str]:
     text = str(label).strip()
     try:
         val = float(text)
-    except ValueError:
-        pass
-    else:
         return (0, val, text)
+    except ValueError:
+        return (1, 0.0, text.lower())
     m = re.match(r"^(?:tau|event[_ ]?time|et)\s*[:=]\s*(-?\d+(?:\.\d+)?)$", text, flags=re.IGNORECASE)
     if m:
         try:
             return (0, float(m.group(1)), text)
         except ValueError:
-            pass
+            return (1, 0.0, text.lower())
     m = re.match(r"^D(-?\d+)$", text, flags=re.IGNORECASE)
     if m:
         try:
             return (0, float(m.group(1)), text)
         except ValueError:
-            pass
+            return (1, 0.0, text.lower())
     return (1, 0.0, text.lower())
 
 
@@ -165,10 +164,7 @@ def filter_and_order_params(  # noqa: PLR0913
         selected = sorted(selected, key=lambda x: str(x).lower())
     elif sort.lower() == "tau":
         selected = sorted(selected, key=_tau_sort_key)
-    elif sort.lower() == "none":
-        # preserve current ordering
-        pass
-    else:
+    elif sort.lower() != "none":
         raise ValueError("sort must be one of {'alpha','tau','none'}")
     return selected
 

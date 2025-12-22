@@ -129,12 +129,7 @@ def _optimize_V_nested(
     max_iter_fw: int = 10_000,
     tol_fw: float = 1e-10,
     max_iter_v: int = 500,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Optimize V (predictor importance weights) via nested MSPE minimization.
-
-    Outer: minimize pre-period outcome MSPE over V (diagonal, sum-to-one via softmax)
-    Inner: for each V, solve simplex LS for w using Frank-Wolfe
-    """
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from scipy.optimize import minimize
     K = X_pred_treat.shape[0]
     T_pre = Y_pre_treat.shape[0]
@@ -156,7 +151,7 @@ def _optimize_V_nested(
     u_opt = res.x
     v_opt = np.exp(u_opt) / np.sum(np.exp(u_opt))
     w_opt = _inner_w(v_opt)
-    return v_opt, w_opt
+    return u_opt, v_opt, w_opt
 
 
 @dataclass
@@ -308,7 +303,6 @@ class SyntheticControl:
         tau_grid: np.ndarray,
         *,
         tol: float = 1e-12,
-        jitter: float = 1e-12,
     ) -> tuple[np.ndarray, np.ndarray]:
         N, T = Y.shape
         t2pos = {t: idx for idx, t in enumerate(times)}
@@ -332,28 +326,81 @@ class SyntheticControl:
         psi_tau = np.zeros((N, len(tau_grid)))
         psi_post = np.zeros(N)
 
-        def _kkt_dx_active(As, b, xs, dAs, db):
-            k = xs.size
-            if k <= 1:
-                return np.zeros_like(xs)
-            K = As.T @ As + float(jitter) * np.eye(k)
-            dg = dAs.T @ b + As.T @ db
-            Ax = As @ xs
-            dAx = dAs @ xs
-            dKxs = dAs.T @ Ax + As.T @ dAx
-            r = dg - dKxs
+        def _softmax(u: np.ndarray) -> np.ndarray:
+            z = u - np.max(u)
+            ez = np.exp(z)
+            return ez / np.sum(ez)
 
+        def _softmax_jac(v: np.ndarray) -> np.ndarray:
+            return np.diag(v) - np.outer(v, v)
+
+        def _kkt_solve(A: np.ndarray, b: np.ndarray) -> np.ndarray:
+            k = A.shape[0]
             ones = np.ones((k, 1))
-            M = np.block([[K, ones], [ones.T, np.zeros((1, 1))]])
-            rhs = np.concatenate([r, np.zeros(1)])
-            sol = la.solve(M, rhs, method="qr")
-            dxs = sol[:k]
-            dxs = dxs - dxs.mean()
-            return dxs
+            M = np.block([[A, ones], [ones.T, np.zeros((1, 1))]])
+            rhs = np.vstack([b.reshape(-1, 1), np.ones((1, 1))])
+            U, s, Vt = np.linalg.svd(M, full_matrices=False)
+            s_inv = np.where(s > 1e-14, 1.0 / s, 0.0)
+            sol = (Vt.T * s_inv) @ (U.T @ rhs)
+            return sol[:-1, 0]
+
+        def _kkt_dw(Xs, y, v, wS, dX_s, dy, dv):
+            if Xs.shape[1] <= 1:
+                return np.zeros(Xs.shape[1])
+            D = np.diag(v)
+            dD = np.diag(dv) if dv is not None else np.zeros_like(D)
+            A = Xs.T @ D @ Xs
+            b = Xs.T @ D @ y
+            dA = dX_s.T @ D @ Xs + Xs.T @ dD @ Xs + Xs.T @ D @ dX_s
+            db = dX_s.T @ D @ y + Xs.T @ dD @ y + Xs.T @ D @ dy
+            k = Xs.shape[1]
+            ones = np.ones((k, 1))
+            M = np.block([[A, ones], [ones.T, np.zeros((1, 1))]])
+            rhs = np.vstack([(db - dA @ wS).reshape(-1, 1), np.zeros((1, 1))])
+            U, s, Vt = np.linalg.svd(M, full_matrices=False)
+            s_inv = np.where(s > 1e-14, 1.0 / s, 0.0)
+            sol = (Vt.T * s_inv) @ (U.T @ rhs)
+            return sol[:-1, 0]
+
+        def _w_from_u_fixedS(X, y, u, S):
+            v = _softmax(u)
+            Xs = X[:, S]
+            A = Xs.T @ np.diag(v) @ Xs
+            b = Xs.T @ np.diag(v) @ y
+            wS = _kkt_solve(A, b)
+            return v, wS
+
+        def _grad_u_fixedS(X, y, u, S):
+            Kp = X.shape[0]
+            v, wS = _w_from_u_fixedS(X, y, u, S)
+            w = np.zeros(X.shape[1], dtype=float)
+            w[S] = wS
+            r = y - X @ w
+            Jv = _softmax_jac(v)
+            g = np.zeros(Kp, dtype=float)
+            Xs = X[:, S]
+            for q in range(Kp):
+                dv = Jv[:, q]
+                dwS = _kkt_dw(Xs, y, v, wS, np.zeros_like(Xs), np.zeros_like(y), dv)
+                dr = -(Xs @ dwS)
+                g[q] = (2.0 / Kp) * float(r @ dr)
+            return g
+
+        def _jac_u_num(X, y, u, S, eps=1e-6):
+            Kp = X.shape[0]
+            J = np.zeros((Kp, Kp), dtype=float)
+            for q in range(Kp):
+                du = np.zeros(Kp, dtype=float)
+                du[q] = eps
+                gp = _grad_u_fixedS(X, y, u + du, S)
+                gm = _grad_u_fixedS(X, y, u - du, S)
+                J[:, q] = (gp - gm) / (2.0 * eps)
+            return J
 
         for g, meta in results_g.items():
             idx_tr = meta["idx_tr"]
-            ntr = int(idx_tr.sum())
+            tr_ids = np.where(idx_tr)[0]
+            ntr = len(tr_ids)
             if ntr <= 0:
                 continue
 
@@ -362,64 +409,115 @@ class SyntheticControl:
             if N0 == 0:
                 continue
 
-            omega = np.asarray(meta["omega"], dtype=float).reshape(-1)
             pre = times < g
+            pre_idx = np.where(pre)[0]
+            Kp = len(pre_idx)
+            if Kp == 0:
+                continue
 
-            Y0_pre = Y[donors_idx][:, pre]
-            Y1_pre = Y[np.flatnonzero(idx_tr)][:, pre]
-            y_tr_pre = Y1_pre.mean(axis=0)
+            X = Y[donors_idx][:, pre].T
 
-            A_omg = Y0_pre.T
-            b_omg = y_tr_pre
+            weights_list = meta.get("weights", [])
+            u_list = meta.get("u_list", [])
 
-            supp_omg = np.flatnonzero(omega > tol)
-            As_omg = A_omg[:, supp_omg]
-            xs_omg = omega[supp_omg]
+            treated_struct = []
+            for k_tr, tr in enumerate(tr_ids):
+                y = Y[tr, pre].astype(float)
+                w0 = np.asarray(weights_list[k_tr], dtype=float).reshape(-1)
+                S = (w0 > tol)
+                if S.sum() == 0:
+                    S[np.argmax(w0)] = True
 
-            involved_units = np.unique(np.concatenate([np.flatnonzero(idx_tr), donors_idx]))
-            for i in involved_units:
-                u = U_hat[i, :]
+                if self.v_mode == "identity":
+                    u = None
+                    v = np.ones(Kp, dtype=float) / Kp
+                    Xs = X[:, S]
+                    A = Xs.T @ np.diag(v) @ Xs
+                    b = Xs.T @ np.diag(v) @ y
+                    wS = _kkt_solve(A, b)
+                    w = np.zeros(len(donors_idx), dtype=float)
+                    w[S] = wS
+                    treated_struct.append({"tr": tr, "S": S, "u": u, "v": v, "w": w, "y": y, "X": X})
+                else:
+                    u0 = np.asarray(u_list[k_tr], dtype=float).reshape(-1)
+                    if u0.shape[0] != Kp:
+                        raise ValueError("nested SC: stored u has wrong length vs pre periods")
+                    u = u0.copy()
+                    Jg = _jac_u_num(X, y, u, S)
+                    g0 = _grad_u_fixedS(X, y, u, S)
+                    if np.isfinite(g0).all():
+                        U_jg, s_jg, Vt_jg = np.linalg.svd(Jg, full_matrices=False)
+                        s_jg_inv = np.where(s_jg > 1e-14, 1.0 / s_jg, 0.0)
+                        step = (Vt_jg.T * s_jg_inv) @ (U_jg.T @ (-g0).reshape(-1, 1))
+                        step = step[:, 0]
+                        if np.isfinite(step).all():
+                            u = u + step
+                    v, wS = _w_from_u_fixedS(X, y, u, S)
+                    w = np.zeros(len(donors_idx), dtype=float)
+                    w[S] = wS
+                    Jg = _jac_u_num(X, y, u, S)
+                    Jv = _softmax_jac(v)
+                    treated_struct.append({"tr": tr, "S": S, "u": u, "v": v, "w": w, "wS": wS, "y": y, "X": X, "Jg": Jg, "Jv": Jv})
 
-                d_y_tr = np.zeros(T)
-                if idx_tr[i]:
-                    d_y_tr = u / float(ntr)
-
-                d_omega = np.zeros(N0)
-                if supp_omg.size >= 2:
-                    dA_s = np.zeros_like(As_omg)
-                    db = np.zeros_like(b_omg)
-
-                    if idx_tr[i]:
-                        u_pre = u[pre] / float(ntr)
-                        db = u_pre
-                    else:
-                        if i in donors_idx:
-                            j_loc = int(np.where(donors_idx == i)[0][0])
-                            u_pre = u[pre]
-                            if j_loc in supp_omg:
-                                col = int(np.where(supp_omg == j_loc)[0][0])
-                                dA_s[:, col] = u_pre
-
-                    if (dA_s != 0).any() or (db != 0).any():
-                        dxs = _kkt_dx_active(As_omg, b_omg, xs_omg, dA_s, db)
-                        d_omega[supp_omg] = dxs.ravel()
-
-                d_y_sc = np.zeros(T)
-                if i in donors_idx:
-                    j_loc = int(np.where(donors_idx == i)[0][0])
-                    d_y_sc += omega[j_loc] * u
-                if (d_omega != 0).any():
-                    d_y_sc += d_omega @ Y[donors_idx]
-
-                d_att = d_y_tr - d_y_sc
-
+            for i in range(N):
+                ui = U_hat[i, :]
+                d_att = np.zeros(T, dtype=float)
+                for st in treated_struct:
+                    tr = st["tr"]
+                    w = st["w"]
+                    S = st["S"]
+                    dtau = np.zeros(T, dtype=float)
+                    if i == tr:
+                        dtau += ui
+                    if idx_tr[i] == False and i in donors_idx:
+                        m = np.where(donors_idx == i)[0][0]
+                        dtau -= w[m] * ui
+                    affects_weights = (i == tr) or (idx_tr[i] == False and i in donors_idx)
+                    if affects_weights:
+                        dX = np.zeros_like(X)
+                        dy = np.zeros(Kp, dtype=float)
+                        u_pre = ui[pre].astype(float)
+                        if i == tr:
+                            dy = u_pre
+                        if idx_tr[i] == False and i in donors_idx:
+                            m = np.where(donors_idx == i)[0][0]
+                            dX[:, m] = u_pre
+                        if self.v_mode == "identity":
+                            v = st["v"]
+                            Xs = X[:, S]
+                            wS = st["w"][S]
+                            dwS = _kkt_dw(Xs, st["y"], v, wS, dX[:, S], dy, None)
+                            dw = np.zeros_like(w)
+                            dw[S] = dwS
+                        else:
+                            u = st["u"]
+                            Jg = st["Jg"]
+                            Jv = st["Jv"]
+                            y = st["y"]
+                            g_base = _grad_u_fixedS(X, y, u, S)
+                            eps = 1e-6
+                            g_pert = _grad_u_fixedS(X + eps * dX, y + eps * dy, u, S)
+                            gY = (g_pert - g_base) / eps
+                            U_jg, s_jg, Vt_jg = np.linalg.svd(Jg, full_matrices=False)
+                            s_jg_inv = np.where(s_jg > 1e-14, 1.0 / s_jg, 0.0)
+                            du = (Vt_jg.T * s_jg_inv) @ (U_jg.T @ (-gY).reshape(-1, 1))
+                            du = du[:, 0]
+                            dv = Jv @ du
+                            v = st["v"]
+                            Xs = X[:, S]
+                            wS = st["w"][S]
+                            dwS = _kkt_dw(Xs, y, v, wS, dX[:, S], dy, dv)
+                            dw = np.zeros_like(w)
+                            dw[S] = dwS
+                        dtau -= Y[donors_idx][:, :].T @ dw
+                    d_att += dtau / ntr
                 for t_idx in range(T):
                     tau = int(_event_tau(times[t_idx], g, t2pos))
                     if tau in tau2k and den_tau[tau] > 0:
                         k = tau2k[tau]
-                        psi_tau[i, k] += float(ntr) * float(d_att[t_idx]) / float(den_tau[tau])
+                        psi_tau[i, k] += (ntr * d_att[t_idx]) / den_tau[tau]
                     if tau >= 0:
-                        psi_post[i] += float(ntr) * float(d_att[t_idx]) / float(post_den)
+                        psi_post[i] += (ntr * d_att[t_idx]) / post_den
 
         return psi_tau, psi_post
 
@@ -498,7 +596,7 @@ class SyntheticControl:
                 Y_pre_donors = Y[j_donors][:, pre].astype(np.float64)
 
                 if self.v_mode == "nested":
-                    _, w = _optimize_V_nested(
+                    u, v, w = _optimize_V_nested(
                         y_pre, X_pre.T,
                         y_pre, Y_pre_donors,
                         max_iter_fw=self.max_iter,
@@ -508,6 +606,7 @@ class SyntheticControl:
                     w = _frank_wolfe_simplex(
                         X_pre, y_pre, max_iter=self.max_iter, tol=self.tol,
                     )
+                    u = None
 
                 y_treated = Y[i_treated, :].astype(np.float64)
                 X_all = Y[j_donors, :].T.astype(np.float64)
@@ -515,10 +614,12 @@ class SyntheticControl:
                 att_path = y_treated - y_synth
                 att_paths_g.append(att_path)
                 if "weights" not in results_g.get(g, {}):
-                    results_g[g] = {"weights": [], "y_synth": [], "treated_row_ids": []}
+                    results_g[g] = {"weights": [], "y_synth": [], "treated_row_ids": [], "u_list": []}
                 results_g[g]["weights"].append(w)
                 results_g[g]["y_synth"].append(y_synth)
                 results_g[g]["treated_row_ids"].append(i_treated)
+                if self.v_mode == "nested":
+                    results_g[g]["u_list"].append(u)
 
             att_path_g = np.mean(att_paths_g, axis=0)
 

@@ -293,26 +293,13 @@ class DREventStudy:
             return Xc
 
         if x_ps is None:
-            import warnings as _warnings
-
-            _warnings.warn(
-                "x_ps not supplied: using constant propensity features. "
-                "Strongly recommend specifying x_ps with covariates for reliable overlap diagnostics.",
-                UserWarning,
-                stacklevel=2,
+            raise ValueError(
+                "x_ps not supplied: must specify x_ps with covariates for reliable overlap diagnostics.",
             )
-            x_ps = pd.DataFrame({"const": 1.0}, index=df_aug.index)
         if x_or is None:
-            import warnings as _warnings
-
-            _warnings.warn(
-                "x_or not supplied: using propensity feature set. "
-                "DR double robustness requires distinct x_ps and x_or for full efficiency.",
-                UserWarning,
-                stacklevel=2,
+            raise ValueError(
+                "x_or not supplied: DR double robustness requires specifying x_or.",
             )
-            x_or = x_ps
-        # Align feature matrices to df_aug index and ensure explicit const column.
         x_ps = _ensure_const_df(x_ps.loc[df_aug.index, :])
         x_or = _ensure_const_df(x_or.loc[df_aug.index, :])
 

@@ -184,7 +184,7 @@ def _cd_kp_stats(  # noqa: PLR0913
             df_denom_kp = max(1, n - L_total)
             out["kp_rk_Wald_F"] = float(lam_kp * df_denom_kp / L2) if L2 > 0 else float("nan")
     except (np.linalg.LinAlgError, RuntimeError, ValueError):
-        pass
+        out = out
 
     return out
 
@@ -1136,12 +1136,6 @@ class IV2SLS(BaseEstimator):
 
         # If any columns were dropped by strict QRCP screening, apply them and record
         if not np.all(new_keepX == keepX):
-            warnings.warn(
-                f"Dropped {int(np.sum(keepX) - int(np.sum(new_keepX)))} collinear X column(s) to match Stata QRCP behavior: {dropped_X}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            # Apply local drop to Xw
             Xw = (
                 Xw[:, keep_local_X]
                 if keep_local_X.size
@@ -1152,11 +1146,6 @@ class IV2SLS(BaseEstimator):
                 name for name, keep in zip(self._var_names, keepX) if keep
             ]
         if not np.all(new_keepZ == keepZ):
-            warnings.warn(
-                f"Dropped {int(np.sum(keepZ) - int(np.sum(new_keepZ)))} collinear Z column(s) to match Stata QRCP behavior: {dropped_Z}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
             Zw = (
                 Zw[:, keep_local_Z]
                 if keep_local_Z.size
@@ -1167,7 +1156,6 @@ class IV2SLS(BaseEstimator):
                 name for name, keep in zip(self._instr_names, keepZ) if keep
             ]
 
-        # Record dropped columns in dropped_stats for model_info reporting
         if dropped_stats is None:
             dropped_stats = {}
         dropped_stats.setdefault("dropped_collinear_X", []).extend(dropped_X)

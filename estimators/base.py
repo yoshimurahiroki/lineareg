@@ -1508,17 +1508,6 @@ class BaseEstimator(ABC):
         self, n_obs: int, *, boot: BootConfig | None,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
         """Dispatch bootstrap multiplier generation with centralized validation."""
-        # If caller omitted a BootConfig, fall back to the project-wide default
-        # BootConfig (which itself uses bt.DEFAULT_BOOTSTRAP_ITERATIONS). This
-        # ensures all estimators default to B=2000 and avoids surprising
-        # exceptions when a user relies on defaults.
         if boot is None:
-            import warnings
-
-            warnings.warn(
-                "BootConfig not supplied: using project default BootConfig with n_boot=DEFAULT_BOOTSTRAP_ITERATIONS.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
             boot = BootConfig()
         return boot.make_multipliers(n_obs)

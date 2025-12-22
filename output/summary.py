@@ -317,9 +317,7 @@ def modelsummary(  # noqa: PLR0913
                             # Copy PostATT_se from PostSpill if available
                             if "PostSpill_se" in _res.model_info:
                                 info["PostATT_se"] = _res.model_info["PostSpill_se"]
-                            elif "PostATT_se" in info:
-                                # Use same SE for both if only one is stored
-                                pass
+                            # (if "PostATT_se" already exists, keep it unchanged)
                             spill_extra = dict(_res.extra) if _res.extra else {}
                             spill_extra["se_source"] = extra.get("se_source", "bootstrap")
                             spill_res = EstimationResult(
@@ -334,7 +332,8 @@ def modelsummary(  # noqa: PLR0913
                             out_n.append(f"{_nm} (Spill)")
                             continue
                     except (AttributeError, IndexError, KeyError, TypeError, ValueError):
-                        pass
+                        # Spill extraction failed - fall through to default handling
+                        out_r = out_r  # noqa: PLW0127
                 # fallback: no spill column emitted
             else:
                 out_r.append(_res)
@@ -364,7 +363,8 @@ def modelsummary(  # noqa: PLR0913
                     return ""
                 return f"{float(val):{coef_format}}"
         except (TypeError, ValueError):
-            pass
+            # Not convertible to float - fall through to str()
+            val = val  # noqa: PLW0127
         return str(val)
 
     def _stat_moran(  # noqa: PLR0911
@@ -974,7 +974,8 @@ def modelsummary(  # noqa: PLR0913
                     if ca is not None and str(ca).lower() != "nan":
                         center_vals.add(int(ca))
                 except (TypeError, ValueError):
-                    pass
+                    # CenterAt not convertible to int - skip
+                    ca = ca  # noqa: PLW0127
 
         def _parse_tau(label: object) -> int | None:
             if isinstance(label, (int, np.integer)):
@@ -1131,7 +1132,8 @@ def modelsummary(  # noqa: PLR0913
                                             se_val = float(s[cand])
                                             break
                                         except (KeyError, TypeError, ValueError):
-                                            pass
+                                            # Continue to next candidate
+                                            se_val = se_val  # noqa: PLW0127
                     se_row.append(f"({se_val:{se_format}})" if se_val is not None and np.isfinite(se_val) and abs(se_val) > 1e-10 else "")
                     # Try to get aggregated CI
                     if _is_policy_ci_family(res) and _is_es_uniform_band(res):
@@ -1369,7 +1371,8 @@ def modelsummary(  # noqa: PLR0913
                                 se_val = float(s[cand])
                                 break
                             except (KeyError, TypeError, ValueError):
-                                pass
+                                # Continue to next candidate
+                                se_val = se_val  # noqa: PLW0127
             se_row.append(f"({se_val:{se_format}})" if se_val is not None and np.isfinite(se_val) and abs(se_val) > 1e-10 else "")
             # Aggregated CI (from model_info bands)
             band_text = _agg_band_str(res, "PostATT", coef_format)

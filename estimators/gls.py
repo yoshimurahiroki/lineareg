@@ -389,19 +389,10 @@ class GLS(BaseEstimator):
                     dif = np.diff(ts[idx])
                     uniq = np.unique(dif)
                     if uniq.size == 1 and not np.isclose(uniq[0], 1.0):
-                        # If strict_xtgls is enabled, require exact equal spacing and raise
-                        # (Stata-like strictness). Otherwise emit a warning and continue.
                         if strict_xtgls:
                             raise ValueError(
                                 "AR1 requires constant unit spacing within each series (strict_xtgls=True).",
                             )
-                        import warnings
-
-                        warnings.warn(
-                            "Non-unit constant spacing detected within a series; proceeding in non-strict mode (strict_xtgls=False).",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
 
             if pw_mode.lower() in {"two", "two-step", "twostep"}:
                 # Two-step: compute rho on full sorted data, apply transform, then restore

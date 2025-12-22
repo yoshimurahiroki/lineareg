@@ -529,12 +529,6 @@ def _prune_redundant_rows(
     if rank <= 0:
         return R[:0, :], q[:0, :]
     keep_rows = np.sort(piv[:rank].astype(np.int64))
-    if keep_rows.size < R.shape[0]:
-        warnings.warn(
-            f"Pruned {R.shape[0] - keep_rows.size} redundant/near-dependent constraint row(s); rank={keep_rows.size}.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     return R[keep_rows, :], q[keep_rows, :]
 
 

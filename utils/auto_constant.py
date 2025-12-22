@@ -396,13 +396,6 @@ def _handle_no_intercept(  # noqa: PLR0913
     warn: bool,
 ) -> tuple[np.ndarray, list[str], str]:
     """Handle include_intercept=False case."""
-    if warn and (ones_idx or const_idx):
-        warnings.warn(
-            "Existing constant-like columns detected but "
-            "include_intercept=False; left unchanged.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
     return X, names, const_name
 
 
@@ -494,19 +487,11 @@ def _normalize_existing_ones_r(  # noqa: PLR0913
 
     drop = sorted(list(const_idx) + list(ones_idx[1:]), reverse=True)
     for t in drop:
-        if warn:
-            warnings.warn(
-                f"Dropping redundant constant-like column "
-                f"'{names_work[t]}' (collinearity with intercept).",
-                RuntimeWarning,
-                stacklevel=4,
-            )
         X_work = np.delete(X_work, t, axis=1)
         del names_work[t]
         if t < j:
             j -= 1
 
-    # Move to front if not already there
     if j != 0:
         col = X_work[:, j : j + 1].copy()
         X_work = np.delete(X_work, j, axis=1)
@@ -533,19 +518,11 @@ def _normalize_existing_ones_stata(  # noqa: PLR0913
 
     drop = sorted(list(const_idx) + list(ones_idx[1:]), reverse=True)
     for t in drop:
-        if warn:
-            warnings.warn(
-                f"Dropping redundant constant-like column "
-                f"'{names_work[t]}' (collinearity with intercept).",
-                RuntimeWarning,
-                stacklevel=4,
-            )
         X_work = np.delete(X_work, t, axis=1)
         del names_work[t]
         if t < j:
             j -= 1
 
-    # Move to back (Stata convention: _cons at end)
     last = X_work.shape[1] - 1
     if j != last:
         col = X_work[:, j : j + 1].copy()
@@ -571,13 +548,6 @@ def _add_new_intercept_r(  # noqa: PLR0913
     names_out = list(names)
 
     for t in sorted(const_idx, reverse=True):
-        if warn:
-            warnings.warn(
-                f"Dropping constant column '{names_out[t]}' "
-                f"(will use canonical intercept).",
-                RuntimeWarning,
-                stacklevel=4,
-            )
         X_out = np.delete(X_out, t, axis=1)
         del names_out[t]
 
@@ -599,13 +569,6 @@ def _add_new_intercept_stata(  # noqa: PLR0913
     names_out = list(names)
 
     for t in sorted(const_idx, reverse=True):
-        if warn:
-            warnings.warn(
-                f"Dropping constant column '{names_out[t]}' "
-                f"(will use canonical intercept).",
-                RuntimeWarning,
-                stacklevel=4,
-            )
         X_out = np.delete(X_out, t, axis=1)
         del names_out[t]
 

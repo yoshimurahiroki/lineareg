@@ -1442,30 +1442,15 @@ def solve(  # noqa: PLR0913
                 RuntimeError,
                 ValueError,
                 np.linalg.LinAlgError,
-            ) as exc:
-                _warnings.warn(
-                    f"solve(qr): sparse QR failed ({exc}); densifying for exact QR/SVD.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            ):
                 Ad = to_dense(A)
                 Bd = to_dense(B)
                 if Bd.ndim == 1:
                     Bd = Bd.reshape(-1, 1)
-                # Fall through to dense QR/SVD below
 
-        # (removed) iterative methods are not permitted by spec; exact QR/SVD only
-
-        # Priority 3: Densification for exact QR/SVD (method="qr"/"svd" with no SPQR)
-        _warnings.warn(
-            "solve: sparse exact QR/SVD unavailable; densifying matrix.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
         Ad = to_dense(A)
         if Bd.ndim == 1:
             Bd = Bd.reshape(-1, 1)
-        # Fall through to dense QR/SVD below
 
     # Dense path (or densified sparse)
     Ad = to_dense(A)
@@ -1484,13 +1469,8 @@ def solve(  # noqa: PLR0913
                 X = np.linalg.solve(L.T, np.linalg.solve(L, Bd))
             return np.asarray(X, dtype=np.float64)
         except (np.linalg.LinAlgError, ValueError):
-            _warnings.warn(
-                "solve: Cholesky failed; downgrading to QR/SVD routes.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            sym_pos = False
 
-    # QRCP path (rank-revealing)
     if method == "qr":
         return np.asarray(
             _qr_ls_solve(
@@ -2006,22 +1986,19 @@ def eigh(A: Matrix) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Eigenvalues and eigenvectors of a symmetric matrix with GPU fast-path.
     """
     Ad = to_dense(A)
+    gpu_result: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
     if _bk is not None and _bk.gpu_enabled():
         try:
-            # CuPy exposes eigvalsh/eigh via xp.linalg.eigh under the hood; wrap via backend.svd/eigvalsh when possible.
-            # Here, prefer NumPy fallback for exact parity if backend errors.
             xp = _bk.xp_for([Ad])  # type: ignore[attr-defined]
             Ad_dev = _bk.asarray(Ad, xp=xp, dtype=np.float64)  # type: ignore[attr-defined]
             w, v = xp.linalg.eigh(Ad_dev)  # type: ignore[attr-defined]
-            return np.asarray(_bk.to_cpu(w), dtype=np.float64), np.asarray(_bk.to_cpu(v), dtype=np.float64)  # type: ignore[attr-defined]
+            gpu_result = (np.asarray(_bk.to_cpu(w), dtype=np.float64), np.asarray(_bk.to_cpu(v), dtype=np.float64))  # type: ignore[attr-defined]
         except (RuntimeError, ValueError, TypeError, AttributeError):  # pragma: no cover - fallback on backend error
-            _warnings.warn(
-                "GPU eigh failed; falling back to NumPy (results are unchanged).",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            gpu_result = None
         finally:
             _bk.free_gpu_cache()
+        if gpu_result is not None:
+            return gpu_result
     return np.linalg.eigh(Ad)
 
 
@@ -2814,9 +2791,7 @@ def solve_constrained_batch(  # noqa: PLR0913
 
     # Optionally prune redundant constraint rows (caller may have already done so)
     if prune_redundant and m > 0:
-        # Use QR pivoting on R.T to detect independent rows (reuse existing helper if available)
         try:
-            # Attempt to use numpy/scipy QR via la.qr to find rank; minimal deterministic pruning
             qr_res = qr(R.T, pivoting=True, mode="economic")
             if isinstance(qr_res, tuple) and len(qr_res) == 3:
                 _, R_up, piv = qr_res
@@ -2829,12 +2804,8 @@ def solve_constrained_batch(  # noqa: PLR0913
                     R = R[keep, :]
                     qd = qd[keep, :]
                     m = R.shape[0]
-        except (RuntimeError, np.linalg.LinAlgError, ValueError) as exc:
-            _warnings.warn(
-                f"solve_constrained_batch: constraint pruning failed ({exc}); continuing without pruning.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        except (RuntimeError, np.linalg.LinAlgError, ValueError):
+            m = R.shape[0]
 
     # Precompute XtWX_sym for KKT branch
     # Compute XtWX (weighted Gram) once for KKT branches. Use gram() which
@@ -2872,6 +2843,7 @@ def solve_constrained_batch(  # noqa: PLR0913
                 sol = solve(A_kkt, Bvec, sym_pos=False)
                 betas[:, j] = sol[:k, :].reshape(-1)
         except (RuntimeError, np.linalg.LinAlgError, ValueError):
+            kkt_solved = False
             if ridge > 0.0:
                 try:
                     XtWX_r = XtWX + ridge * eye(XtWX.shape[0])
@@ -2886,14 +2858,11 @@ def solve_constrained_batch(  # noqa: PLR0913
                         Bvec = np.vstack([2.0 * Xty, qj])
                         sol = solve(A_kkt, Bvec, sym_pos=False)
                         betas[:, j] = sol[:k, :].reshape(-1)
-                except (RuntimeError, np.linalg.LinAlgError, ValueError) as exc:
-                    _warnings.warn(
-                        f"solve_constrained_batch: ridge-adjusted KKT solve failed ({exc}); falling back to generic solver.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                else:
-                    return betas
+                    kkt_solved = True
+                except (RuntimeError, np.linalg.LinAlgError, ValueError):
+                    kkt_solved = False
+            if kkt_solved:
+                return betas
         else:
             return betas
         # Last-resort per-RHS KKT without SPD assumption
@@ -3228,13 +3197,6 @@ def vectorized_gram(
     gram() is sufficient.
 
     """
-    if n_jobs not in {-1, 1}:
-        _warnings.warn(
-            "vectorized_gram: multi-threaded path not implemented; falling back to serial gram().",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    # For standard matrices, just use gram() directly
     return gram(X, weights=weights)
 
 

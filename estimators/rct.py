@@ -696,20 +696,13 @@ class RCT:
                 raise ValueError(
                     "p='estimate' requires self.ps_learner to be set (sklearn-like estimator with predict_proba).",
                 )
-            # ps_X fallback: use Xv if ps_X unspecified (warn)
             if self.ps_X is None:
-                import warnings
-
-                warnings.warn(
-                    "ps_X not provided: using X for PS learning (explicit ps_X recommended for clarity).",
-                    stacklevel=2,
+                raise ValueError(
+                    "ps_X must be provided when p='estimate' (required for PS learning).",
                 )
-                Xps = Xv
-            else:
-                Xps = np.asarray(self.ps_X, dtype=np.float64)
-                if Xps.shape[0] != n:
-                    raise ValueError("ps_X row count must equal n observations.")
-            # Ensure ps_learner implements predict_proba
+            Xps = np.asarray(self.ps_X, dtype=np.float64)
+            if Xps.shape[0] != n:
+                raise ValueError("ps_X row count must equal n observations.")
             if not hasattr(self.ps_learner, "predict_proba"):
                 raise ValueError(
                     "ps_learner must implement predict_proba (sklearn-like multi-class classifier).",

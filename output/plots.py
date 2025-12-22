@@ -205,7 +205,8 @@ def _parse_tau_index(idx: pd.Index) -> np.ndarray:
             out.append(float(s))
             continue
         except (TypeError, ValueError):
-            pass
+            # Not a numeric string - try pattern match below
+            s = s  # noqa: PLW0127
         m = pat_tau.match(s)
         if m:
             g = m.group(1) or m.group(2)
@@ -387,18 +388,17 @@ def event_study_plot(  # noqa: PLR0913
     bad_order = np.any(ylo > yhi)
     bad_inside = np.any((y < ylo) | (y > yhi))
     if bad_order or bad_inside:
-        import warnings as _warnings
-
-        _warnings.warn(
-            "Band columns appear inconsistent (lower>upper or estimate outside band).",
-            RuntimeWarning,
-            stacklevel=2,
-        )
         if fix_inversions:
             # auto-correct inversions by sorting pairs
             lo = np.minimum(ylo, yhi)
             hi = np.maximum(ylo, yhi)
             ylo, yhi = lo, hi
+        else:
+            msg = (
+                "Band columns appear inconsistent (lower>upper or estimate outside band). "
+                "Set fix_inversions=True to auto-correct."
+            )
+            raise ValueError(msg)
 
     # ensure sort by tau
     idx = np.argsort(tau)

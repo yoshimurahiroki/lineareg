@@ -315,26 +315,9 @@ def _prepare_and_prune_fe(
     """
     codes_list = _prepare_fe(fe_ids)
     pruned: list[NDArray[np.int64]] = []
-    # Provide detailed logging about which FE is nested in which other FE(s).
     for j, z in enumerate(codes_list):
         others = [codes_list[k] for k in range(len(codes_list)) if k != j]
-        if _is_nested(z, others):
-            # Identify which other FE(s) determine this FE for clearer diagnostics
-            determiners: list[int] = []
-            for k, other in enumerate(others):
-                # rebuild index of original FE position
-                orig_k = k if k < j else k + 1
-                if _is_nested(z, [other]):
-                    determiners.append(orig_k)
-            det_msg = (
-                f" (determined by FE indices: {determiners})" if determiners else ""
-            )
-            warnings.warn(
-                f"Fixed effect #{j + 1} is perfectly nested in other FE(s) and will be dropped.{det_msg}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        else:
+        if not _is_nested(z, others):
             pruned.append(z)
     return pruned
 

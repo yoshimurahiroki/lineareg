@@ -218,20 +218,12 @@ def _slag(
         slag_col = fac * Wx
     elif norm_std == "W":
         one = np.ones((n, 1), dtype=np.float64)
-        # Use core.linalg for the multiplication to allow sparse W
         rsum = np.asarray(la.dot(W, one)).reshape(-1, 1)
         zero_rows = np.isclose(rsum.reshape(-1), 0.0)
         if np.any(zero_rows):
             if zero_row_policy == "error":
-                msg = "W contains rows with zero sum (units with no neighbors). Set zero_row_policy to 'zero' or 'warn' to proceed."
+                msg = "W contains rows with zero sum (units with no neighbors). Set zero_row_policy to 'zero' to proceed."
                 raise ValueError(msg)
-            if zero_row_policy == "warn":
-                warnings.warn(
-                    "W contains rows with zero sum; corresponding spatial lags will be set to zero.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        # Avoid division by zero: where rsum == 0 we set rsum to 1 so Wx/1 == 0
         rsum_safe = np.where(rsum == 0.0, 1.0, rsum)
         Wx = la.dot(W, x_arr)
         slag_col = Wx.reshape(-1, 1) / rsum_safe
@@ -579,20 +571,14 @@ class FormulaParser:
         if uses_ts and (self.id_name is None or self.t_name is None):
             msg = "lag/lead/diff require both id_name and t_name; global shift fallback is not permitted."
             raise ValueError(msg)
-        # Warn if spatial lag used without id/time: row alignment to W is critical
-        # (R spdep::listw also requires 1-to-1 correspondence between data rows and W dimension)
-        if (
-            uses_sp
-            and (self.id_name is None or self.t_name is None)
-            and self.warn_if_no_id
-        ):
-            warnings.warn(
-                "slag() used without id_name/t_name: row alignment to W relies "
-                "solely on current DataFrame order. Stata spmatrix and R spdep "
-                "require explicit row ordering; ensure W matches your data ordering.",
-                RuntimeWarning,
-                stacklevel=2,
+        # Fail-fast: spatial lag requires panel identifiers for deterministic row alignment
+        if uses_sp and (self.id_name is None or self.t_name is None):
+            msg = (
+                "slag() requires both id_name and t_name for deterministic row alignment to W. "
+                "Stata spmatrix and R spdep require explicit row ordering; "
+                "provide id_name and t_name to ensure W matches your data ordering."
             )
+            raise ValueError(msg)
         # If either time-series operators or spatial lag operators appear and
         # panel identifiers are provided, we always canonical-sort by (id,time).
         # This unifies the earlier inconsistent messaging about W alignment and
@@ -867,17 +853,12 @@ class FormulaParser:
                     deviations = np.abs(rsum[~zero_rows] - 1.0)
                     max_dev = float(np.max(deviations)) if deviations.size else 0.0
                     if max_dev > (atol + rtol):
-                        warnings.warn(
-                            f"Row sums of W '{Wkey}' deviate from 1 (max |sum-1|={max_dev:.3e}); proceeding with on-the-fly row-normalization.",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
                         if max_dev > 1e-3:
-                            warnings.warn(
-                                f"Row-normalization large deviation for W '{Wkey}' (>{1e-3:.1e}). Check construction and ordering of W.",
-                                RuntimeWarning,
-                                stacklevel=2,
+                            msg = (
+                                f"Row sums of W '{Wkey}' deviate substantially from 1 (max |sum-1|={max_dev:.3e}, >{1e-3:.1e}). "
+                                f"Check construction and ordering of W. If row-normalization is intended, apply it before passing W."
                             )
+                            raise ValueError(msg)
                 # Row-normalization diagnostics only
                 # (zero-diagonal/nonnegativity already enforced above in a sparse-safe way)
 

@@ -844,13 +844,7 @@ def _maybe_switch_to_webb(  # noqa: PLR0911
     if D.name == "webb":
         if G < 6:
             pol = getattr(D, "policy", "strict")
-            # boottest policy: warn and continue with Webb; strict policy: downgrade
             if pol == "boottest":
-                warnings.warn(
-                    "G<6 under Webb: continuing with Webb per boottest policy.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
                 return D
             return WildDist("rademacher", policy=pol)
         return D
@@ -1071,21 +1065,13 @@ def cluster_multipliers(  # noqa: PLR0913
                         Wg[:, idx_bits] = enum_vec_mammen(idx_bits)
                     Wg = Wg.T  # shape (total, G)
             else:
-                # fallback: not a two-point family we can enumerate
                 Wg = None
                 total = 0
 
-            if Wg is None:
-                # cannot enumerate this distribution; fall back to random draws
-                pass
-            else:
-                # When enumerating, always return the full enumerated grid.
-                # Do not truncate or warn if the caller requested a larger n_boot.
-                # Ensure rows correspond to clusters (G x total)
+            if Wg is not None:
                 if Wg.shape[0] == G and Wg.shape[1] == total:
                     Wg_proc = Wg
                 elif Wg.shape[0] == total and Wg.shape[1] == G:
-                    # transpose to (G x total)
                     Wg_proc = Wg.T
                 else:
                     Wg_proc = Wg.T
@@ -1433,11 +1419,7 @@ def apply_wild_bootstrap(  # noqa: PLR0913
         if X is None:
             msg = "WCU_score recentering requires X to be provided (cannot use yhat/resid alone)."
             raise ValueError(msg)
-        # Centralized recentering helper which ensures MNW/boottest semantics and numeric stability.
         u = _score_recentering(u, X, clusters, weights=weights)
-    elif residual_type == "WCU":
-        # Classic WCU: no recentering under null (MNW/boottest semantics)
-        pass
 
     # Build bootstrap outcomes: yh + u ⊙ W
     # Ensure shapes are compatible: yh (n,1), u (n,1), W (n,B) -> Ystar (n,B)
@@ -2228,31 +2210,13 @@ def _cluster_meat(
 
         # Adjustment A_g
         if kind == "CRV2":
-            # A_g = (I - H_gg)^{-1/2} via eigendecomposition (BRL, Bell-McCaffrey 2002)
             evals, evecs = la.eigh(Mgg)
-            # clubSandwich-style clipping at 0 (g-inverse sqrt)
-            neg = int(np.sum(evals < 0.0))
-            if neg:
-                warnings.warn(
-                    f"Cluster PSD correction: clipped {neg} negative eigenvalues to zero.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
             evals = np.maximum(evals, 0.0)
             with np.errstate(divide="ignore"):
                 inv_sqrt = np.where(evals > 0.0, 1.0 / np.sqrt(evals), 0.0)
             Ag = dot(evecs * inv_sqrt, evecs.T)
         elif kind == "CRV3":
-            # A_g = (I - H_gg)^{-1} (JK-equivalent)
-            # Use pseudo-inverse if singular (as in clubSandwich)
             evals, evecs = la.eigh(Mgg)
-            neg = int(np.sum(evals < 0.0))
-            if neg:
-                warnings.warn(
-                    f"Cluster PSD correction: clipped {neg} negative eigenvalues to zero.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
             evals = np.maximum(evals, 0.0)
             with np.errstate(divide="ignore"):
                 inv_ = np.where(evals > 0.0, 1.0 / evals, 0.0)
@@ -2488,13 +2452,7 @@ def _score_recentering_iv(
                 ag = la.pinv(la.dot(Zg.T, Zg))
                 ag = la.dot(ag, la.dot(Zg.T, ug))
                 u_new[mask, :] = ug - la.dot(Zg, ag)
-            except (np.linalg.LinAlgError, ValueError, FloatingPointError) as exc:
-                # leave cluster unchanged on failure, but surface a warning for diagnostics
-                warnings.warn(
-                    f"Score recentering fallback failed for cluster {g}: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            except (np.linalg.LinAlgError, ValueError, FloatingPointError):
                 continue
     return u_new.reshape(-1)
 
@@ -2638,10 +2596,8 @@ def cluster_robust_vcov(  # noqa: PLR0913
         G_min = int(np.min([np.unique(c).size for c in clusters_list]))
         p = Xd.shape[1]
         if kind == "CRV1" and G_min < max(p + 1, 10):
-            warnings.warn(
-                "CRV1 is unreliable with few clusters; consider increasing clusters.",
-                RuntimeWarning,
-                stacklevel=2,
+            raise ValueError(
+                f"CRV1 is unreliable with G_min={G_min} clusters (need at least {max(p + 1, 10)}). Use CRV2/CRV3 or increase cluster count.",
             )
 
         for r in range(1, R + 1):
@@ -2654,10 +2610,8 @@ def cluster_robust_vcov(  # noqa: PLR0913
                 if kind == "CRV1":
                     Gs = int(np.max(inv_S) + 1)
                     if Gs < max(p + 1, 10):
-                        warnings.warn(
-                            f"CRV1 may be unreliable with few clusters on subset {S}.",
-                            RuntimeWarning,
-                            stacklevel=2,
+                        raise ValueError(
+                            f"CRV1 may be unreliable with G={Gs} clusters on subset {S}. Use CRV2/CRV3 or increase cluster count.",
                         )
                 meat += sign * _cluster_meat(Xw, uw, A, inv_S, kind=kind)
 
@@ -2680,9 +2634,7 @@ def cluster_robust_vcov(  # noqa: PLR0913
 
         if G_correction == "min":
             V *= G_min / (G_min - 1.0) if G_min > 1 else 1.0
-        elif G_correction == "conventional":
-            pass
-        else:
+        elif G_correction != "conventional":
             msg = "G_correction must be 'min' or 'conventional'"
             raise ValueError(msg)
 
@@ -2762,15 +2714,12 @@ def cluster_robust_vcov(  # noqa: PLR0913
     _, inv = np.unique(codes, return_inverse=True)
     inv = inv.astype(np.int64, copy=False)
     G = int(inv.max()) + 1
-    G_min = G  # for unified warning
+    G_min = G
     p = Xd.shape[1]
     if kind == "CRV1" and G_min < max(p + 1, 10):
-        warnings.warn(
-            "CRV1 is unreliable with few clusters; consider CRV2/CRV3.",
-            RuntimeWarning,
-            stacklevel=2,
+        raise ValueError(
+            f"CRV1 is unreliable with G={G_min} clusters (need at least {max(p + 1, 10)}). Use CRV2/CRV3 or increase cluster count.",
         )
-    # Special-case: Jackknife-by-cluster (CRV3J) exact implementation
     if kind == "CRV3J":
         # Enforce single-way clusters only for CRV3J (jackknife-by-cluster).
         if (
@@ -2842,9 +2791,7 @@ def cluster_robust_vcov(  # noqa: PLR0913
             V *= float(N) / float(N - K_eff)
         if G_correction == "min":
             V *= G / (G - 1.0) if G > 1 else 1.0
-        elif G_correction == "conventional":
-            pass
-        else:
+        elif G_correction != "conventional":
             msg = "G_correction must be 'min' or 'conventional'"
             raise ValueError(msg)
         if isinstance(t_df, int):

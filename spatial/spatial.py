@@ -89,41 +89,18 @@ def moran_i(residuals: np.ndarray | pd.Series, W: la.Matrix) -> float:
             raise
         except Exception as exc:
             raise TypeError("W must be numeric (coercible to float).") from exc
-    # Diagnostics on W (sparse/ndarray/DataFrame safe)
-    # diagonal
     if hasattr(W, "diagonal"):
         diagW = np.asarray(W.diagonal()).reshape(-1)
     else:
         diagW = np.asarray(np.diag(np.asarray(W))).reshape(-1)
     if np.any(diagW < -1e-12):
-        warnings.warn(
-            "Spatial weight matrix has negative diagonal entries.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    # Row sums: do not densify
+        raise ValueError("Spatial weight matrix has negative diagonal entries.")
     one = np.ones((n, 1), dtype=np.float64)
     row_sums = np.asarray(la.dot(W, one)).reshape(-1)
     if np.any(row_sums < -1e-12):
-        warnings.warn(
-            "Spatial weight matrix has negative row sums.", RuntimeWarning, stacklevel=2,
-        )
+        raise ValueError("Spatial weight matrix has negative row sums.")
     if np.any(np.isclose(row_sums, 0.0)):
-        warnings.warn(
-            "Spatial weight matrix has zero-sum rows; Moran's I may be unstable.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    # Optional: fraction of rows close to a common constant (diagnostic only)
-    rs_mean = float(np.mean(row_sums))
-    rs_dev = float(np.max(np.abs(row_sums - rs_mean)))
-    base = max(1.0, float(np.max(np.abs(row_sums))), abs(rs_mean))
-    if rs_dev <= 10.0 * np.finfo(float).eps * base:
-        warnings.warn(
-            "Row sums are (nearly) constant across units; WX may contain a constant column.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        raise ValueError("Spatial weight matrix has zero-sum rows; Moran's I is undefined.")
 
     We = la.dot(W, e)
     # Extract scalar from 1x1 matrix explicitly to avoid NumPy deprecation
@@ -226,12 +203,7 @@ def moran_i_panel(
             I_t = moran_i(resid_t, W)
             if np.isfinite(I_t):
                 moran_values.append(I_t)
-        except (ValueError, TypeError) as exc:
-            warnings.warn(
-                f"Skipping period {t!r} in Moran's I due to: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        except (ValueError, TypeError):
             continue
 
     # Return average Moran's I across periods
@@ -851,12 +823,7 @@ class SAR2SLS(BaseEstimator):
                 else:
                     bs_arr = np.asarray(iv_res.se).reshape(-1)
                     bootstrap_se_out = pd.Series(bs_arr, index=param_names_sar)
-            except (ValueError, TypeError, AttributeError) as exc:
-                warnings.warn(
-                    f"Failed to coerce bootstrap standard errors from IV2SLS output: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            except (ValueError, TypeError, AttributeError):
                 bootstrap_se_out = None
 
         # Build Z_used for projection: use the exact Z_input used above.

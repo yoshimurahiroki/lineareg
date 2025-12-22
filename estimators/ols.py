@@ -489,8 +489,6 @@ class OLS(BaseEstimator):
             return keep
 
         keep_cols = (_keep_columns_stata if rp == "stata" else _keep_columns_r)(X_proc)
-        # If all columns are dropped by the collinearity screen, raise an explicit
-        # error mirroring R/Stata behavior: design matrix rank == 0.
         if int(np.sum(keep_cols)) == 0:
             msg = "All regressors dropped by collinearity screen (rank=0). Check FE specification and multicollinearity."
             raise RuntimeError(msg)
@@ -498,19 +496,11 @@ class OLS(BaseEstimator):
             dropped_vars = [
                 self._var_names[j] for j in range(len(keep_cols)) if not keep_cols[j]
             ]
-            warnings.warn(
-                f"Dropped {len(dropped_vars)} collinear column(s) (Stata-style QRCP): {dropped_vars}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            # Persist dropped columns for programmatic access (R/Stata parity aid)
             extra_local.setdefault("diagnostics", {})
             extra_local["diagnostics"]["dropped_collinear"] = list(dropped_vars)
             extra_local["diagnostics"]["keep_mask"] = keep_cols.copy()
-        # Apply column keep to X and names
         X_proc = X_proc[:, keep_cols]
         self._var_names = [nm for (nm, k) in zip(self._var_names, keep_cols) if k]
-        # If the constant was dropped, recompute FE DoF without intercept (only if FE were provided)
         if (self._const_name is not None) and (self._const_name not in self._var_names):
             if absorb_fe is not None:
                 try:
@@ -532,12 +522,8 @@ class OLS(BaseEstimator):
                         fe_ids_masked,
                         include_intercept=False,
                     )
-                except (TypeError, ValueError, AttributeError, RuntimeError) as _err:
-                    warnings.warn(
-                        "Failed to recompute FE DoF after constant drop; proceeding with existing DoF.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
+                except (TypeError, ValueError, AttributeError, RuntimeError):
+                    fe_dof_info = None
             self._const_name = None
 
         # --- Remap linear equality constraints to surviving columns ---

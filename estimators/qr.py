@@ -176,22 +176,6 @@ def _solve_qr_lp(
     # Use the adopted active solution (res or res2) for objective verification
     u_plus = active.x[k : k + n]
     u_minus = active.x[k + n : k + 2 * n]
-    obj_unperturbed = float(np.sum(w.ravel() * (tau * u_plus + (1.0 - tau) * u_minus)))
-    tol_obj = 1e-6 * max(1.0, abs(obj_unperturbed))
-    perturbation_effect = abs(
-        obj_unperturbed - float(active.fun - la.dot(tie, active.x[:k])),
-    )
-    if perturbation_effect > tol_obj:
-        global _WARNED_TIEBREAK
-        if not _WARNED_TIEBREAK:
-            _WARNED_TIEBREAK = True
-            warnings.warn(
-                f"Lexicographic tie-breaking perturbed QR objective by {perturbation_effect:.2e} "
-                f"(tolerance {tol_obj:.2e}). This is within R/Stata quantreg tolerances.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    # reshape into column vector (n,1)
     dual_arr = (
         np.asarray(dual_eq, dtype=float).reshape(-1, 1) if dual_eq is not None else None
     )
@@ -342,22 +326,6 @@ def _solve_qr_lp_prepared(
     # objective perturbation check (same policy as _solve_qr_lp)
     u_plus = active.x[k : k + n]
     u_minus = active.x[k + n : k + 2 * n]
-    obj_unperturbed = float(np.sum(w.ravel() * (tau * u_plus + (1.0 - tau) * u_minus)))
-    tol_obj = 1e-6 * max(1.0, abs(obj_unperturbed))
-    # la.dot expects array-likes; ensure 1-D inputs
-    perturbation_effect = abs(
-        obj_unperturbed - float(active.fun - la.dot(tie, active.x[:k])),
-    )
-    if perturbation_effect > tol_obj:
-        global _WARNED_TIEBREAK
-        if not _WARNED_TIEBREAK:
-            _WARNED_TIEBREAK = True
-            warnings.warn(
-                f"Lexicographic tie-breaking perturbed QR objective by {perturbation_effect:.2e} "
-                f"(tolerance {tol_obj:.2e}). This is within R/Stata quantreg tolerances.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
     dual_arr = (
         np.asarray(dual_eq, dtype=float).reshape(-1, 1) if dual_eq is not None else None
@@ -1052,8 +1020,7 @@ class QR(BaseEstimator):
         time_ids: Sequence | None = None,
     ) -> EstimationResult:
         if device is not None and device != "cpu":
-            import warnings
-            warnings.warn(f"QR device '{device}' requested but only 'cpu' is supported; proceeding with CPU.", RuntimeWarning, stacklevel=2)
+            raise ValueError(f"QR device '{device}' requested but only 'cpu' is supported.")
         mask = np.isfinite(self.y_orig).ravel() & np.all(
             np.isfinite(self.X_orig), axis=1,
         )
@@ -1271,15 +1238,10 @@ class QR(BaseEstimator):
                     except Exception:
                         failed_draws += 1
 
-            if failed_draws > 0:
-                warnings.warn(f"QR bootstrap: {failed_draws}/{B} draws failed to solve; using {B - failed_draws} valid draws.", RuntimeWarning, stacklevel=2)
-
             valid_mask = ~np.isnan(boot_betas[0, :])
             if valid_mask.sum() < 2:
-                warnings.warn("QR bootstrap: fewer than 2 valid draws; SE not available.", RuntimeWarning, stacklevel=2)
-                se_hat = None
-            else:
-                se_hat = bt.bootstrap_se(boot_betas[:, valid_mask])
+                raise RuntimeError(f"QR bootstrap: fewer than 2 valid draws ({valid_mask.sum()}/{B}); SE not available.")
+            se_hat = bt.bootstrap_se(boot_betas[:, valid_mask])
 
         params = pd.Series(beta_hat.reshape(-1), index=self._var_names, name="coef")
         se = pd.Series(se_hat.reshape(-1), index=self._var_names, name="se") if se_hat is not None else None
@@ -1563,8 +1525,7 @@ class IVQR(BaseEstimator):
         when cluster_ids provided). Pair bootstrap is forbidden.
         """
         if device is not None and device != "cpu":
-            import warnings
-            warnings.warn(f"IVQR device '{device}' requested but only 'cpu' is supported; proceeding with CPU.", RuntimeWarning, stacklevel=2)
+            raise ValueError(f"IVQR device '{device}' requested but only 'cpu' is supported.")
         mask = (
             np.isfinite(self.y_orig).ravel()
             & np.all(np.isfinite(self.X_orig), axis=1)

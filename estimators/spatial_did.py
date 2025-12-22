@@ -117,6 +117,7 @@ class SpatialDID:
         center_at: int = -1,
         anticipation: int = 0,
         base_period: str = "varying",
+        control_group: str = "notyet",
         alpha: float = 0.05,
         boot: BootConfig | None = None,
         cluster_ids: Sequence | None = None,
@@ -143,6 +144,10 @@ class SpatialDID:
         if base_period_norm not in {"varying", "universal"}:
             raise ValueError("base_period must be 'varying' or 'universal'")
         self.base_period = base_period_norm
+        cg_norm = str(control_group).lower().replace("_", "").replace("-", "").replace("treated", "")
+        if cg_norm not in {"never", "notyet"}:
+            raise ValueError("control_group must be 'never' or 'notyet'.")
+        self.control_group = cg_norm
         self.alpha = float(alpha)
 
         self.boot = boot
@@ -391,8 +396,9 @@ class SpatialDID:
         # (indices were assigned above)
 
         def control_mask_strict(t_int: int, base_int: int) -> np.ndarray:
-            # controls must be untreated at BOTH time t AND base (g-1), like csdid.
             m = max(int(t_int), int(base_int))
+            if self.control_group == "never":
+                return G == 0
             return (G == 0) | (m < G)
 
         # Containers

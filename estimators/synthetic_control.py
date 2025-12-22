@@ -129,11 +129,21 @@ def _optimize_V_nested(
     max_iter_fw: int = 10_000,
     tol_fw: float = 1e-10,
     max_iter_v: int = 500,
+    newton_refine: int = 20,
+    newton_tol: float = 1e-10,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from scipy.optimize import minimize
     K = X_pred_treat.shape[0]
     T_pre = Y_pre_treat.shape[0]
     J = X_pred_donors.shape[1]
+
+    def _softmax(u: np.ndarray) -> np.ndarray:
+        z = u - np.max(u)
+        ez = np.exp(z)
+        return ez / np.sum(ez)
+
+    def _softmax_jac(v: np.ndarray) -> np.ndarray:
+        return np.diag(v) - np.outer(v, v)
 
     def _inner_w(v_diag: np.ndarray) -> np.ndarray:
         return _frank_wolfe_simplex(
@@ -141,15 +151,108 @@ def _optimize_V_nested(
         )
 
     def _mspe_pre(u: np.ndarray) -> float:
-        v_diag = np.exp(u) / np.sum(np.exp(u))
+        v_diag = _softmax(u)
         w = _inner_w(v_diag)
         synth_pre = la.dot(Y_pre_donors.T, w)
         return float(np.mean((Y_pre_treat - synth_pre) ** 2))
 
+    def _kkt_solve_local(A: np.ndarray, b: np.ndarray) -> np.ndarray:
+        k = A.shape[0]
+        ones = np.ones((k, 1))
+        M = np.block([[A, ones], [ones.T, np.zeros((1, 1))]])
+        rhs = np.vstack([b.reshape(-1, 1), np.ones((1, 1))])
+        U, s, Vt = np.linalg.svd(M, full_matrices=False)
+        s_inv = np.where(s > 1e-14, 1.0 / s, 0.0)
+        sol = (Vt.T * s_inv) @ (U.T @ rhs)
+        return sol[:-1, 0]
+
+    def _kkt_dw_local(Xs, y, v, wS, dX_s, dy, dv):
+        if Xs.shape[1] <= 1:
+            return np.zeros(Xs.shape[1])
+        D = np.diag(v)
+        dD = np.diag(dv) if dv is not None else np.zeros_like(D)
+        A = Xs.T @ D @ Xs
+        b = Xs.T @ D @ y
+        dA = dX_s.T @ D @ Xs + Xs.T @ dD @ Xs + Xs.T @ D @ dX_s
+        db = dX_s.T @ D @ y + Xs.T @ dD @ y + Xs.T @ D @ dy
+        k = Xs.shape[1]
+        ones = np.ones((k, 1))
+        M = np.block([[A, ones], [ones.T, np.zeros((1, 1))]])
+        rhs = np.vstack([(db - dA @ wS).reshape(-1, 1), np.zeros((1, 1))])
+        U, s, Vt = np.linalg.svd(M, full_matrices=False)
+        s_inv = np.where(s > 1e-14, 1.0 / s, 0.0)
+        sol = (Vt.T * s_inv) @ (U.T @ rhs)
+        return sol[:-1, 0]
+
+    def _w_from_u_fixedS(X, y, u, S):
+        v = _softmax(u)
+        Xs = X[:, S]
+        A = Xs.T @ np.diag(v) @ Xs
+        b = Xs.T @ np.diag(v) @ y
+        wS = _kkt_solve_local(A, b)
+        return v, wS
+
+    def _grad_u_fixedS(X, y, u, S):
+        Kp = X.shape[0]
+        v, wS = _w_from_u_fixedS(X, y, u, S)
+        w = np.zeros(X.shape[1], dtype=float)
+        w[S] = wS
+        r = y - X @ w
+        Jv = _softmax_jac(v)
+        g = np.zeros(Kp, dtype=float)
+        Xs = X[:, S]
+        for q in range(Kp):
+            dv = Jv[:, q]
+            dwS = _kkt_dw_local(Xs, y, v, wS, np.zeros_like(Xs), np.zeros_like(y), dv)
+            dr = -(Xs @ dwS)
+            g[q] = (2.0 / Kp) * float(r @ dr)
+        return g
+
+    def _jac_u_num(X, y, u, S, eps=1e-6):
+        Kp = X.shape[0]
+        J = np.zeros((Kp, Kp), dtype=float)
+        for q in range(Kp):
+            du = np.zeros(Kp, dtype=float)
+            du[q] = eps
+            gp = _grad_u_fixedS(X, y, u + du, S)
+            gm = _grad_u_fixedS(X, y, u - du, S)
+            J[:, q] = (gp - gm) / (2.0 * eps)
+        return J
+
     u0 = np.zeros(K, dtype=np.float64)
     res = minimize(_mspe_pre, u0, method="Nelder-Mead", options={"maxiter": max_iter_v})
     u_opt = res.x
-    v_opt = np.exp(u_opt) / np.sum(np.exp(u_opt))
+
+    v_opt = _softmax(u_opt)
+    w_opt = _inner_w(v_opt)
+    S = w_opt > tol_fw
+    if S.sum() == 0:
+        S[np.argmax(w_opt)] = True
+    X_pre = X_pred_donors.T
+    y_pre = X_pred_treat
+
+    for _ in range(newton_refine):
+        g0 = _grad_u_fixedS(X_pre, y_pre, u_opt, S)
+        if np.max(np.abs(g0)) < newton_tol:
+            break
+        if not np.isfinite(g0).all():
+            break
+        Jg = _jac_u_num(X_pre, y_pre, u_opt, S)
+        U_jg, s_jg, Vt_jg = np.linalg.svd(Jg, full_matrices=False)
+        s_jg_inv = np.where(s_jg > 1e-14, 1.0 / s_jg, 0.0)
+        step = (Vt_jg.T * s_jg_inv) @ (U_jg.T @ (-g0).reshape(-1, 1))
+        step = step[:, 0]
+        if not np.isfinite(step).all():
+            break
+        u_opt = u_opt + step
+        v_opt = _softmax(u_opt)
+        w_opt = _inner_w(v_opt)
+        S_new = w_opt > tol_fw
+        if S_new.sum() == 0:
+            S_new[np.argmax(w_opt)] = True
+        S = S_new
+
+    v_opt = _softmax(u_opt)
     w_opt = _inner_w(v_opt)
     return u_opt, v_opt, w_opt
 
@@ -202,6 +305,7 @@ class SyntheticControl:
         v_mode: str = "identity",
         anticipation: int = 0,
         base_period: str = "varying",
+        control_group: str = "never",
         tau_weight: str = "treated_t",
         boot_cluster: str = "twoway",
     ) -> None:
@@ -213,6 +317,10 @@ class SyntheticControl:
             raise ValueError("v_mode must be 'identity' or 'nested'")
         if base_period not in {"varying", "universal"}:
             raise ValueError("base_period must be 'varying' or 'universal'")
+        cg_norm = str(control_group).lower().replace("_", "").replace("-", "").replace("treated", "")
+        if cg_norm != "never":
+            raise ValueError("SyntheticControl requires control_group='never' (donor pool must be never-treated).")
+        self.control_group = cg_norm
         tau_weight_norm = str(tau_weight).lower()
         if tau_weight_norm not in {"equal", "group", "treated_t"}:
             raise ValueError("tau_weight must be one of {'equal','group','treated_t'}.")
@@ -443,15 +551,6 @@ class SyntheticControl:
                     if u0.shape[0] != Kp:
                         raise ValueError("nested SC: stored u has wrong length vs pre periods")
                     u = u0.copy()
-                    Jg = _jac_u_num(X, y, u, S)
-                    g0 = _grad_u_fixedS(X, y, u, S)
-                    if np.isfinite(g0).all():
-                        U_jg, s_jg, Vt_jg = np.linalg.svd(Jg, full_matrices=False)
-                        s_jg_inv = np.where(s_jg > 1e-14, 1.0 / s_jg, 0.0)
-                        step = (Vt_jg.T * s_jg_inv) @ (U_jg.T @ (-g0).reshape(-1, 1))
-                        step = step[:, 0]
-                        if np.isfinite(step).all():
-                            u = u + step
                     v, wS = _w_from_u_fixedS(X, y, u, S)
                     w = np.zeros(len(donors_idx), dtype=float)
                     w[S] = wS

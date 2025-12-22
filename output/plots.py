@@ -829,13 +829,11 @@ def event_study_percentile_plot(  # noqa: PLR0913
     est = str(meta.get("estimator", "")).lower()
     if est and est not in {"synthetic", "sdid", "rct", "placebo"}:
         raise ValueError(f"percentile bands are not supported for estimator='{est}'.")
-    # Be permissive if metadata is missing or mislabeled; proceed if percentile bands are present
     if str(meta.get("kind", "")).lower() != "percentile":
-        import warnings as _w
-
-        _w.warn(
-            "Percentile CI bands provided without meta.kind='percentile'; proceeding anyway.",
-            stacklevel=2,
+        raise ValueError(
+            "Percentile CI bands require meta.kind='percentile'; got '{}'.".format(
+                meta.get("kind", "missing")
+            ),
         )
     if "level" in meta:
         level = int(meta["level"])

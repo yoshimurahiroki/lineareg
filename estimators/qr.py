@@ -889,10 +889,8 @@ class QR(BaseEstimator):
         self._n_obs_raw: int = y_arr.shape[0]
         self.n_features: int = X_aug.shape[1]
         self.tau: float = float(tau)
-        # Strict upfront check to avoid accidental MNW variants via BootConfig later
-        # This is a no-op placeholder to make the intent explicit for audits.
-        if hasattr(BootConfig, "__name__"):
-            pass  # intentionally no-op; actual rejection occurs in fit()
+        # Strict upfront validation of BootConfig is deferred to fit() where MNW variants
+        # are explicitly rejected; no placeholder code needed here.
 
     @classmethod
     def from_formula(  # noqa: PLR0913
@@ -1143,19 +1141,13 @@ class QR(BaseEstimator):
         if isinstance(boot.dist, str):
             dist_norm = str(boot.dist).strip().lower().replace("-", "").replace("_", "")
             if dist_norm in {"11", "13", "31", "33", "33j"}:
-                import warnings as _w
-                _w.warn(
-                    f"QR: MNW variant '{boot.dist}' not supported; falling back to dist='exp'.",
-                    RuntimeWarning, stacklevel=2,
+                raise ValueError(
+                    f"QR: MNW variant '{boot.dist}' not supported; use dist='exp' or dist='golden'."
                 )
-                effective_dist = "exp"
             elif dist_norm in {"rademacher", "mammen", "webb"}:
-                import warnings as _w
-                _w.warn(
-                    f"QR: dist='{boot.dist}' produces negative weights incompatible with LP; falling back to dist='exp'.",
-                    RuntimeWarning, stacklevel=2,
+                raise ValueError(
+                    f"QR: dist='{boot.dist}' produces negative weights incompatible with LP; use dist='exp' or dist='golden'."
                 )
-                effective_dist = "exp"
         boot = BootConfig(
             dist=effective_dist if effective_dist not in {"rademacher", "mammen", "webb"} else "exp",
             n_boot=boot.n_boot,

@@ -661,12 +661,8 @@ class BootConfig:
         # accept case-insensitive spellings (parity with Stata/R option parsing)
         cm = str(self.cluster_method).lower()
         if cm not in {"intersection", "cgm"}:
-            import warnings as _w
-
-            _w.warn(
-                "cluster_method is only used for VCV construction; multipliers use `bootcluster`.",
-                RuntimeWarning,
-                stacklevel=2,
+            raise ValueError(
+                "cluster_method must be 'intersection' or 'cgm'; multipliers use `bootcluster`.",
             )
 
         # Apply preset overrides before constructing distribution/policy objects

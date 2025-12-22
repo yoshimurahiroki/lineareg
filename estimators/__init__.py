@@ -25,7 +25,6 @@ __all__ = [
     "DREventStudy",
     "EventStudyCS",
     "SpatialDID",
-    "StratifiedRCT",
     "SyntheticControl",
 ]
 
@@ -48,7 +47,6 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "SpatialDID": ("lineareg.estimators.spatial_did", "SpatialDID"),
     "SAR2SLS": ("lineareg.spatial.spatial", "SAR2SLS"),
     "RCT": ("lineareg.estimators.rct", "RCT"),
-    "StratifiedRCT": ("lineareg.estimators.rct", "StratifiedRCT"),
 }
 
 

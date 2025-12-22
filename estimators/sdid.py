@@ -463,6 +463,10 @@ class SDID:
                                     donor_cf_count[j_global] += 1.0
                         donor_mask = donor_cf_count > 0.5
                         Y_cf[donor_mask, :] = donor_cf_sum[donor_mask, :] / donor_cf_count[donor_mask, None]
+                        # For control units NOT in any donor pool, use their observed Y as counterfactual
+                        # This ensures U_hat = 0 for these units and they pass through unchanged in DGP.
+                        not_in_donor_pool = ~donor_mask & control_unit_mask
+                        Y_cf[not_in_donor_pool, :] = Y[not_in_donor_pool, :]
                         for g, meta in results_g.items():
                             idx_tr = cohorts[g]
                             y_sc_g = meta["y_sc"]
@@ -509,13 +513,13 @@ class SDID:
                         continue
 
                 if filled < B:
-                    import warnings as _w
-                    _w.warn(f"SDID bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
                     att_tau_star = att_tau_star[:, :filled]
                     att_b = att_b[:filled]
 
                 if filled == 0:
                     raise RuntimeError("SDID bootstrap failed: 0 successful draws. Check data/resampling settings.")
+                if filled < 2:
+                    raise RuntimeError(f"SDID bootstrap failed: only {filled} draw(s) succeeded; need at least 2.")
 
                 boot_info["B"] = filled
                 boot_info["post_ATT_draws"] = att_b

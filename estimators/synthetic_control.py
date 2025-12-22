@@ -795,11 +795,11 @@ class SyntheticControl:
         boot_info = None
 
         if _boot is not None and int(getattr(_boot, "n_boot", 0)) > 1:
-            B = int(boot.n_boot)
+            B = int(_boot.n_boot)
             alpha_level = float(self.spec.alpha)
-            rng = np.random.default_rng(getattr(boot, "seed", None))
+            rng = np.random.default_rng(getattr(_boot, "seed", None))
 
-            mode = (getattr(boot, "mode", None) or "auto").lower()
+            mode = (getattr(_boot, "mode", None) or "auto").lower()
             if mode == "auto":
                 mode = "unit" if n_treated_total >= 2 else "permutation"
             if mode not in {"unit", "placebo", "permutation", "if"}:
@@ -964,7 +964,7 @@ class SyntheticControl:
                     U_hat=U_hat, tau_grid=tau_grid,
                 )
 
-                dist = getattr(boot, "dist", "rademacher")
+                dist = getattr(_boot, "dist", "rademacher")
                 mult_u = bt.wild_multipliers(n_units, n_boot=B, dist=dist, rng=rng)
 
                 theta_hat = att_series.reindex(tau_grid).to_numpy(dtype=float)
@@ -1170,12 +1170,12 @@ class SyntheticControl:
                         continue
 
                 if filled < B:
-                    import warnings as _w
-                    _w.warn(f"SC bootstrap: only {filled}/{B} draws succeeded.", RuntimeWarning, stacklevel=2)
                     att_tau_star = att_tau_star[:, :filled]
 
                 if filled == 0:
                     raise RuntimeError("SC bootstrap failed: 0 successful draws. Check data/resampling settings.")
+                if filled < 2:
+                    raise RuntimeError(f"SC bootstrap failed: only {filled} draw(s) succeeded; need at least 2.")
 
                 post_star_arr = np.full(filled, np.nan, dtype=float)
                 if np.any(mask_post) and filled > 0:

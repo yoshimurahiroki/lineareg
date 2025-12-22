@@ -602,13 +602,7 @@ class OLS(BaseEstimator):
                     AttributeError,
                     RuntimeError,
                 ) as _err:  # best-effort; keep prior fe_dof_info
-                    import warnings as _w
-
-                    _w.warn(
-                        "Failed to recompute FE DoF after constant drop; proceeding with existing DoF.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
+                    pass  # Cannot recompute FE DoF after constant drop; retain existing fe_dof_info
         # Analytic (diagonal) observation weights are not supported for OLS.
         # Use unweighted QR/SVD solves routed through core.linalg for point estimates.
         # Enforce QR-only solver for OLS (project policy: prefer QR stability,

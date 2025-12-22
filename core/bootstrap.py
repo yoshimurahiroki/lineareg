@@ -2290,28 +2290,17 @@ def _score_recentering(
     *,
     weights: Sequence[float] | None = None,
 ) -> NDArray[np.float64]:
-    """Centralized MNW-style score recentering used by WCU_score.
+    """MNW-style score recentering for WCU_score (Wild Cluster Score Bootstrap).
 
-    The Wild Cluster Score Bootstrap (WCU-score) adjusts residuals to satisfy
-    **cluster-wise** score orthogonality: X_g' W_g u*_g = 0 for each cluster g.
+    Implements the WCR3/WCU_score adjustment from MacKinnon, Nielsen, Webb (2023)
+    and boottest/fwildclusterboot.  For each cluster g, the adjusted residuals
+    satisfy leverage-adjusted orthogonality using the **global** (X'WX)^{-1}:
 
-    This is distinct from global orthogonality X' W u* = 0. The cluster-wise
-    condition ensures that when we multiply by cluster-level wild multipliers v_g,
-    the bootstrap scores X_g' W_g (v_g u*_g) have mean zero (over bootstrap draws).
+        u*_g = M_g u_g  where  M_g = I - X_g (X'WX)^{-1} X_g' W_g
 
-    Implementation
-    --------------
-    Following MacKinnon, Nielsen, Webb (2023) and boottest/fwildclusterboot,
-    for each cluster g we solve:
-
-        minimize ||u*_g - u_g||^2  subject to  X_g' W_g u*_g = 0
-
-    The solution is a projection using **cluster-specific** (X_g' W_g X_g)^{-1}:
-
-        u*_g = (I - H_g) u_g  where  H_g = X_g (X_g' W_g X_g)^{-1} X_g' W_g
-
-    For numerical stability, we compute the cluster-specific inverse via
-    pseudoinverse when the cluster design matrix is rank-deficient.
+    This uses cluster-specific projection (X_g'W_gX_g)^{-1} to ensure X_g'W_g u*_g = 0
+    for each cluster, which imposes the null hypothesis in the bootstrap DGP.
+    This is the standard WCU-score recentering following MacKinnon et al.
 
     Parameters
     ----------
@@ -2327,7 +2316,7 @@ def _score_recentering(
     Returns
     -------
     u_adj : ndarray
-        Score-recentered residuals (n,) with X_g' W_g u_adj_g = 0 for each g.
+        Score-recentered residuals (n,).
 
     """
     if clusters is None:
@@ -2354,16 +2343,12 @@ def _score_recentering(
         wg = w[mask].reshape(-1, 1)
         ug = u[mask, :]
         ng = Xg.shape[0]
-        XgTWg = Xg.T * wg.T
-        XgTWgXg = la.dot(XgTWg, Xg)
+        XgTWgXg = la.dot(Xg.T * wg.T, Xg)
         try:
-            inv_XgTWgXg = np.linalg.pinv(XgTWgXg)
+            XgTWgXg_inv = np.linalg.pinv(XgTWgXg)
         except np.linalg.LinAlgError:
-            inv_XgTWgXg = np.linalg.pinv(XgTWgXg + 1e-12 * np.eye(XgTWgXg.shape[0]))
-        # Hg = X_g (X_g' W_g X_g)^{-1} X_g' W_g is the oblique projection and
-        # is NOT symmetric when W ≠ I.  Do not symmetrize; it would break the
-        # score orthogonality property X_g' W_g (I - H_g) u_g = 0.
-        Hg = la.dot(la.dot(Xg, inv_XgTWgXg), XgTWg)
+            XgTWgXg_inv = np.linalg.pinv(XgTWgXg + 1e-12 * np.eye(XgTWgXg.shape[0]))
+        Hg = la.dot(la.dot(Xg, XgTWgXg_inv), Xg.T * wg.T)
         Mg = np.eye(ng, dtype=np.float64) - Hg
         u_adj[mask, :] = la.dot(Mg, ug)
 
@@ -2390,40 +2375,36 @@ def _score_recentering_iv(
     *,
     eig_tol: float | None = None,
 ) -> NDArray[np.float64]:
-    """Recenter IV scores so that, within each cluster g, Z_g' u_g = 0.
+    """Recenter IV scores using cluster-specific (Z_g'Z_g)^{-1}.
 
-    Achieved by u_g <- u_g - Z_g a_g where a_g = (Z_g'Z_g)^+ Z_g' u_g (range-restricted
-    pseudo-inverse). When `clusters` is None the operation is global.
+    For each cluster g: u*_g = (I - Z_g (Z_g'Z_g)^{-1} Z_g') u_g.
+    This ensures Z_g' u*_g = 0 for each cluster, imposing the null in the bootstrap DGP.
+    When `clusters` is None the operation is global using (Z'Z)^{-1}.
     """
     u_arr = np.asarray(u, dtype=np.float64).reshape(-1, 1)
     Zd = to_dense(Z)
 
     if clusters is None:
-        # Global recentering: solve a = (Z'Z)^+ Z' u and return u - Z a
         ZtZ = la.crossprod(Zd, Zd)
         try:
             evals, U = la.eigh(ZtZ)
-            tol = la.eig_tol(ZtZ) if eig_tol is None else float(eig_tol)
-            keep = evals > tol
+            tol_eig = la.eig_tol(ZtZ) if eig_tol is None else float(eig_tol)
+            keep = evals > tol_eig
             if not np.any(keep):
                 return u_arr.reshape(-1)
-            # Build range-restricted pseudoinverse via eigenbasis
             Ur = U[:, keep]
             inv_vals = 1.0 / evals[keep]
-            Zt_u = la.dot(Zd.T, u_arr)
-            a = la.dot(Ur, la.dot(np.diag(inv_vals), la.dot(Ur.T, Zt_u)))
-            u_new = u_arr - la.dot(Zd, a)
-            return u_new.reshape(-1)
+            ZtZ_inv = la.dot(Ur, la.dot(np.diag(inv_vals), Ur.T))
         except (np.linalg.LinAlgError, ValueError, FloatingPointError):
-            # Fallback: use Moore-Penrose pseudoinverse
             try:
-                a = la.pinv(la.dot(Zd.T, Zd))
-                a = la.dot(a, la.dot(Zd.T, u_arr))
-                return (u_arr - la.dot(Zd, a)).reshape(-1)
+                ZtZ_inv = la.pinv(ZtZ)
             except (np.linalg.LinAlgError, ValueError, FloatingPointError):
                 return u_arr.reshape(-1)
+        Zt_u = la.dot(Zd.T, u_arr)
+        a = la.dot(ZtZ_inv, Zt_u)
+        u_new = u_arr - la.dot(Zd, a)
+        return u_new.reshape(-1)
 
-    # Clustered recentering: operate cluster-by-cluster
     clusters_arr = np.asarray(clusters, dtype=np.int64).reshape(-1)
     u_new = u_arr.copy()
     for g in np.unique(clusters_arr):
@@ -2434,26 +2415,14 @@ def _score_recentering_iv(
         ug = u_arr[mask, :]
         if Zg.size == 0:
             continue
-        ZgT_Zg = la.crossprod(Zg, Zg)
+        ZgTZg = la.crossprod(Zg, Zg)
         try:
-            evals, U = la.eigh(ZgT_Zg)
-            tol = la.eig_tol(ZgT_Zg) if eig_tol is None else float(eig_tol)
-            keep = evals > tol
-            if not np.any(keep):
-                # skip if no informative columns in this cluster
-                continue
-            Ur = U[:, keep]
-            inv_vals = 1.0 / evals[keep]
-            Zt_u = la.dot(Zg.T, ug)
-            ag = la.dot(Ur, la.dot(np.diag(inv_vals), la.dot(Ur.T, Zt_u)))
-            u_new[mask, :] = ug - la.dot(Zg, ag)
-        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
-            try:
-                ag = la.pinv(la.dot(Zg.T, Zg))
-                ag = la.dot(ag, la.dot(Zg.T, ug))
-                u_new[mask, :] = ug - la.dot(Zg, ag)
-            except (np.linalg.LinAlgError, ValueError, FloatingPointError):
-                continue
+            ZgTZg_inv = np.linalg.pinv(ZgTZg)
+        except np.linalg.LinAlgError:
+            ZgTZg_inv = np.linalg.pinv(ZgTZg + 1e-12 * np.eye(ZgTZg.shape[0]))
+        Hg = la.dot(la.dot(Zg, ZgTZg_inv), Zg.T)
+        Mg = np.eye(Hg.shape[0], dtype=np.float64) - Hg
+        u_new[mask, :] = la.dot(Mg, ug)
     return u_new.reshape(-1)
 
 
